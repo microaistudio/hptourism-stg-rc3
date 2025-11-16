@@ -2,6 +2,7 @@ import bcrypt from 'bcrypt';
 import { db } from './db';
 import { users, ddoCodes } from '../shared/schema';
 import { eq } from 'drizzle-orm';
+import { getDistrictStaffManifest } from '../shared/districtStaffManifest';
 
 /**
  * Database Seed Script
@@ -123,53 +124,79 @@ async function seed() {
       console.log('   ⚠️  Change this password immediately after first login!');
     }
 
-    // Create test Dealing Assistant account for Shimla district
-    console.log('🔍 Creating test Dealing Assistant account...');
-    
-    const existingDA = await db.select()
-      .from(users)
-      .where(eq(users.mobile, '9876543210'))
-      .limit(1);
+    // Seed all district staff (Dealing Assistants + DTDOs)
+    console.log('👥 Seeding district staff accounts (DA & DTDO)…');
+    const staffManifest = getDistrictStaffManifest();
+    let daUpserts = 0;
+    let dtdoUpserts = 0;
 
-    if (existingDA.length > 0) {
-      console.log('✅ Dealing Assistant user already exists (mobile: 9876543210)');
-      
-      // Update role, district, AND password to ensure correct credentials
-      const hashedDAPassword = await bcrypt.hash('da123', 10);
-      
-      await db.update(users)
-        .set({ 
-          role: 'dealing_assistant', 
-          district: 'Shimla',
-          password: hashedDAPassword,
-          fullName: 'Priya Sharma (DA Shimla)',
-          isActive: true 
-        })
-        .where(eq(users.mobile, '9876543210'));
-      
-      console.log('✅ Dealing Assistant role, district, and password updated');
-      console.log('   Password reset to: da123');
-    } else {
-      // Create test DA user for Shimla
-      const hashedDAPassword = await bcrypt.hash('da123', 10);
-      
-      await db.insert(users).values({
-        mobile: '9876543210',
-        email: 'da.shimla@himachaltourism.gov.in',
-        password: hashedDAPassword,
-        fullName: 'Priya Sharma (DA Shimla)',
-        role: 'dealing_assistant',
-        district: 'Shimla',
-        isActive: true,
-      });
-      
-      console.log('✅ Dealing Assistant user created successfully');
-      console.log('   Mobile: 9876543210');
-      console.log('   Email: da.shimla@himachaltourism.gov.in');
-      console.log('   Password: da123');
-      console.log('   District: Shimla');
-      console.log('   ⚠️  For testing only - change password in production!');
+    for (const entry of staffManifest) {
+      for (const roleKey of ['da', 'dtdo'] as const) {
+        const staffRecord = entry[roleKey];
+        const role =
+          roleKey === 'da' ? 'dealing_assistant' : 'district_tourism_officer';
+        const designation =
+          roleKey === 'da'
+            ? 'Dealing Assistant'
+            : 'District Tourism Development Officer';
+        const fullNameSuffix = roleKey === 'da' ? 'DA' : 'DTDO';
+        const hashedPassword = await bcrypt.hash(staffRecord.password, 10);
+
+        const existing = await db
+          .select()
+          .from(users)
+          .where(eq(users.mobile, staffRecord.mobile))
+          .limit(1);
+
+        if (existing.length > 0) {
+          await db
+            .update(users)
+            .set({
+              role,
+              district: entry.districtLabel,
+              username: staffRecord.username,
+              email: staffRecord.email,
+              fullName: `${staffRecord.fullName} (${fullNameSuffix} ${entry.districtLabel})`,
+              designation,
+              password: hashedPassword,
+              isActive: true,
+            })
+            .where(eq(users.mobile, staffRecord.mobile));
+        } else {
+          await db.insert(users).values({
+            mobile: staffRecord.mobile,
+            email: staffRecord.email,
+            password: hashedPassword,
+            fullName: `${staffRecord.fullName} (${fullNameSuffix} ${entry.districtLabel})`,
+            role,
+            district: entry.districtLabel,
+            username: staffRecord.username,
+            designation,
+            isActive: true,
+          });
+        }
+
+        if (roleKey === 'da') {
+          daUpserts += 1;
+        } else {
+          dtdoUpserts += 1;
+        }
+      }
     }
+
+    console.log(
+      `✅ District staff accounts ensured (${daUpserts} DA, ${dtdoUpserts} DTDO)`
+    );
+    console.log(
+      '   ➜ Reference credentials: seed_data/district-staff-accounts.csv'
+    );
+
+    const sampleEntry =
+      staffManifest.find(
+        (entry) =>
+          entry.districtLabel.toLowerCase().includes('shimla') ||
+          entry.da.username === 'da_shimla'
+      ) ?? staffManifest[0];
 
     console.log('\n📋 Summary of Default Accounts:');
     console.log('┌────────────────────┬──────────────┬──────────────────┬──────────────────────┐');
@@ -177,7 +204,29 @@ async function seed() {
     console.log('├────────────────────┼──────────────┼──────────────────┼──────────────────────┤');
     console.log('│ Admin              │ 9999999999   │ admin123         │ User Management      │');
     console.log('│ Super Admin        │ 9999999998   │ SuperAdmin@2025  │ Full System + Reset  │');
-    console.log('│ Dealing Assistant  │ 9876543210   │ da123            │ Shimla District      │');
+    console.log(`│ Dealing Assistants │ ${daUpserts
+      .toString()
+      .padEnd(12)} │ refer manifest   │ District Queues      │`);
+    console.log(`│ DTDOs              │ ${dtdoUpserts
+      .toString()
+      .padEnd(12)} │ refer manifest   │ District Escalations │`);
+    if (sampleEntry) {
+      console.log('├────────────────────┼──────────────┼──────────────────┼──────────────────────┤');
+      console.log(
+        `│ Sample DA (${sampleEntry.districtLabel
+          .slice(0, 12)
+          .padEnd(12)}) │ ${sampleEntry.da.mobile.padEnd(12)} │ ${sampleEntry.da.password.padEnd(
+          16
+        )} │ ${sampleEntry.districtLabel.padEnd(20).slice(0, 20)} │`
+      );
+      console.log(
+        `│ Sample DTDO (${sampleEntry.districtLabel
+          .slice(0, 12)
+          .padEnd(12)}) │ ${sampleEntry.dtdo.mobile.padEnd(12)} │ ${sampleEntry.dtdo.password.padEnd(
+          16
+        )} │ ${sampleEntry.districtLabel.padEnd(20).slice(0, 20)} │`
+      );
+    }
     console.log('└────────────────────┴──────────────┴──────────────────┴──────────────────────┘');
 
     console.log('\n🎉 Database seed completed successfully!');
