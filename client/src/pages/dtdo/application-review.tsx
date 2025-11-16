@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, useLocation } from "wouter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,14 +25,22 @@ import {
   User,
   MapPin,
   Home as HomeIcon,
-  Calendar,
   ClipboardCheck,
   AlertTriangle,
+  Shield,
+  Ruler,
+  Banknote,
+  Copy,
+  ZoomIn,
+  Download,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { format } from "date-fns";
 import type { HomestayApplication, Document as HomestayDocument } from "@shared/schema";
+import { buildObjectViewUrl } from "@/lib/utils";
+import { ApplicationTimelineCard } from "@/components/application/application-timeline-card";
+import { InspectionReportCard } from "@/components/application/inspection-report-card";
 
 interface ApplicationData {
   application: HomestayApplication;
@@ -46,7 +54,18 @@ interface ApplicationData {
     fullName: string;
     mobile: string;
   };
+  correctionHistory?: Array<{
+    id: string;
+    createdAt: string;
+    feedback?: string | null;
+  }>;
 }
+
+const formatCorrectionTimestamp = (value?: string | null) => {
+  if (!value) return "No resubmission yet";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "No resubmission yet" : format(parsed, "PPP p");
+};
 
 export default function DTDOApplicationReview() {
   const { id } = useParams<{ id: string }>();
@@ -55,6 +74,8 @@ export default function DTDOApplicationReview() {
   
   const [actionType, setActionType] = useState<'accept' | 'reject' | 'revert' | null>(null);
   const [remarks, setRemarks] = useState("");
+  const [previewDoc, setPreviewDoc] = useState<HomestayDocument | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const { data, isLoading } = useQuery<ApplicationData>({
     queryKey: ["/api/dtdo/applications", id],
@@ -70,6 +91,7 @@ export default function DTDOApplicationReview() {
     onSuccess: (data, variables) => {
       queryClient.invalidateQueries({ queryKey: ["/api/dtdo/applications"] });
       queryClient.invalidateQueries({ queryKey: ["/api/dtdo/applications", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/applications", id, "timeline"] });
       toast({
         title: "Success",
         description: "Application processed successfully",
@@ -91,35 +113,106 @@ export default function DTDOApplicationReview() {
     },
   });
 
-  if (isLoading) {
+  const application = data?.application;
+  const owner = data?.owner;
+  const documents = data?.documents ?? [];
+  const daInfo = data?.daInfo;
+  const correctionHistory = data?.correctionHistory ?? [];
+  const correctionCount = application?.correctionSubmissionCount ?? 0;
+  const lastCorrection = correctionHistory[0];
+
+  const documentStats = useMemo(() => {
+    const counts = { pending: 0, verified: 0, needsCorrection: 0, rejected: 0 };
+    for (const doc of documents) {
+      const status = (doc.verificationStatus || "pending").toLowerCase();
+      if (status === "verified") counts.verified += 1;
+      else if (status === "needs_correction") counts.needsCorrection += 1;
+      else if (status === "rejected") counts.rejected += 1;
+      else counts.pending += 1;
+    }
+    return counts;
+  }, [documents]);
+
+  const roomSummary = useMemo(() => {
+    const app = application;
+    if (!app) {
+      return [
+        { label: "Single Rooms", value: 0, rate: undefined },
+        { label: "Double Rooms", value: 0, rate: undefined },
+        { label: "Family Suites", value: 0, rate: undefined },
+      ];
+    }
+    return [
+      {
+        label: "Single Rooms",
+        value: app.singleBedRooms ?? 0,
+        rate: app.singleBedRoomRate,
+      },
+      {
+        label: "Double Rooms",
+        value: app.doubleBedRooms ?? 0,
+        rate: app.doubleBedRoomRate,
+      },
+      {
+        label: "Family Suites",
+        value: app.familySuites ?? 0,
+        rate: app.familySuiteRate,
+      },
+    ];
+  }, [application]);
+
+  const amenities = (application?.amenities as Record<string, boolean>) || {};
+  const safetyChecks = {
+    cctv: amenities.cctv ?? false,
+    fireSafety: amenities.fireSafety ?? false,
+    powerBackup: amenities.generator ?? false,
+    parking: amenities.parking ?? false,
+  };
+
+  if (isLoading || !application || !owner) {
     return (
       <div className="container mx-auto p-6 max-w-7xl">
         <div className="flex items-center justify-center h-96">
-          <Loader2 className="w-8 h-8 animate-spin text-primary" />
+          {isLoading ? (
+            <Loader2 className="w-8 h-8 animate-spin text-primary" />
+          ) : (
+            <div className="text-muted-foreground">Application not found</div>
+          )}
         </div>
       </div>
     );
   }
-
-  if (!data) {
-    return (
-      <div className="container mx-auto p-6 max-w-7xl">
-        <Card>
-          <CardContent className="p-12 text-center">
-            <AlertCircle className="w-16 h-16 mx-auto text-muted-foreground mb-4" />
-            <h3 className="text-xl font-semibold mb-2">Application Not Found</h3>
-            <Button onClick={() => setLocation("/dtdo/dashboard")} className="mt-4" data-testid="button-back">
-              Back to Dashboard
-            </Button>
-          </CardContent>
-        </Card>
-      </div>
-    );
-  }
-
-  const { application, owner, documents, daInfo } = data;
   const applicationStatus = application.status ?? "forwarded_to_dtdo";
   const daRemarks = (application as unknown as { daRemarks?: string | null }).daRemarks ?? null;
+  const actionableStatuses = new Set(["forwarded_to_dtdo", "dtdo_review"]);
+  const isActionableStatus = actionableStatuses.has(applicationStatus);
+  const formattedStatus = applicationStatus.replace(/_/g, " ").replace(/\b\w/g, (char) =>
+    char.toUpperCase(),
+  );
+  const copyApplicationNumber = async () => {
+    try {
+      await navigator.clipboard.writeText(application.applicationNumber);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+      toast({
+        title: "Copied",
+        description: "Application number copied to clipboard",
+      });
+    } catch (error) {
+      toast({
+        title: "Copy failed",
+        description: "Unable to copy application number",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const documentUrl = (doc: HomestayDocument) =>
+    (doc as unknown as { fileUrl?: string }).fileUrl ||
+    buildObjectViewUrl(doc.filePath, {
+      fileName: doc.fileName,
+      mimeType: doc.mimeType,
+    });
 
   const handleAction = (action: 'accept' | 'reject' | 'revert') => {
     setActionType(action);
@@ -194,7 +287,18 @@ export default function DTDOApplicationReview() {
           </Button>
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Application Review</h1>
-            <p className="text-muted-foreground mt-1">{application.applicationNumber}</p>
+            <div className="flex items-center gap-2 text-muted-foreground mt-1">
+              <span>{application.applicationNumber}</span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={copyApplicationNumber}
+                title="Copy application number"
+              >
+                <Copy className={`h-4 w-4 ${copied ? "text-green-600" : ""}`} />
+              </Button>
+            </div>
           </div>
         </div>
         <div className="flex gap-2">
@@ -242,31 +346,130 @@ export default function DTDOApplicationReview() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <HomeIcon className="h-5 w-5" />
-                    Property Information
+                    Property Snapshot
                   </CardTitle>
+                  <CardDescription>Key facts captured during owner onboarding</CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-3">
+                <CardContent className="grid md:grid-cols-2 gap-4">
                   <DetailRow label="Property Name" value={application.propertyName} />
                   <DetailRow label="Category" value={application.category.toUpperCase()} />
-                  <DetailRow label="Total Rooms" value={application.totalRooms.toString()} />
+                  <DetailRow label="Total Rooms" value={String(application.totalRooms ?? "N/A")} />
+                  <DetailRow label="Application Kind" value={application.applicationKind?.replace(/_/g, " ") ?? "New"} />
                   <DetailRow label="Address" value={application.address} />
-                  <DetailRow label="District" value={application.district} />
+                  <DetailRow label="District / Tehsil" value={`${application.district} • ${application.tehsil ?? "N/A"}`} />
                   <DetailRow label="Pincode" value={application.pincode} />
+                  <DetailRow label="Legacy RC / Guardian" value={(application as any).parentCertificateNumber || (application as any).guardianName || "N/A"} />
                 </CardContent>
               </Card>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <MapPin className="h-5 w-5" />
-                    Location
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <DetailRow label="Latitude" value={application.latitude || "N/A"} />
-                  <DetailRow label="Longitude" value={application.longitude || "N/A"} />
-                </CardContent>
-              </Card>
+              <div className="grid lg:grid-cols-2 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Ruler className="h-5 w-5" />
+                      Room Mix & Tariffs
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-muted-foreground">
+                          <th className="py-2">Type</th>
+                          <th className="py-2">Rooms</th>
+                          <th className="py-2 text-right">Tariff / Night</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {roomSummary.map((row) => (
+                          <tr key={row.label} className="border-t">
+                            <td className="py-2">{row.label}</td>
+                            <td className="py-2">{row.value}</td>
+                            <td className="py-2 text-right">{formatCurrency(row.rate)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Banknote className="h-5 w-5" />
+                      Fee & Discount Summary
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="grid gap-3 text-sm">
+                    <SummaryRow label="Base Fee" value={formatCurrency(application.baseFee)} />
+                    <SummaryRow label="Female Owner Discount" value={formatCurrency(application.femaleOwnerDiscount)} />
+                    <SummaryRow label="Pangi Concession" value={formatCurrency(application.pangiDiscount)} />
+                    <SummaryRow label="Multi-year Discount" value={formatCurrency(application.validityDiscount)} />
+                    <SummaryRow label="Total Discount" value={formatCurrency(application.totalDiscount)} />
+                    <div className="border-t pt-2 text-right text-base font-semibold">
+                      Payable: {formatCurrency(application.totalFee)}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Shield className="h-5 w-5" />
+                      Correction Tracking
+                    </CardTitle>
+                    <CardDescription>Owner acknowledgement before resubmission</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <DetailRow label="Corrections Used" value={`${correctionCount}`} />
+                    <DetailRow
+                      label="Owner Confirmation"
+                      value={formatCorrectionTimestamp(lastCorrection?.createdAt)}
+                    />
+                    {lastCorrection?.feedback && (
+                      <p className="text-xs text-muted-foreground rounded-lg border bg-muted/30 p-3">
+                        {lastCorrection.feedback}
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+
+              <div className="grid lg:grid-cols-2 gap-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Shield className="h-5 w-5" />
+                      Safety & Amenities
+                    </CardTitle>
+                    <CardDescription>Availability as declared by the owner</CardDescription>
+                  </CardHeader>
+                  <CardContent className="grid gap-2 text-sm">
+                    <TagRow label="CCTV Coverage" enabled={safetyChecks.cctv} />
+                    <TagRow label="Fire Safety Equipment" enabled={safetyChecks.fireSafety} />
+                    <TagRow label="Power Backup" enabled={safetyChecks.powerBackup} />
+                    <TagRow label="On-site Parking" enabled={safetyChecks.parking} />
+                    <DetailRow label="Nearest Hospital" value={application.nearestHospital ?? "N/A"} />
+                    <DetailRow label="Additional Notes" value={application.fireEquipmentDetails || application.serviceNotes || "N/A"} />
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <MapPin className="h-5 w-5" />
+                      Location
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <DetailRow label="Latitude" value={application.latitude || "N/A"} />
+                    <DetailRow label="Longitude" value={application.longitude || "N/A"} />
+                    <DetailRow label="Distance to Airport" value={formatDistance(application.distanceAirport)} />
+                    <DetailRow label="Distance to Railway" value={formatDistance(application.distanceRailway)} />
+                    <DetailRow label="Distance to City Center" value={formatDistance(application.distanceCityCenter)} />
+                    <DetailRow label="Distance to Bus Stand" value={formatDistance(application.distanceBusStand)} />
+                  </CardContent>
+                </Card>
+              </div>
             </TabsContent>
 
             <TabsContent value="owner" className="space-y-4 mt-4">
@@ -274,13 +477,19 @@ export default function DTDOApplicationReview() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <User className="h-5 w-5" />
-                    Owner Details
+                    Owner & Guardian Details
                   </CardTitle>
+                  <CardDescription>Verify identity before inspection scheduling</CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-3">
+                <CardContent className="grid md:grid-cols-2 gap-4">
                   <DetailRow label="Full Name" value={owner.fullName} />
+                  <DetailRow label="Gender" value={application.ownerGender?.toUpperCase()} />
                   <DetailRow label="Mobile" value={owner.mobile} />
                   <DetailRow label="Email" value={owner.email || "N/A"} />
+                  <DetailRow label="Guardian / Father" value={(application as any).guardianName || "N/A"} />
+                  <DetailRow label="Aadhaar" value={application.ownerAadhaar} />
+                  <DetailRow label="Ownership" value={(application.propertyOwnership || "").replace(/_/g, " ") || "N/A"} />
+                  <DetailRow label="Alternate Phone" value={(application as any).alternatePhone || "N/A"} />
                 </CardContent>
               </Card>
             </TabsContent>
@@ -292,40 +501,73 @@ export default function DTDOApplicationReview() {
                     <FileText className="h-5 w-5" />
                     Uploaded Documents
                   </CardTitle>
-                  <CardDescription>{documents.length} documents uploaded</CardDescription>
+                  <CardDescription>
+                    {documents.length} uploaded • {documentStats.verified} verified by DA · {documentStats.pending} pending
+                  </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="space-y-2">
+                  <div className="space-y-3">
                     {documents.length === 0 ? (
                       <p className="text-sm text-muted-foreground text-center py-8">
                         No documents uploaded
                       </p>
                     ) : (
                       documents.map((doc) => {
-                        const fileUrl = (doc as { fileUrl?: string }).fileUrl ?? doc.filePath;
+                        const statusMeta = getDocumentStatusMeta(doc.verificationStatus);
+                        const trimmedNotes =
+                          typeof doc.verificationNotes === "string" && doc.verificationNotes.trim().length > 0
+                            ? doc.verificationNotes.trim()
+                            : "";
                         return (
-                          <div key={doc.id} className="flex items-center justify-between p-3 border rounded-lg hover-elevate">
-                          <div className="flex items-center gap-3">
-                            <FileText className="h-4 w-4 text-muted-foreground" />
-                            <div>
-                              <div className="font-medium text-sm">{doc.documentType}</div>
-                              <div className="text-xs text-muted-foreground">{doc.fileName}</div>
+                        <div
+                          key={doc.id}
+                          className="p-3 border rounded-xl bg-card/50 shadow-xs flex flex-col gap-2"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                              <FileText className="h-5 w-5 text-muted-foreground" />
+                              <div>
+                                <div className="font-medium text-sm">{formatDocumentType(doc.documentType)}</div>
+                                <div className="text-xs text-muted-foreground">{doc.fileName}</div>
+                              </div>
                             </div>
+                            <StatusBadge status={doc.verificationStatus ?? "pending"} />
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => {
-                              if (fileUrl) {
-                                window.open(fileUrl, "_blank");
-                              }
-                            }}
-                            data-testid={`button-view-doc-${doc.id}`}
-                          >
-                            View
-                          </Button>
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setPreviewDoc(doc)}
+                              data-testid={`button-preview-doc-${doc.id}`}
+                            >
+                              <ZoomIn className="h-4 w-4 mr-2" />
+                              Preview
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => window.open(documentUrl(doc), "_blank")}
+                            >
+                              <Download className="h-4 w-4 mr-2" />
+                              Download
+                            </Button>
                           </div>
-                        );
+                          {trimmedNotes && (
+                            <div
+                              className={`rounded-lg border px-3 py-2 text-sm space-y-1 ${
+                                statusMeta?.noteBgClass ?? "bg-muted/30 border-border/60"
+                              }`}
+                            >
+                              <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                DA Remarks
+                              </div>
+                              <p className={statusMeta?.noteTextClass ?? "text-muted-foreground"}>
+                                {trimmedNotes}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      );
                       })
                     )}
                   </div>
@@ -337,73 +579,65 @@ export default function DTDOApplicationReview() {
 
         {/* Right Column - Decision Panel */}
         <div className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>DTDO Decision</CardTitle>
-              <CardDescription>Review and take action on this application</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Button
-                className="w-full"
-                variant="default"
-                onClick={() => handleAction('accept')}
-                disabled={actionMutation.isPending}
-                data-testid="button-accept"
-              >
-                <CheckCircle className="mr-2 h-4 w-4" />
-                Accept & Schedule Inspection
-              </Button>
+          {isActionableStatus ? (
+            <Card>
+              <CardHeader>
+                <CardTitle>DTDO Decision</CardTitle>
+                <CardDescription>Review and take action on this application</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <Button
+                  className="w-full"
+                  variant="default"
+                  onClick={() => handleAction('accept')}
+                  disabled={actionMutation.isPending}
+                  data-testid="button-accept"
+                >
+                  <CheckCircle className="mr-2 h-4 w-4" />
+                  Accept & Schedule Inspection
+                </Button>
 
-              <Button
-                className="w-full"
-                variant="outline"
-                onClick={() => handleAction('revert')}
-                disabled={actionMutation.isPending}
-                data-testid="button-revert"
-              >
-                <AlertTriangle className="mr-2 h-4 w-4" />
-                Revert to Applicant
-              </Button>
+                <Button
+                  className="w-full"
+                  variant="outline"
+                  onClick={() => handleAction('revert')}
+                  disabled={actionMutation.isPending}
+                  data-testid="button-revert"
+                >
+                  <AlertTriangle className="mr-2 h-4 w-4" />
+                  Revert to Applicant
+                </Button>
 
-              <Button
-                className="w-full"
-                variant="destructive"
-                onClick={() => handleAction('reject')}
-                disabled={actionMutation.isPending}
-                data-testid="button-reject"
-              >
-                <XCircle className="mr-2 h-4 w-4" />
-                Reject Application
-              </Button>
-            </CardContent>
-          </Card>
+                <Button
+                  className="w-full"
+                  variant="destructive"
+                  onClick={() => handleAction('reject')}
+                  disabled={actionMutation.isPending}
+                  data-testid="button-reject"
+                >
+                  <XCircle className="mr-2 h-4 w-4" />
+                  Reject Application
+                </Button>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card>
+              <CardHeader>
+                <CardTitle>DTDO Decision</CardTitle>
+                <CardDescription>
+                  Actions are disabled because this application is already {formattedStatus}.
+                </CardDescription>
+              </CardHeader>
+            </Card>
+          )}
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Calendar className="h-5 w-5" />
-                Timeline
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3 text-sm">
-              {application.submittedAt && (
-                <div>
-                  <div className="font-medium">Submitted</div>
-                  <div className="text-muted-foreground">
-                    {format(new Date(application.submittedAt), "MMM dd, yyyy HH:mm")}
-                  </div>
-                </div>
-              )}
-              {application.daForwardedDate && (
-                <div>
-                  <div className="font-medium">Forwarded by DA</div>
-                  <div className="text-muted-foreground">
-                    {format(new Date(application.daForwardedDate), "MMM dd, yyyy HH:mm")}
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
+          <InspectionReportCard applicationId={id} preferDtdoEndpoint />
+
+          <ApplicationTimelineCard
+            applicationId={id}
+            description="Workflow trace covering DA scrutiny, DTDO actions, and owner resubmissions."
+            preferDtdoEndpoint
+          />
         </div>
       </div>
 
@@ -471,6 +705,56 @@ export default function DTDOApplicationReview() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={!!previewDoc} onOpenChange={(open) => !open && setPreviewDoc(null)}>
+        <DialogContent className="max-w-4xl">
+          {previewDoc && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <FileText className="h-5 w-5" />
+                  {formatDocumentType(previewDoc.documentType)}
+                </DialogTitle>
+                <DialogDescription className="flex items-center justify-between flex-wrap gap-2">
+                  <span>{previewDoc.fileName}</span>
+                  <StatusBadge status={previewDoc.verificationStatus ?? "pending"} />
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2">
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => window.open(documentUrl(previewDoc), "_blank")}
+                  >
+                    <Download className="h-4 w-4 mr-2" />
+                    Download Original
+                  </Button>
+                </div>
+                <div className="border rounded-lg max-h-[70vh] overflow-auto bg-muted/30 flex items-center justify-center">
+                  {previewDoc.mimeType?.startsWith("image/") ? (
+                    <img
+                      src={documentUrl(previewDoc)}
+                      alt={previewDoc.fileName}
+                      className="w-full h-auto object-contain"
+                    />
+                  ) : previewDoc.mimeType?.includes("pdf") ? (
+                    <iframe
+                      src={documentUrl(previewDoc)}
+                      className="w-full h-[70vh]"
+                      title={previewDoc.fileName}
+                    />
+                  ) : (
+                    <div className="p-8 text-center text-sm text-muted-foreground">
+                      This file type is not previewable in the browser. Please download the original file.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -482,4 +766,96 @@ function DetailRow({ label, value }: { label: string; value?: string }) {
       <span className="font-medium text-right">{value || "N/A"}</span>
     </div>
   );
+}
+
+function SummaryRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between text-sm">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="font-semibold">{value}</span>
+    </div>
+  );
+}
+
+function TagRow({ label, enabled }: { label: string; enabled?: boolean }) {
+  return (
+    <div className="flex items-center justify-between text-sm">
+      <span className="text-muted-foreground">{label}</span>
+      <Badge variant={enabled ? "default" : "outline"} className={enabled ? "bg-green-100 text-green-700" : ""}>
+        {enabled ? "Available" : "Missing"}
+      </Badge>
+    </div>
+  );
+}
+
+type DocumentStatusMeta = {
+  label: string;
+  badgeClass: string;
+  noteBgClass: string;
+  noteTextClass: string;
+};
+
+const DOCUMENT_STATUS_META: Record<string, DocumentStatusMeta> = {
+  pending: {
+    label: "Pending review",
+    badgeClass: "bg-slate-100 text-slate-700",
+    noteBgClass: "bg-slate-50 border-slate-200",
+    noteTextClass: "text-slate-800",
+  },
+  verified: {
+    label: "Verified",
+    badgeClass: "bg-emerald-50 text-emerald-700",
+    noteBgClass: "bg-emerald-50 border-emerald-200",
+    noteTextClass: "text-emerald-900",
+  },
+  needs_correction: {
+    label: "Needs correction",
+    badgeClass: "bg-amber-50 text-amber-800",
+    noteBgClass: "bg-amber-50 border-amber-200",
+    noteTextClass: "text-amber-900",
+  },
+  rejected: {
+    label: "Rejected",
+    badgeClass: "bg-rose-50 text-rose-700",
+    noteBgClass: "bg-rose-50 border-rose-200",
+    noteTextClass: "text-rose-900",
+  },
+};
+
+const getDocumentStatusMeta = (status?: string | null): DocumentStatusMeta | null => {
+  if (!status) return null;
+  const normalized = status.toLowerCase();
+  if (DOCUMENT_STATUS_META[normalized]) {
+    return DOCUMENT_STATUS_META[normalized];
+  }
+  return {
+    label: status.replace(/_/g, " "),
+    badgeClass: "bg-muted text-muted-foreground",
+    noteBgClass: "bg-muted/40 border-border/60",
+    noteTextClass: "text-muted-foreground",
+  };
+};
+
+function StatusBadge({ status }: { status: string }) {
+  const meta = getDocumentStatusMeta(status) ?? DOCUMENT_STATUS_META.pending;
+  return <Badge className={meta.badgeClass}>{meta.label}</Badge>;
+}
+
+function formatCurrency(value?: string | number | null) {
+  if (value === null || value === undefined) return "—";
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  return `₹${numeric.toLocaleString("en-IN")}`;
+}
+
+function formatDistance(value?: number | string | null) {
+  if (value === null || value === undefined) return "Not provided";
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "Not provided";
+  return `${numeric} km`;
+}
+
+function formatDocumentType(value?: string | null) {
+  if (!value) return "Document";
+  return value.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }

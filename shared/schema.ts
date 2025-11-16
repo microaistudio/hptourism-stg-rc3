@@ -3,6 +3,37 @@ import { pgTable, text, varchar, integer, decimal, boolean, timestamp, jsonb } f
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
 
+export const APPLICATION_KIND_VALUES = ['new_registration', 'renewal', 'add_rooms', 'delete_rooms', 'cancel_certificate'] as const;
+export type ApplicationKind = typeof APPLICATION_KIND_VALUES[number];
+export const applicationKindEnum = z.enum(APPLICATION_KIND_VALUES);
+
+const serviceContextSchema = z.object({
+  requestedRooms: z.object({
+    single: z.number().int().min(0).optional(),
+    double: z.number().int().min(0).optional(),
+    family: z.number().int().min(0).optional(),
+    total: z.number().int().min(0).optional(),
+  }).partial().optional(),
+  requestedRoomDelta: z.number().int().optional(),
+  requestedDeletions: z.array(
+    z.object({
+      roomType: z.string().min(1),
+      count: z.number().int().min(1),
+    })
+  ).optional(),
+  renewalWindow: z.object({
+    start: z.string().min(4),
+    end: z.string().min(4),
+  }).partial().optional(),
+  requiresPayment: z.boolean().optional(),
+  inheritsCertificateExpiry: z.string().optional(),
+  note: z.string().optional(),
+  legacyGuardianName: z.union([z.string(), z.null()]).optional(),
+  legacyOnboarding: z.boolean().optional(),
+}).partial();
+
+export type ApplicationServiceContext = z.infer<typeof serviceContextSchema>;
+
 // Users Table
 export const users = pgTable("users", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
@@ -26,7 +57,7 @@ export const users = pgTable("users", {
   officePhone: varchar("office_phone", { length: 15 }),
   
   // System fields
-  role: varchar("role", { length: 50 }).notNull().default('property_owner'), // 'property_owner', 'district_officer', 'state_officer', 'admin', 'dealing_assistant', 'district_tourism_officer', 'super_admin'
+  role: varchar("role", { length: 50 }).notNull().default('property_owner'), // 'property_owner', 'district_officer', 'state_officer', 'admin', 'dealing_assistant', 'district_tourism_officer', 'super_admin', 'admin_rc'
   aadhaarNumber: varchar("aadhaar_number", { length: 12 }).unique(),
   district: varchar("district", { length: 100 }),
   password: text("password"), // For demo/testing, in production would use proper auth
@@ -48,7 +79,7 @@ export const insertUserSchema = createInsertSchema(users, {
   employeeId: z.string().optional().or(z.literal('')),
   officeAddress: z.string().optional().or(z.literal('')),
   officePhone: z.string().regex(/^[6-9]\d{9}$/, "Invalid phone number").optional().or(z.literal('')),
-  role: z.enum(['property_owner', 'district_officer', 'state_officer', 'admin', 'dealing_assistant', 'district_tourism_officer', 'super_admin']),
+  role: z.enum(['property_owner', 'district_officer', 'state_officer', 'admin', 'dealing_assistant', 'district_tourism_officer', 'super_admin', 'admin_rc']),
   aadhaarNumber: z.string().regex(/^\d{12}$/, "Invalid Aadhaar number").optional().or(z.literal('')),
   district: z.string().optional().or(z.literal('')),
   password: z.string().min(1, "Password is required"),
@@ -74,7 +105,7 @@ export const userProfiles = pgTable("user_profiles", {
   district: varchar("district", { length: 100 }),
   tehsil: varchar("tehsil", { length: 100 }),
   block: varchar("block", { length: 100 }), // For rural (GP) areas
-  gramPanchayat: varchar("gram_panchayat", { length: 100 }), // For rural (GP) areas
+  gramPanchayat: varchar("gram_panchayat", { length: 100 }), // Village/locality (GP for rural, locality for urban)
   urbanBody: varchar("urban_body", { length: 200 }), // For urban (MC/TCP) areas
   ward: varchar("ward", { length: 50 }), // For urban (MC/TCP) areas
   address: text("address"),
@@ -110,10 +141,26 @@ export type InsertUserProfile = z.infer<typeof insertUserProfileSchema>;
 export type UserProfile = typeof userProfiles.$inferSelect;
 
 // Homestay Applications Table
+export const PROJECT_TYPE_VALUES = [
+  "new_property",
+  "existing_property",
+  "new_project",
+  "new_rooms",
+] as const;
+type ProjectType = (typeof PROJECT_TYPE_VALUES)[number];
+
 export const homestayApplications = pgTable("homestay_applications", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   userId: varchar("user_id").notNull().references(() => users.id),
   applicationNumber: varchar("application_number", { length: 50 }).notNull().unique(),
+  applicationKind: varchar("application_kind", { length: 30 }).$type<ApplicationKind>().notNull().default('new_registration'),
+  parentApplicationId: varchar("parent_application_id"),
+  parentApplicationNumber: varchar("parent_application_number", { length: 50 }),
+  parentCertificateNumber: varchar("parent_certificate_number", { length: 50 }),
+  inheritedCertificateValidUpto: timestamp("inherited_certificate_valid_upto"),
+  serviceContext: jsonb("service_context").$type<ApplicationServiceContext>(),
+  serviceNotes: text("service_notes"),
+  serviceRequestedAt: timestamp("service_requested_at"),
   
   // Property Details (ANNEXURE-I)
   propertyName: varchar("property_name", { length: 255 }).notNull(),
@@ -132,8 +179,8 @@ export const homestayApplications = pgTable("homestay_applications", {
   block: varchar("block", { length: 100 }), // Mandatory for rural (gp)
   blockOther: varchar("block_other", { length: 100 }), // Custom block if not in LGD
   
-  gramPanchayat: varchar("gram_panchayat", { length: 100 }), // Mandatory for rural (gp)
-  gramPanchayatOther: varchar("gram_panchayat_other", { length: 100 }), // Custom gram panchayat if not in LGD
+  gramPanchayat: varchar("gram_panchayat", { length: 100 }), // Village/locality (GP for rural, locality for urban)
+  gramPanchayatOther: varchar("gram_panchayat_other", { length: 100 }), // Custom entry if not in LGD
   
   // Urban Address (for MC/TCP)
   urbanBody: varchar("urban_body", { length: 200 }), // Name of MC/TCP/Nagar Panchayat - Mandatory for urban
@@ -154,12 +201,13 @@ export const homestayApplications = pgTable("homestay_applications", {
   ownerGender: varchar("owner_gender", { length: 10 }).notNull(), // 'male', 'female', 'other' - affects fee (female gets 10% discount for 3 years)
   ownerMobile: varchar("owner_mobile", { length: 15 }).notNull(),
   ownerEmail: varchar("owner_email", { length: 255 }),
+  guardianName: varchar("guardian_name", { length: 255 }),
   ownerAadhaar: varchar("owner_aadhaar", { length: 12 }).notNull(),
   propertyOwnership: varchar("property_ownership", { length: 10 }).$type<'owned' | 'leased'>().notNull().default('owned'),
   
   // Room & Category Details (ANNEXURE-I)
   proposedRoomRate: decimal("proposed_room_rate", { precision: 10, scale: 2 }), // DEPRECATED: Use per-room-type rates below
-  projectType: varchar("project_type", { length: 20 }).notNull(), // 'new_rooms', 'new_project'
+  projectType: varchar("project_type", { length: 20 }).$type<ProjectType>().notNull(),
   propertyArea: decimal("property_area", { precision: 10, scale: 2 }).notNull(), // in sq meters
   
   // 2025 Rules - Per Room Type Rates (Required for Form-A certificate)
@@ -256,7 +304,8 @@ export const homestayApplications = pgTable("homestay_applications", {
   daId: varchar("da_id").references(() => users.id),
   daReviewDate: timestamp("da_review_date"),
   daForwardedDate: timestamp("da_forwarded_date"),
-  
+  daRemarks: text("da_remarks"),
+
   stateOfficerId: varchar("state_officer_id").references(() => users.id),
   stateReviewDate: timestamp("state_review_date"),
   stateNotes: text("state_notes"),
@@ -264,6 +313,7 @@ export const homestayApplications = pgTable("homestay_applications", {
   // DTDO (District Tourism Development Officer) Details
   dtdoId: varchar("dtdo_id").references(() => users.id),
   dtdoReviewDate: timestamp("dtdo_review_date"),
+  correctionSubmissionCount: integer("correction_submission_count").notNull().default(0),
   dtdoRemarks: text("dtdo_remarks"),
   
   rejectionReason: text("rejection_reason"),
@@ -319,6 +369,14 @@ export const homestayApplications = pgTable("homestay_applications", {
 });
 
 export const insertHomestayApplicationSchema = createInsertSchema(homestayApplications, {
+  applicationKind: applicationKindEnum.default('new_registration'),
+  parentApplicationId: z.string().uuid().optional(),
+  parentApplicationNumber: z.string().optional().or(z.literal('')),
+  parentCertificateNumber: z.string().optional().or(z.literal('')),
+  inheritedCertificateValidUpto: z.union([z.date(), z.string()]).optional(),
+  serviceContext: serviceContextSchema.optional(),
+  serviceNotes: z.string().optional().or(z.literal('')),
+  serviceRequestedAt: z.union([z.date(), z.string()]).optional(),
   propertyName: z.string().min(3, "Property name must be at least 3 characters"),
   category: z.enum(['diamond', 'gold', 'silver']),
   locationType: z.enum(['mc', 'tcp', 'gp']),
@@ -340,9 +398,10 @@ export const insertHomestayApplicationSchema = createInsertSchema(homestayApplic
   ownerGender: z.enum(['male', 'female', 'other']),
   ownerMobile: z.string().regex(/^[6-9]\d{9}$/),
   ownerEmail: z.string().email().optional().or(z.literal('')),
+  guardianName: z.string().min(3).optional().or(z.literal('')),
   ownerAadhaar: z.string().regex(/^\d{12}$/),
   proposedRoomRate: z.number().min(100, "Room rate must be at least ₹100").optional(), // DEPRECATED: Use per-room-type rates
-  projectType: z.enum(['new_rooms', 'new_project']),
+  projectType: z.enum(PROJECT_TYPE_VALUES),
   propertyArea: z.number().min(1, "Property area required"),
   
   // 2025 Rules - Per Room Type Rates
@@ -413,6 +472,14 @@ export const insertHomestayApplicationSchema = createInsertSchema(homestayApplic
 
 // Draft Application Schema - Most fields optional for saving incomplete applications
 export const draftHomestayApplicationSchema = createInsertSchema(homestayApplications, {
+  applicationKind: applicationKindEnum.optional(),
+  parentApplicationId: z.string().uuid().optional(),
+  parentApplicationNumber: z.string().optional().or(z.literal('')),
+  parentCertificateNumber: z.string().optional().or(z.literal('')),
+  inheritedCertificateValidUpto: z.union([z.date(), z.string()]).optional(),
+  serviceContext: serviceContextSchema.optional(),
+  serviceNotes: z.string().optional().or(z.literal('')),
+  serviceRequestedAt: z.union([z.date(), z.string()]).optional(),
   propertyName: z.string().min(1).optional().or(z.literal('')),
   category: z.enum(['diamond', 'gold', 'silver']).optional(),
   locationType: z.enum(['mc', 'tcp', 'gp']).optional(),
@@ -434,6 +501,7 @@ export const draftHomestayApplicationSchema = createInsertSchema(homestayApplica
   ownerGender: z.enum(['male', 'female', 'other']).optional(),
   ownerMobile: z.string().optional().or(z.literal('')),
   ownerEmail: z.string().optional().or(z.literal('')),
+  guardianName: z.string().optional().or(z.literal('')),
   ownerAadhaar: z.string().optional().or(z.literal('')),
   proposedRoomRate: z.number().optional(), // DEPRECATED: Use per-room-type rates
   projectType: z.enum(['new_rooms', 'new_project']).optional(),
@@ -605,7 +673,17 @@ export const applicationActions = pgTable("application_actions", {
 });
 
 export const insertApplicationActionSchema = createInsertSchema(applicationActions, {
-  action: z.enum(['approved', 'rejected', 'sent_back_for_corrections', 'clarification_requested', 'site_inspection_scheduled', 'document_verified', 'payment_verified']),
+  action: z.enum([
+    'approved',
+    'rejected',
+    'sent_back_for_corrections',
+    'clarification_requested',
+    'site_inspection_scheduled',
+    'document_verified',
+    'payment_verified',
+    'inspection_acknowledged',
+    'correction_resubmitted',
+  ]),
   feedback: z.string().min(10, "Feedback must be at least 10 characters"),
 }).omit({ id: true, createdAt: true });
 
@@ -725,6 +803,7 @@ export const himkoshTransactions = pgTable("himkosh_transactions", {
   
   // Challan Details
   challanPrintUrl: text("challan_print_url"), // URL to print challan from CTP
+  portalBaseUrl: text("portal_base_url"),
   
   // Transaction Status
   transactionStatus: varchar("transaction_status", { length: 50 }).default('initiated'), // 'initiated', 'redirected', 'success', 'failed', 'verified'
@@ -1156,6 +1235,32 @@ export const insertSystemSettingSchema = createInsertSchema(systemSettings, {
 export const selectSystemSettingSchema = createSelectSchema(systemSettings);
 export type InsertSystemSetting = z.infer<typeof insertSystemSettingSchema>;
 export type SystemSetting = typeof systemSettings.$inferSelect;
+
+export const loginOtpChallenges = pgTable("login_otp_challenges", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  userId: varchar("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  otpHash: varchar("otp_hash", { length: 255 }).notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  consumedAt: timestamp("consumed_at"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+export type LoginOtpChallenge = typeof loginOtpChallenges.$inferSelect;
+
+export const passwordResetChallenges = pgTable("password_reset_challenges", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  userId: varchar("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  channel: varchar("channel", { length: 32 }).notNull(),
+  recipient: varchar("recipient", { length: 255 }),
+  otpHash: varchar("otp_hash", { length: 255 }).notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  consumedAt: timestamp("consumed_at"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+export type PasswordResetChallenge = typeof passwordResetChallenges.$inferSelect;
 
 // ====================================================================
 // LGD Master Tables (Local Government Directory - Himachal Pradesh)

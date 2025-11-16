@@ -9,6 +9,11 @@
  * - Pangi sub-division discount: 50%
  */
 
+import {
+  DEFAULT_CATEGORY_RATE_BANDS,
+  type CategoryRateBands,
+} from "./appSettings";
+
 export type CategoryType = 'diamond' | 'gold' | 'silver';
 export type LocationType = 'mc' | 'tcp' | 'gp';
 
@@ -156,15 +161,24 @@ export interface CategoryValidationResult {
   suggestedCategory?: CategoryType;
 }
 
+const CATEGORY_PRIORITY: Record<CategoryType, number> = {
+  silver: 1,
+  gold: 2,
+  diamond: 3,
+};
+
+const capitalizeCategory = (value: CategoryType) => value.charAt(0).toUpperCase() + value.slice(1);
+
 export function validateCategorySelection(
   selectedCategory: CategoryType,
   totalRooms: number,
-  highestRoomRate: number
+  highestRoomRate: number,
+  bands: CategoryRateBands = DEFAULT_CATEGORY_RATE_BANDS,
 ): CategoryValidationResult {
   const errors: string[] = [];
   const warnings: string[] = [];
   let suggestedCategory: CategoryType | undefined;
-  const categoryLabel = selectedCategory.charAt(0).toUpperCase() + selectedCategory.slice(1);
+  const categoryLabel = capitalizeCategory(selectedCategory);
 
   if (totalRooms < 1) {
     errors.push("At least one room must be configured to determine the category.");
@@ -176,27 +190,28 @@ export function validateCategorySelection(
 
   if (highestRoomRate <= 0) {
     errors.push("Please provide nightly rates for at least one room type.");
-  }
+  } else {
+    const recommendedCategory = suggestCategory(totalRooms, highestRoomRate, bands);
+    suggestedCategory = recommendedCategory;
+    const selectedRank = CATEGORY_PRIORITY[selectedCategory];
+    const recommendedRank = CATEGORY_PRIORITY[recommendedCategory];
+    const formattedRate = Math.round(highestRoomRate).toLocaleString("en-IN");
 
-  if (selectedCategory === "diamond" && highestRoomRate <= 10000) {
-    errors.push(`${categoryLabel} requires tariff above ₹10,000 per room per night. Your highest rate is ₹${Math.round(highestRoomRate).toLocaleString("en-IN")}.`);
-    suggestedCategory = "gold";
-  }
-
-  if (selectedCategory === "gold") {
-    if (highestRoomRate < 3000) {
-      errors.push(`${categoryLabel} requires tariff between ₹3,000 and ₹10,000 per room per night. Your highest rate is ₹${Math.round(highestRoomRate).toLocaleString("en-IN")}.`);
-      suggestedCategory = "silver";
+    if (selectedRank < recommendedRank) {
+      errors.push(
+        `Your highest tariff of ₹${formattedRate} falls under the ${capitalizeCategory(
+          recommendedCategory,
+        )} bracket. Please switch to ${capitalizeCategory(recommendedCategory)} or higher to remain compliant.`,
+      );
+    } else if (selectedRank > recommendedRank) {
+      warnings.push(
+        `Your highest tariff of ₹${formattedRate} fits within the ${capitalizeCategory(
+          recommendedCategory,
+        )} bracket. ${categoryLabel} is optional—consider selecting ${capitalizeCategory(
+          recommendedCategory,
+        )} to lower the registration fee.`,
+      );
     }
-    if (highestRoomRate > 10000) {
-      errors.push(`${categoryLabel} caps tariff at ₹10,000 per room per night. Your highest rate is ₹${Math.round(highestRoomRate).toLocaleString("en-IN")} (Diamond bracket).`);
-      suggestedCategory = "diamond";
-    }
-  }
-
-  if (selectedCategory === "silver" && highestRoomRate >= 3000) {
-    errors.push(`${categoryLabel} requires tariff below ₹3,000 per room per night. Your highest rate is ₹${Math.round(highestRoomRate).toLocaleString("en-IN")}.`);
-    suggestedCategory = highestRoomRate > 10000 ? "diamond" : "gold";
   }
   
   return {
@@ -212,17 +227,24 @@ export function validateCategorySelection(
  */
 export function suggestCategory(
   totalRooms: number,
-  highestRoomRate: number
+  highestRoomRate: number,
+  bands: CategoryRateBands = DEFAULT_CATEGORY_RATE_BANDS,
 ): CategoryType {
-  if (highestRoomRate > 10000) {
-    return 'diamond';
+  if (highestRoomRate <= 0) {
+    return "silver";
   }
 
-  if (highestRoomRate >= 3000) {
-    return 'gold';
+  const ordered: CategoryType[] = ["silver", "gold", "diamond"];
+  for (const category of ordered) {
+    const band = bands[category];
+    const min = Math.max(0, Math.floor(band.min));
+    const max = band.max === null ? Number.POSITIVE_INFINITY : Math.floor(band.max);
+    if (highestRoomRate >= min && highestRoomRate <= max) {
+      return category;
+    }
   }
 
-  return 'silver';
+  return "diamond";
 }
 
 /**

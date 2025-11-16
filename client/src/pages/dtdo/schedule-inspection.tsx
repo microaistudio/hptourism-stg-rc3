@@ -1,9 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, useLocation } from "wouter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import {
@@ -25,7 +24,11 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { format } from "date-fns";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Calendar } from "@/components/ui/calendar";
+import { cn } from "@/lib/utils";
 import type { HomestayApplication } from "@shared/schema";
+import { ApplicationSummaryCard } from "@/components/application/application-summary";
 
 interface ApplicationData {
   application: HomestayApplication;
@@ -42,12 +45,42 @@ interface DealingAssistant {
   mobile: string;
 }
 
+const generateTimeSlots = (startHour = 8, endHour = 19) => {
+  const slots: string[] = [];
+  for (let hour = startHour; hour <= endHour; hour++) {
+    for (const minute of [0, 15, 30, 45]) {
+      if (hour === endHour && minute > 45) continue;
+      const labelHour = String(hour).padStart(2, "0");
+      const labelMinute = String(minute).padStart(2, "0");
+      slots.push(`${labelHour}:${labelMinute}`);
+    }
+  }
+  return slots;
+};
+
+const TIME_SLOTS = generateTimeSlots(8, 19);
+
+const formatTimeLabel = (slot: string) => {
+  const [hour, minute] = slot.split(":").map(Number);
+  const date = new Date();
+  date.setHours(hour, minute, 0, 0);
+  return format(date, "h:mm a");
+};
+
+const combineDateAndTime = (date: Date, time: string) => {
+  const [hour, minute] = time.split(":").map(Number);
+  const combined = new Date(date);
+  combined.setHours(hour, minute, 0, 0);
+  return combined;
+};
+
 export default function DTDOScheduleInspection() {
   const { id } = useParams<{ id: string }>();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
 
-  const [inspectionDate, setInspectionDate] = useState("");
+  const [selectedDate, setSelectedDate] = useState<Date | undefined>();
+  const [selectedTime, setSelectedTime] = useState<string>(TIME_SLOTS[8] ?? "10:00");
   const [assignedDA, setAssignedDA] = useState("");
   const [specialInstructions, setSpecialInstructions] = useState("");
 
@@ -115,10 +148,19 @@ export default function DTDOScheduleInspection() {
   const { application, owner } = data;
 
   const handleSchedule = () => {
-    if (!inspectionDate) {
+    if (!selectedDate) {
       toast({
         title: "Validation Error",
         description: "Please select an inspection date",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!selectedTime) {
+      toast({
+        title: "Validation Error",
+        description: "Please select an inspection time",
         variant: "destructive",
       });
       return;
@@ -134,8 +176,8 @@ export default function DTDOScheduleInspection() {
     }
 
     // Ensure date is in the future
-    const selectedDate = new Date(inspectionDate);
-    if (selectedDate < new Date()) {
+    const combinedDate = combineDateAndTime(selectedDate, selectedTime);
+    if (combinedDate < new Date()) {
       toast({
         title: "Validation Error",
         description: "Inspection date must be in the future",
@@ -146,7 +188,7 @@ export default function DTDOScheduleInspection() {
 
     scheduleInspectionMutation.mutate({
       applicationId: id!,
-      inspectionDate,
+      inspectionDate: combinedDate.toISOString(),
       assignedTo: assignedDA,
       specialInstructions,
     });
@@ -155,8 +197,8 @@ export default function DTDOScheduleInspection() {
   const availableDAs = dasData?.das || [];
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
-  const minDate = format(tomorrow, "yyyy-MM-dd");
-  const FIFTEEN_MINUTES_IN_SECONDS = 15 * 60;
+  tomorrow.setHours(0, 0, 0, 0);
+  const minSelectableDate = tomorrow;
 
   return (
     <div className="container mx-auto p-6 max-w-4xl space-y-6">
@@ -179,34 +221,22 @@ export default function DTDOScheduleInspection() {
       </div>
 
       {/* Application Summary */}
-      <Card className="border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-blue-700 dark:text-blue-400">
-            <ClipboardCheck className="h-5 w-5" />
-            Application Details
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <div className="text-muted-foreground">Application Number</div>
-              <div className="font-medium">{application.applicationNumber}</div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">Property Name</div>
-              <div className="font-medium">{application.propertyName}</div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">Owner</div>
-              <div className="font-medium">{owner.fullName}</div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">Address</div>
-              <div className="font-medium">{application.address}</div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+      <ApplicationSummaryCard
+        title="Application Details"
+        icon={<ClipboardCheck className="h-5 w-5" />}
+        className="border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20"
+        application={application}
+        owner={{
+          name: owner.fullName,
+          mobile: owner.mobile,
+          email: owner.email,
+        }}
+        extraRows={[
+          { label: "Address", value: application.address },
+          { label: "District", value: application.district },
+          { label: "Tehsil", value: application.tehsil },
+        ]}
+      />
 
       {/* Inspection Scheduling Form */}
       <Card>
@@ -218,21 +248,55 @@ export default function DTDOScheduleInspection() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label htmlFor="inspectionDate" className="flex items-center gap-2">
+            <Label className="flex items-center gap-2">
               <CalendarIcon className="h-4 w-4" />
-              Inspection Date
+              Inspection Date &amp; Time
             </Label>
-            <Input
-              id="inspectionDate"
-              type="datetime-local"
-              value={inspectionDate}
-              onChange={(e) => setInspectionDate(e.target.value)}
-              min={minDate}
-              step={FIFTEEN_MINUTES_IN_SECONDS}
-              data-testid="input-inspection-date"
-            />
+            <div className="grid gap-3 sm:grid-cols-[1.4fr,0.6fr]">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      "w-full justify-start text-left font-normal",
+                      !selectedDate && "text-muted-foreground",
+                    )}
+                    data-testid="button-inspection-date"
+                  >
+                    <CalendarIcon className="mr-2 h-4 w-4" />
+                    {selectedDate ? format(selectedDate, "PPP") : "Pick a date"}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={selectedDate}
+                    onSelect={setSelectedDate}
+                    disabled={(date) => date < minSelectableDate}
+                    initialFocus
+                  />
+                </PopoverContent>
+              </Popover>
+              <Select
+                value={selectedTime}
+                onValueChange={setSelectedTime}
+                disabled={!selectedDate}
+              >
+                <SelectTrigger data-testid="select-inspection-time">
+                  <SelectValue placeholder="Pick time slot" />
+                </SelectTrigger>
+                <SelectContent className="max-h-64">
+                  {TIME_SLOTS.map((slot) => (
+                    <SelectItem key={slot} value={slot}>
+                      {formatTimeLabel(slot)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
             <p className="text-xs text-muted-foreground">
-              Select date and time for the property inspection. Time picks move in 15‑minute blocks (00, 15, 30, 45) to match field visits.
+              Calendar opens from the next working day. Time slots are locked to 15-minute intervals
+              (00, 15, 30, 45) to match DA field visits.
             </p>
           </div>
 
@@ -262,24 +326,29 @@ export default function DTDOScheduleInspection() {
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="specialInstructions">Special Instructions (Optional)</Label>
+            <Label htmlFor="specialInstructions">Message for Owner (optional)</Label>
             <Textarea
               id="specialInstructions"
               value={specialInstructions}
               onChange={(e) => setSpecialInstructions(e.target.value)}
-              placeholder="Any specific instructions for the DA conducting the inspection..."
+              placeholder="Share any visit prep guidance the owner should see (e.g., documents to keep ready, accessibility notes)."
               rows={4}
               data-testid="textarea-instructions"
             />
             <p className="text-xs text-muted-foreground">
-              Provide any specific areas to focus on or documents to verify
+              This note is included in the owner notification and shown on their dashboard.
             </p>
           </div>
 
           <div className="flex gap-2 pt-4">
             <Button
               onClick={handleSchedule}
-              disabled={scheduleInspectionMutation.isPending || !inspectionDate || !assignedDA}
+              disabled={
+                scheduleInspectionMutation.isPending ||
+                !selectedDate ||
+                !selectedTime ||
+                !assignedDA
+              }
               data-testid="button-schedule"
             >
               {scheduleInspectionMutation.isPending && (

@@ -1,13 +1,164 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import { db } from '../db';
 import { himkoshTransactions, homestayApplications, ddoCodes, systemSettings, users } from '../../shared/schema';
 import { HimKoshCrypto, buildRequestString, parseResponseString, buildVerificationString } from './crypto';
 import { getHimKoshConfig } from './config';
-import { desc, eq } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
+import { config as appConfig } from '@shared/config';
+import { ensureDistrictCodeOnApplicationNumber } from '@shared/applicationNumber';
+import { logApplicationAction } from '../audit';
 
 const router = Router();
+
+let portalBaseColumnEnsured = false;
+const ensurePortalBaseUrlColumn = async () => {
+  if (portalBaseColumnEnsured) {
+    return;
+  }
+  try {
+    await db.execute(
+      sql`ALTER TABLE "himkosh_transactions" ADD COLUMN IF NOT EXISTS "portal_base_url" text`,
+    );
+    portalBaseColumnEnsured = true;
+    console.info('[himkosh] Ensured portal_base_url column exists on himkosh_transactions');
+  } catch (error) {
+    console.error('[himkosh] Failed to ensure portal_base_url column:', error);
+  }
+};
+
+void ensurePortalBaseUrlColumn();
+
+const normalizeDistrictForMatch = (value?: string | null) => {
+  if (!value) return [];
+  const cleaned = value
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/\b(division|sub-division|subdivision|hq|office|district|development|tourism|ddo|dto|dt|section|unit|range|circle|zone|serving|for|the|at|and)\b/g, " ")
+    .replace(/[^a-z\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) {
+    return [];
+  }
+
+  const tokens = cleaned
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2);
+
+  return Array.from(new Set(tokens));
+};
+
+const resolveDistrictDdo = async (district?: string | null) => {
+  if (!district) {
+    return undefined;
+  }
+
+  const [exact] = await db
+    .select()
+    .from(ddoCodes)
+    .where(eq(ddoCodes.district, district))
+    .limit(1);
+
+  if (exact) {
+    return exact;
+  }
+
+  const allCodes = await db.select().from(ddoCodes);
+  const districtTokens = normalizeDistrictForMatch(district);
+
+  if (districtTokens.length === 0) {
+    return undefined;
+  }
+
+  return allCodes.find((code) => {
+    const codeTokens = normalizeDistrictForMatch(code.district);
+    return codeTokens.some((token) => districtTokens.includes(token));
+  });
+};
 const crypto = new HimKoshCrypto();
+
+const stripTrailingSlash = (value: string) => value.replace(/\/+$/, '');
+
+const sanitizeBaseUrl = (value?: string | null) => {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return stripTrailingSlash(parsed.origin);
+  } catch {
+    try {
+      const parsed = new URL(`https://${trimmed}`);
+      return stripTrailingSlash(parsed.origin);
+    } catch {
+      return undefined;
+    }
+  }
+};
+
+const looksLocalHost = (host?: string | null) => {
+  if (!host) return false;
+  return /localhost|127\.|0\.0\.0\.0/i.test(host);
+};
+
+const deriveHostFromRequest = (req: Request) => {
+  const hostHeader = req.get('x-forwarded-host') ?? req.get('host');
+  if (!hostHeader) {
+    return undefined;
+  }
+  const host = hostHeader.split(',')[0]?.trim();
+  if (!host) {
+    return undefined;
+  }
+
+  const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  const rawProtocol = forwardedProto || req.protocol?.toLowerCase();
+  const isLocal = looksLocalHost(host);
+  let protocol: 'http' | 'https';
+
+  if (rawProtocol === 'https') {
+    protocol = 'https';
+  } else if (rawProtocol === 'http') {
+    protocol = isLocal ? 'http' : 'https';
+  } else {
+    protocol = isLocal ? 'http' : 'https';
+  }
+
+  return `${protocol}://${host}`;
+};
+
+const resolvePortalBaseUrl = (req: Request): string | undefined => {
+  const bodyCandidate =
+    typeof req.body === 'object' &&
+    req.body !== null &&
+    typeof (req.body as Record<string, unknown>).portalBaseUrl === 'string'
+      ? ((req.body as Record<string, unknown>).portalBaseUrl as string)
+      : undefined;
+
+  const candidates = [
+    bodyCandidate,
+    req.get('origin'),
+    deriveHostFromRequest(req),
+    req.get('referer'),
+    appConfig.frontend.baseUrl,
+  ];
+
+  for (const candidate of candidates) {
+    const sanitized = sanitizeBaseUrl(candidate);
+    if (sanitized) {
+      return sanitized;
+    }
+  }
+
+  return undefined;
+};
 
 const STATUS_META: Record<
   string,
@@ -184,14 +335,6 @@ const buildCallbackPage = (options: {
 </html>`;
 };
 
-const parseEnvBool = (value?: string | null) => {
-  if (!value) return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return undefined;
-};
-
 /**
  * POST /api/himkosh/initiate
  * Initiate HimKosh payment for an application
@@ -228,11 +371,7 @@ router.post('/initiate', async (req, res) => {
     // Look up DDO code based on application's district
     let ddoCode = config.ddo; // Default/fallback DDO
     if (application.district) {
-      const [ddoMapping] = await db
-        .select()
-        .from(ddoCodes)
-        .where(eq(ddoCodes.district, application.district))
-        .limit(1);
+      const ddoMapping = await resolveDistrictDdo(application.district);
       
       if (ddoMapping) {
         ddoCode = ddoMapping.ddoCode;
@@ -260,14 +399,16 @@ router.post('/initiate', async (req, res) => {
       .limit(1);
     
     const envTestOverride =
-      parseEnvBool(process.env.HIMKOSH_TEST_MODE) ??
-      parseEnvBool(process.env.HIMKOSH_FORCE_TEST_MODE);
+      typeof appConfig.himkosh.forceTestMode === "boolean"
+        ? appConfig.himkosh.forceTestMode
+        : appConfig.himkosh.testMode;
 
-    const isTestMode = envTestOverride !== undefined
-      ? envTestOverride
-      : testModeSetting 
-        ? (testModeSetting.settingValue as { enabled: boolean }).enabled 
-        : false;
+    const isTestMode =
+      envTestOverride !== undefined
+        ? envTestOverride
+        : testModeSetting
+            ? (testModeSetting.settingValue as { enabled: boolean }).enabled
+            : false;
     
     // Use ₹1 for gateway if test mode is enabled, otherwise use actual amount
     const gatewayAmount = isTestMode ? 1 : actualAmount;
@@ -280,8 +421,37 @@ router.post('/initiate', async (req, res) => {
     const now = new Date();
     const periodDate = `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
 
+    const resolvedPortalBase = resolvePortalBaseUrl(req);
+    const trimmedPortalBase = resolvedPortalBase ? stripTrailingSlash(resolvedPortalBase) : undefined;
+    const fallbackPortalBase =
+      sanitizeBaseUrl(appConfig.frontend.baseUrl) ||
+      sanitizeBaseUrl(config.returnUrl) ||
+      sanitizeBaseUrl(deriveHostFromRequest(req));
+
+    const portalBaseForStorage = trimmedPortalBase || fallbackPortalBase;
+
+    let callbackUrl = config.returnUrl;
+    if (trimmedPortalBase) {
+      callbackUrl = `${trimmedPortalBase}/api/himkosh/callback`;
+    } else if (!callbackUrl && portalBaseForStorage) {
+      callbackUrl = `${portalBaseForStorage}/api/himkosh/callback`;
+    }
+
+    if (trimmedPortalBase) {
+      console.log('[himkosh] Using dynamic callback URL derived from request:', callbackUrl);
+    } else if (callbackUrl) {
+      console.log('[himkosh] Using configured callback URL:', callbackUrl);
+    } else {
+      console.warn('[himkosh] No callback URL resolved; HimKosh response redirects may fail.');
+    }
+
     // Build request parameters
     // CRITICAL: Government code ALWAYS includes Head2/Amount2 (even if 0)
+    const deptRefNo = ensureDistrictCodeOnApplicationNumber(
+      application.applicationNumber,
+      application.district,
+    );
+
     const requestParams: {
       deptId: string;
       deptRefNo: string;
@@ -299,7 +469,7 @@ router.post('/initiate', async (req, res) => {
       returnUrl?: string;
     } = {
       deptId: config.deptId,
-      deptRefNo: application.applicationNumber,
+      deptRefNo,
       totalAmount: gatewayAmount, // Use gateway amount (₹1 in test mode)
       tenderBy: application.ownerName,
       appRefNo,
@@ -309,7 +479,7 @@ router.post('/initiate', async (req, res) => {
       periodFrom: periodDate,
       periodTo: periodDate,
       serviceCode: config.serviceCode,
-      returnUrl: config.returnUrl,
+      returnUrl: callbackUrl,
     };
     
     // Optional secondary head support – only include when configured with a positive amount.
@@ -357,9 +527,10 @@ router.post('/initiate', async (req, res) => {
     console.log('[himkosh-encryption] Encrypted length:', encryptedData.length);
 
     // Save transaction to database (store gateway amount that was actually sent)
+    await ensurePortalBaseUrlColumn();
     await db.insert(himkoshTransactions).values({
       applicationId,
-      deptRefNo: application.applicationNumber,
+      deptRefNo,
       appRefNo,
       totalAmount: gatewayAmount, // Store what was sent to gateway
       tenderBy: application.ownerName,
@@ -375,6 +546,7 @@ router.post('/initiate', async (req, res) => {
       periodTo: periodDate,
       encryptedRequest: encryptedData,
       requestChecksum: checksum,
+      portalBaseUrl: portalBaseForStorage ?? null,
       transactionStatus: 'initiated',
     });
 
@@ -445,6 +617,7 @@ router.get('/callback', (_req, res) => {
  */
 router.post('/callback', async (req, res) => {
   try {
+    const config = getHimKoshConfig();
     const { encdata } = req.body;
 
     if (!encdata) {
@@ -500,13 +673,19 @@ router.post('/callback', async (req, res) => {
         transactionStatus: parsedResponse.statusCd === '1' ? 'success' : 'failed',
         respondedAt: new Date(),
         challanPrintUrl: parsedResponse.statusCd === '1' 
-          ? `${getHimKoshConfig().challanPrintUrl}?reportName=PaidChallan&TransId=${parsedResponse.echTxnId}`
+          ? `${config.challanPrintUrl}?reportName=PaidChallan&TransId=${parsedResponse.echTxnId}`
           : undefined,
       })
       .where(eq(himkoshTransactions.id, transaction.id));
 
     // If payment successful, update application
     if (parsedResponse.statusCd === '1') {
+      const [currentApplication] = await db
+        .select()
+        .from(homestayApplications)
+        .where(eq(homestayApplications.id, transaction.applicationId))
+        .limit(1);
+
       // Generate certificate number
       const year = new Date().getFullYear();
       const randomSuffix = Math.floor(10000 + Math.random() * 90000);
@@ -526,6 +705,35 @@ router.post('/callback', async (req, res) => {
           approvedAt: issueDate,
         })
         .where(eq(homestayApplications.id, transaction.applicationId));
+
+      const actorId =
+        currentApplication?.dtdoId ??
+        currentApplication?.daId ??
+        currentApplication?.userId ??
+        null;
+
+      if (actorId) {
+        await logApplicationAction({
+          applicationId: transaction.applicationId,
+          actorId,
+          action: "payment_confirmed",
+          previousStatus: currentApplication?.status ?? null,
+          newStatus: "approved",
+          feedback: `HimKosh payment confirmed (CIN: ${parsedResponse.echTxnId ?? "N/A"})`,
+        });
+        await logApplicationAction({
+          applicationId: transaction.applicationId,
+          actorId,
+          action: "certificate_issued",
+          previousStatus: "approved",
+          newStatus: "approved",
+          feedback: `Certificate number ${certificateNumber} issued automatically.`,
+        });
+      } else {
+        console.warn("[timeline] Unable to resolve actor for HimKosh payment success", {
+          applicationId: transaction.applicationId,
+        });
+      }
     }
 
     const statusCode = parsedResponse.statusCd ?? parsedResponse.status ?? "";
@@ -539,10 +747,13 @@ router.post('/callback', async (req, res) => {
       redirectState: statusCode === "1" ? "success" : statusCode === "2" ? "pending" : "failed",
     };
 
-    const frontendBase =
-      process.env.VITE_FRONTEND_URL ||
-      `${req.protocol}://${req.get("host") ?? ""}`;
-    const trimmedBase = frontendBase.replace(/\/$/, "");
+    const portalBase =
+      sanitizeBaseUrl(transaction.portalBaseUrl) ||
+      resolvePortalBaseUrl(req) ||
+      sanitizeBaseUrl(appConfig.frontend.baseUrl) ||
+      sanitizeBaseUrl(config.returnUrl) ||
+      sanitizeBaseUrl(`${req.protocol}://${req.get("host") ?? ""}`);
+    const trimmedBase = portalBase ? stripTrailingSlash(portalBase) : undefined;
 
     const redirectPath =
       meta.redirectState === "success"
@@ -869,11 +1080,7 @@ router.post('/test-callback-url', async (req, res) => {
     // Look up DDO code
     let ddoCode = config.ddo;
     if (application.district) {
-      const [ddoMapping] = await db
-        .select()
-        .from(ddoCodes)
-        .where(eq(ddoCodes.district, application.district))
-        .limit(1);
+      const ddoMapping = await resolveDistrictDdo(application.district);
       
       if (ddoMapping) {
         ddoCode = ddoMapping.ddoCode;
@@ -890,9 +1097,14 @@ router.post('/test-callback-url', async (req, res) => {
     const now = new Date();
     const periodDate = `${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
 
+    const deptRefNo = ensureDistrictCodeOnApplicationNumber(
+      application.applicationNumber,
+      application.district,
+    );
+
     const requestParams = {
       deptId: config.deptId,
-      deptRefNo: application.applicationNumber,
+      deptRefNo,
       totalAmount: totalAmount,
       tenderBy: application.ownerName,
       appRefNo: appRefNo,

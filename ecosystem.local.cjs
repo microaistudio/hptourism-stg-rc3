@@ -1,16 +1,16 @@
 module.exports = {
   apps: [
     {
-      name: "hptourism-rc3",
+      name: "hptourism-stg-rc3",
       script: "dist-new/index.js",
       cwd: __dirname,
       node_args: "--enable-source-maps",
       env: {
         NODE_ENV: "production",
-        PORT: process.env.PORT || "5000",
+        PORT: process.env.PORT || "4000",
         DATABASE_URL:
           process.env.DATABASE_URL ||
-          "postgresql://hptourism_user:8fd2fa604c5cd25571427be2ec22bf4c@localhost:5432/hptourism",
+          "postgresql://hptourism_user:8fd2fa604c5cd25571427be2ec22bf4c@localhost:5432/hptourism_stg",
         SESSION_SECRET:
           process.env.SESSION_SECRET || "hp-tourism-local-dev-secret",
         OBJECT_STORAGE_MODE: process.env.OBJECT_STORAGE_MODE || "local",

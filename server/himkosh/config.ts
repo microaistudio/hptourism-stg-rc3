@@ -6,25 +6,15 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { config as appConfig } from '@shared/config';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const getEnvValue = (...keys: Array<string | undefined>) => {
-  for (const key of keys) {
-    if (!key) continue;
-    const value = process.env[key];
-    if (value && value.trim().length > 0) {
-      return value.trim();
-    }
-  }
-  return undefined;
-};
-
 export function resolveKeyFilePath(explicitPath?: string): string {
   const candidates = [
     explicitPath,
-    process.env.HIMKOSH_KEY_FILE_PATH,
+    appConfig.himkosh.keyFilePath,
     path.resolve(process.cwd(), 'server/himkosh/echallan.key'),
     path.resolve(process.cwd(), 'dist/himkosh/echallan.key'),
     path.resolve(process.cwd(), 'dist/echallan.key'),
@@ -45,41 +35,38 @@ export function resolveKeyFilePath(explicitPath?: string): string {
   return path.join(__dirname, 'echallan.key');
 }
 
+const defaultEndpoints = {
+  paymentUrl: 'https://himkosh.hp.nic.in/echallan/WebPages/wrfApplicationRequest.aspx',
+  verificationUrl: 'https://himkosh.hp.nic.in/eChallan/webpages/AppVerification.aspx',
+  challanPrintUrl: 'https://himkosh.hp.nic.in/eChallan/challan_reports/reportViewer.aspx',
+  searchUrl: 'https://himkosh.hp.nic.in/eChallan/SearchChallan.aspx',
+};
+
 export const himkoshConfig = {
   // CTP API Endpoints
-  paymentUrl: getEnvValue('HIMKOSH_PAYMENT_URL', 'HIMKOSH_POST_URL') || 'https://himkosh.hp.nic.in/echallan/WebPages/wrfApplicationRequest.aspx',
-  verificationUrl: getEnvValue('HIMKOSH_VERIFICATION_URL', 'HIMKOSH_VERIFY_URL') || 'https://himkosh.hp.nic.in/eChallan/webpages/AppVerification.aspx',
-  challanPrintUrl: getEnvValue('HIMKOSH_CHALLAN_PRINT_URL') || 'https://himkosh.hp.nic.in/eChallan/challan_reports/reportViewer.aspx',
-  searchChallanUrl: getEnvValue('HIMKOSH_SEARCH_URL') || 'https://himkosh.hp.nic.in/eChallan/SearchChallan.aspx',
+  paymentUrl: appConfig.himkosh.paymentUrl || defaultEndpoints.paymentUrl,
+  verificationUrl: appConfig.himkosh.verificationUrl || defaultEndpoints.verificationUrl,
+  challanPrintUrl: appConfig.himkosh.challanPrintUrl || defaultEndpoints.challanPrintUrl,
+  searchChallanUrl: appConfig.himkosh.searchUrl || defaultEndpoints.searchUrl,
 
   // Merchant Configuration (from CTP team)
-  // These will be stored in Replit Secrets
-  merchantCode: getEnvValue('HIMKOSH_MERCHANT_CODE', 'HIMKOSH_MERCHANTCODE', 'HIMKOSH_MERCHANT_ID') || '',
-  deptId: getEnvValue('HIMKOSH_DEPT_ID', 'HIMKOSH_DEPT_CODE') || '',
-  serviceCode: getEnvValue('HIMKOSH_SERVICE_CODE', 'HIMKOSH_SERVICECODE') || '',
-  ddo: getEnvValue('HIMKOSH_DDO', 'HIMKOSH_DDO_CODE') || '',
+  merchantCode: appConfig.himkosh.merchantCode || '',
+  deptId: appConfig.himkosh.deptId || '',
+  serviceCode: appConfig.himkosh.serviceCode || '',
+  ddo: appConfig.himkosh.ddo || '',
 
   // Head of Account Codes (Budget heads)
   heads: {
-    registrationFee: getEnvValue('HIMKOSH_HEAD', 'HIMKOSH_HEAD_OF_ACCOUNT', 'HIMKOSH_HEAD1') || '',
-    secondaryHead: getEnvValue('HIMKOSH_HEAD2', 'HIMKOSH_SECONDARY_HEAD', 'HIMKOSH_HEAD_OF_ACCOUNT_2'),
-    secondaryHeadAmount: (() => {
-      const raw = getEnvValue('HIMKOSH_HEAD2_AMOUNT', 'HIMKOSH_SECONDARY_HEAD_AMOUNT');
-      if (!raw) return undefined;
-      const parsed = Number(raw);
-      return Number.isFinite(parsed) ? parsed : undefined;
-    })(),
+    registrationFee: appConfig.himkosh.head || '',
+    secondaryHead: appConfig.himkosh.secondaryHead,
+    secondaryHeadAmount: appConfig.himkosh.secondaryHeadAmount,
   },
 
   // Return URL for payment callback
-  // CRITICAL: Must be the actual URL where this app is running
-  // In Replit, use REPLIT_DEV_DOMAIN or REPL_SLUG/REPL_OWNER
-  returnUrl:
-    getEnvValue("HIMKOSH_RETURN_URL") || "https://hptourism.osipl.dev/api/himkosh/callback",
+  returnUrl: appConfig.himkosh.returnUrl || 'https://hptourism.osipl.dev/api/himkosh/callback',
 
   // Key file path (will be provided by CTP team)
-  // Use absolute path to ensure it's found regardless of working directory
-  keyFilePath: resolveKeyFilePath(),
+  keyFilePath: resolveKeyFilePath(appConfig.himkosh.keyFilePath),
 };
 
 /**

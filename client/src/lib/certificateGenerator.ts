@@ -1,444 +1,685 @@
-import jsPDF from "jspdf";
+import jsPDFImport from "jspdf";
 import type { HomestayApplication } from "@shared/schema";
+import hpGovLogo from "@/assets/logos_tr/HP_Gov_TR.png?inline";
+import hpTourismLogo from "@/assets/logos_tr/HP_Touris_TR.png?inline";
+import type { InspectionReportSummary } from "@/lib/inspection-report";
 
-export type CertificateFormat = "classic" | "modern" | "heritage";
+const jsPDF = (jsPDFImport as any).jsPDF || jsPDFImport;
+type JsPDFInstance = any;
 
-const formatDate = (value?: string | null) =>
-  value
-    ? new Date(value).toLocaleDateString("en-IN", {
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-      })
-    : "N/A";
+export type CertificateFormat = "policy_portrait" | "policy_landscape" | "policy_heritage";
 
-const buildAddress = (application: HomestayApplication) =>
-  `${application.address || ""}, ${application.district || ""}, PIN: ${
-    application.pincode || "—"
-  }`;
+type RGB = [number, number, number];
+
+type ThemeColors = {
+  primary: RGB;
+  accent: RGB;
+  text: RGB;
+  borderOuter: RGB;
+  borderInner: RGB;
+  background?: RGB;
+};
+
+type PolicyLayout = {
+  orientation: "portrait" | "landscape";
+  marginX: number;
+  marginTop: number;
+  headerSpacing: number;
+  bodyLineHeight: number;
+  tableColumns: [number, number, number, number];
+  tableRowHeight: number;
+  colors: ThemeColors;
+  showLogos?: boolean;
+};
+
+type CertificateOptions = {
+  inspectionReport?: InspectionReportSummary | null;
+};
+
+const POLICY_LAYOUTS: Record<CertificateFormat, PolicyLayout> = {
+  policy_portrait: {
+    orientation: "portrait",
+    marginX: 24,
+    marginTop: 34,
+    headerSpacing: 7,
+    bodyLineHeight: 5.4,
+    tableColumns: [16, 86, 28, 32],
+    tableRowHeight: 9,
+    colors: {
+      primary: [19, 73, 138],
+      accent: [19, 73, 138],
+      text: [33, 37, 41],
+      borderOuter: [21, 71, 138],
+      borderInner: [21, 71, 138],
+    },
+    showLogos: true,
+  },
+  policy_landscape: {
+    orientation: "landscape",
+    marginX: 30,
+    marginTop: 26,
+    headerSpacing: 6,
+    bodyLineHeight: 5,
+    tableColumns: [16, 122, 34, 60],
+    tableRowHeight: 8.2,
+    colors: {
+      primary: [19, 73, 138],
+      accent: [19, 73, 138],
+      text: [33, 37, 41],
+      borderOuter: [21, 71, 138],
+      borderInner: [21, 71, 138],
+    },
+    showLogos: true,
+  },
+  policy_heritage: {
+    orientation: "portrait",
+    marginX: 24,
+    marginTop: 34,
+    headerSpacing: 6.5,
+    bodyLineHeight: 5.2,
+    tableColumns: [16, 86, 28, 32],
+    tableRowHeight: 9,
+    colors: {
+      primary: [92, 54, 14],
+      accent: [171, 119, 44],
+      text: [66, 47, 27],
+      borderOuter: [92, 54, 14],
+      borderInner: [202, 160, 95],
+      background: [253, 246, 233],
+    },
+    showLogos: true,
+  },
+};
+
+const CATEGORY_NOTES: Record<string, string> = {
+  diamond: "Tariff Rs. 10,000 and above per room per night",
+  gold: "Tariff between Rs. 3,000 and Rs. 9,999 per room per night",
+  silver: "Tariff less than Rs. 3,000 per room per night",
+};
+
+const BLANK = "__________";
+
+const LOGO_SPECS = {
+  gov: {
+    aspectRatio: 148 / 194,
+    portraitWidth: 30,
+    landscapeWidth: 24,
+  },
+  tourism: {
+    aspectRatio: 176 / 195,
+    portraitWidth: 32,
+    landscapeWidth: 26,
+  },
+} as const;
 
 export function generateCertificatePDF(
   application: HomestayApplication,
-  format: CertificateFormat = "classic",
+  format: CertificateFormat = "policy_heritage",
+  options?: CertificateOptions,
 ) {
+  const layout = POLICY_LAYOUTS[format];
   const doc = new jsPDF({
-    orientation: "portrait",
+    orientation: layout.orientation,
     unit: "mm",
     format: "a4",
   });
 
-  switch (format) {
-    case "modern":
-      renderModernCertificate(doc, application);
-      break;
-    case "heritage":
-      renderHeritageCertificate(doc, application);
-      break;
-    default:
-      renderClassicCertificate(doc, application);
-      break;
+  renderPolicyCertificate(doc, application, layout, options);
+
+  const certificateId = sanitizeFileSegment(application.certificateNumber || "N_A");
+  doc.save(`HP_Homestay_Certificate_${certificateId}_${format}.pdf`);
+}
+
+function renderPolicyCertificate(
+  doc: JsPDFInstance,
+  application: HomestayApplication,
+  layout: PolicyLayout,
+  options?: CertificateOptions,
+) {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const usableWidth = pageWidth - layout.marginX * 2;
+  const spacingScale = layout.orientation === "portrait" ? 1 : 0.82;
+
+  drawBorder(doc, pageWidth, pageHeight, layout);
+  const logoBottom = drawLogos(doc, pageWidth, hpGovLogo, hpTourismLogo, layout);
+  let cursorY = Math.max(layout.marginTop, logoBottom + 8);
+  cursorY = drawHeader(doc, cursorY, pageWidth, layout);
+
+  doc.setFont("times", "normal");
+  doc.setFontSize(11.2);
+  doc.setTextColor(...layout.colors.text);
+  cursorY += 9 * spacingScale;
+
+  doc.setFont("times", "bold");
+  doc.text(`RC No.: ${valueOrBlank(application.certificateNumber)}`, layout.marginX, cursorY);
+  doc.text(`Valid till: ${formatDateLine(application.certificateExpiryDate)}`, pageWidth - layout.marginX, cursorY, { align: "right" });
+
+  cursorY += 11 * spacingScale;
+  doc.setFont("times", "normal");
+
+  const propertyName = valueOrBlank(application.propertyName);
+  const touristArea = valueOrBlank(resolveTouristArea(application));
+  const ownerHonorific = getOwnerHonorific(application.ownerGender);
+  const ownerName = valueOrBlank(application.ownerName);
+  const guardianName = valueOrBlank(resolveGuardianName(application));
+  const categoryLabel = formatCategoryLabel(application.category);
+  const categoryNote = CATEGORY_NOTES[(application.category || "").toLowerCase()];
+
+  cursorY = writeParagraph(
+    doc,
+    `This is to certify that the Home Stay unit known as ${propertyName} located in the tourist area ${touristArea} has been registered with the Department of Tourism & Civil Aviation, Himachal Pradesh.`,
+    {
+      x: layout.marginX,
+      y: cursorY,
+      maxWidth: usableWidth,
+      lineHeight: layout.bodyLineHeight,
+    },
+  );
+
+  cursorY = writeParagraph(
+    doc,
+    "The Home Stay unit is to be operated / being operated by:",
+    {
+      x: layout.marginX,
+      y: cursorY + 2 * spacingScale,
+      maxWidth: usableWidth,
+      lineHeight: layout.bodyLineHeight,
+    },
+  );
+
+  doc.setFont("times", "bold");
+  cursorY = writeParagraph(
+    doc,
+    `${ownerHonorific} ${ownerName} d/o / s/o / w/o Shri ${guardianName}`,
+    {
+      x: layout.marginX,
+      y: cursorY + 1.6 * spacingScale,
+      maxWidth: usableWidth,
+      lineHeight: layout.bodyLineHeight,
+    },
+  );
+  doc.setFont("times", "normal");
+
+  cursorY = writeParagraph(
+    doc,
+    "Proprietor / Owner(s) / Promoter(s) of the said Home Stay unit has been registered under the Himachal Pradesh Tourism Development and Registration Act, 2002 and the rules made thereunder.",
+    {
+      x: layout.marginX,
+      y: cursorY + 2 * spacingScale,
+      maxWidth: usableWidth,
+      lineHeight: layout.bodyLineHeight,
+    },
+  );
+
+  cursorY += 4 * spacingScale;
+  doc.setFont("times", "bold");
+  doc.text(`Category: ${categoryLabel}`, layout.marginX, cursorY);
+  if (categoryNote) {
+    doc.setFont("times", "italic");
+    doc.setFontSize(10.2);
+    doc.text(`(${categoryNote})`, layout.marginX + 40, cursorY);
+    doc.setFontSize(11.2);
+  }
+  doc.setFont("times", "normal");
+
+  cursorY += 8 * spacingScale;
+  cursorY = drawAccommodationTable(doc, application, layout, cursorY);
+
+  cursorY += 5 * spacingScale;
+  cursorY = writeParagraph(doc, "Note: Total number of beds shall not exceed 12.", {
+    x: layout.marginX,
+    y: cursorY,
+    maxWidth: usableWidth,
+    lineHeight: layout.bodyLineHeight,
+    fontSize: 10.2,
+    fontStyle: "italic",
+  });
+
+  cursorY += 5 * spacingScale;
+  cursorY = writeParagraph(doc, `Registered address: ${buildAddress(application)}`, {
+    x: layout.marginX,
+    y: cursorY,
+    maxWidth: usableWidth,
+    lineHeight: layout.bodyLineHeight,
+    fontSize: 10.5,
+  });
+
+  if (options?.inspectionReport) {
+    cursorY += 6 * spacingScale;
+    cursorY = appendInspectionReference(doc, options.inspectionReport, {
+      x: layout.marginX,
+      y: cursorY,
+      maxWidth: usableWidth,
+      lineHeight: layout.bodyLineHeight,
+    });
   }
 
-  const filename = `HP_Homestay_Certificate_${application.certificateNumber || "N_A"}_${format}.pdf`;
-  doc.save(filename);
-}
+  const instructions = [
+    "Display this certificate prominently at the Homestay property.",
+    "Registration remains subject to adherence with HP Homestay Rules 2025.",
+    "Any change in ownership or property configuration must be reported for revalidation.",
+  ];
 
-function renderClassicCertificate(doc: jsPDF, application: HomestayApplication) {
-  const pageWidth = doc.internal.pageSize.getWidth();
-  const pageHeight = doc.internal.pageSize.getHeight();
+  const bottomSafeLimit = pageHeight - 18;
+  const signatureBlockHeight = 28 * spacingScale;
+  const instructionsHeight = instructions.length * (layout.bodyLineHeight + 0.5) + 10;
+  const upcomingBlock = 12 * spacingScale + signatureBlockHeight + instructionsHeight;
+  if (cursorY + upcomingBlock > bottomSafeLimit) {
+    cursorY = Math.max(layout.marginTop, bottomSafeLimit - upcomingBlock);
+  }
 
-  const primary = [14, 116, 144];
-  const accent = [184, 134, 11];
-  const dark = [32, 60, 70];
+  cursorY += 10 * spacingScale;
+  doc.setFont("times", "normal");
+  doc.setFontSize(11);
+  doc.text(`Place: ${valueOrBlank(resolvePlace(application))}`, layout.marginX, cursorY);
+  cursorY += layout.bodyLineHeight;
+  doc.text(`Date: ${formatDateLine(application.certificateIssuedDate)}`, layout.marginX, cursorY);
 
-  doc.setDrawColor(primary[0], primary[1], primary[2]);
-  doc.setLineWidth(1.5);
-  doc.rect(10, 10, pageWidth - 20, pageHeight - 20);
-  doc.setLineWidth(0.6);
-  doc.rect(13, 13, pageWidth - 26, pageHeight - 26);
-  doc.setDrawColor(accent[0], accent[1], accent[2]);
+  const signatureOffset = 8 * spacingScale;
+  let signatureY = cursorY + signatureOffset;
+  const signatureTail = 14 * spacingScale;
+  if (signatureY + signatureTail > bottomSafeLimit) {
+    const adjustment = signatureY + signatureTail - bottomSafeLimit;
+    signatureY -= adjustment;
+  }
+
+  doc.setDrawColor(140, 101, 52);
   doc.setLineWidth(0.4);
-  doc.rect(16, 16, pageWidth - 32, pageHeight - 32);
+  doc.line(pageWidth - layout.marginX - 50, signatureY - 2, pageWidth - layout.marginX, signatureY - 2);
 
-  let y = 28;
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(16);
-  doc.setTextColor(primary[0], primary[1], primary[2]);
-  doc.text("GOVERNMENT OF HIMACHAL PRADESH", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 8;
-  doc.setFontSize(14);
-  doc.text("Department of Tourism & Civil Aviation", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 12;
-  doc.setFontSize(22);
-  doc.setTextColor(dark[0], dark[1], dark[2]);
-  doc.text("HOMESTAY REGISTRATION CERTIFICATE", pageWidth / 2, y, {
-    align: "center",
-  });
-  doc.setDrawColor(accent[0], accent[1], accent[2]);
-  doc.setLineWidth(0.8);
-  doc.line(38, y + 2, pageWidth - 38, y + 2);
-
-  y += 15;
-  doc.setFontSize(11);
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(90, 90, 90);
-  doc.text("Certificate Number:", pageWidth / 2, y, { align: "center" });
-
-  y += 6;
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(16);
-  doc.setTextColor(primary[0], primary[1], primary[2]);
-  doc.text(application.certificateNumber || "N/A", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 15;
-  doc.setFontSize(11);
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(50, 50, 50);
-  doc.text(
-    "This is to certify that the homestay mentioned below has been registered under the",
-    pageWidth / 2,
-    y,
-    { align: "center" },
-  );
-  y += 6;
-  doc.setFont("helvetica", "bold");
-  doc.text("Himachal Pradesh Homestay Rules 2025", pageWidth / 2, y, {
-    align: "center",
-  });
-  y += 6;
-  doc.setFont("helvetica", "normal");
-  doc.text(
-    "and is authorized to operate as a registered homestay establishment.",
-    pageWidth / 2,
-    y,
-    { align: "center" },
-  );
-
-  y += 15;
-  doc.setFillColor(245, 250, 252);
-  doc.setDrawColor(primary[0], primary[1], primary[2]);
-  doc.setLineWidth(0.4);
-  doc.roundedRect(25, y, pageWidth - 50, 70, 2, 2, "FD");
-
-  let lineY = y + 10;
-  const left = 32;
-  const valueX = 88;
-  doc.setFontSize(10);
-
-  const writePair = (label: string, value: string) => {
-    doc.setFont("helvetica", "bold");
-    doc.setTextColor(primary[0], primary[1], primary[2]);
-    doc.text(label, left, lineY);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(30, 30, 30);
-    doc.text(value || "—", valueX, lineY);
-    lineY += 8;
-  };
-
-  writePair("Property Name:", application.propertyName);
-  writePair("Owner Name:", application.ownerName);
-  writePair("Address:", buildAddress(application));
-  writePair(
-    "Category:",
-    application.category
-      ? application.category.charAt(0).toUpperCase() + application.category.slice(1)
-      : "—",
-  );
-  writePair("Total Rooms:", `${application.totalRooms || 0}`);
-  writePair("Application No:", application.applicationNumber || "—");
-  writePair("Issue Date:", formatDate(application.certificateIssuedDate));
-  writePair("Valid Until:", formatDate(application.certificateExpiryDate));
-
-  doc.setFillColor(255, 250, 240);
-  doc.setDrawColor(accent[0], accent[1], accent[2]);
-  doc.roundedRect(25, lineY + 4, pageWidth - 50, 20, 2, 2, "FD");
-  doc.setFontSize(9);
-  doc.setFont("helvetica", "bold");
-  doc.setTextColor(120, 93, 0);
-  doc.text("IMPORTANT:", 30, lineY + 12);
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(80, 80, 80);
-  doc.text(
-    "This certificate must be displayed prominently at the homestay premises.",
-    30,
-    lineY + 18,
-  );
-  doc.text(
-    "Certificate is subject to compliance with Himachal Pradesh Homestay Rules 2025.",
-    30,
-    lineY + 22,
-  );
-
-  drawSignatures(doc, pageWidth, pageHeight, application);
-}
-
-function renderModernCertificate(doc: jsPDF, application: HomestayApplication) {
-  const pageWidth = doc.internal.pageSize.getWidth();
-  const pageHeight = doc.internal.pageSize.getHeight();
-
-  doc.setFillColor(4, 47, 73);
-  doc.rect(0, 0, pageWidth, 60, "F");
-  doc.setFillColor(255, 255, 255);
-  doc.roundedRect(8, 50, pageWidth - 16, pageHeight - 60, 6, 6, "F");
-
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(20);
-  doc.setTextColor(255, 255, 255);
-  doc.text("HP TOURISM • HOMESTAY CERTIFICATE", pageWidth / 2, 30, {
-    align: "center",
-  });
-  doc.setFontSize(11);
-  doc.text("Department of Tourism & Civil Aviation", pageWidth / 2, 38, {
-    align: "center",
-  });
-
-  let y = 70;
-  doc.setFontSize(26);
-  doc.setTextColor(5, 79, 102);
-  doc.text(application.certificateNumber || "N/A", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 12;
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(11);
-  doc.setTextColor(60, 60, 60);
-  doc.text(
-    "This certifies that the following homestay has been approved under the Himachal Pradesh Homestay Rules 2025.",
-    pageWidth / 2,
-    y,
-    { align: "center", maxWidth: pageWidth - 40 },
-  );
-
-  y += 16;
-  doc.setDrawColor(232, 241, 247);
-  doc.setFillColor(248, 252, 255);
-  doc.roundedRect(20, y, pageWidth - 40, 70, 4, 4, "FD");
-
-  const columnLeft = 28;
-  const columnRight = columnLeft + (pageWidth - 56) / 2 + 6;
-  let leftY = y + 12;
-  let rightY = leftY;
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(10);
-  doc.setTextColor(5, 79, 102);
-
-  const write = (label: string, value: string, startX: number, startY: number) => {
-    doc.text(label, startX, startY);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(50, 50, 50);
-    doc.text(value || "—", startX, startY + 5);
-    doc.setFont("helvetica", "bold");
-    doc.setTextColor(5, 79, 102);
-  };
-
-  write("Property Name", application.propertyName, columnLeft, leftY);
-  leftY += 12;
-  write("Owner", application.ownerName, columnLeft, leftY);
-  leftY += 12;
-  write("Location", buildAddress(application), columnLeft, leftY);
-  leftY += 12;
-  write("Application No.", application.applicationNumber || "—", columnLeft, leftY);
-
-  write(
-    "Category",
-    application.category
-      ? application.category.charAt(0).toUpperCase() + application.category.slice(1)
-      : "—",
-    columnRight,
-    rightY,
-  );
-  rightY += 12;
-  write("Total Rooms", `${application.totalRooms || 0}`, columnRight, rightY);
-  rightY += 12;
-  write("Issue Date", formatDate(application.certificateIssuedDate), columnRight, rightY);
-  rightY += 12;
-  write("Valid Until", formatDate(application.certificateExpiryDate), columnRight, rightY);
-
-  y += 90;
-  doc.setFillColor(4, 47, 73);
-  doc.setTextColor(4, 47, 73);
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(10);
-  doc.text("COMPLIANCE", 20, y);
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(60, 60, 60);
-  doc.text(
-    "Display this certificate prominently at the property. Operating authorization is subject to continued compliance with HP Homestay Rules 2025.",
-    20,
-    y + 6,
-    { maxWidth: pageWidth - 40 },
-  );
-
-  drawSignatures(doc, pageWidth, pageHeight, application, {
-    primaryColor: [4, 47, 73],
-  });
-}
-
-function renderHeritageCertificate(doc: jsPDF, application: HomestayApplication) {
-  const pageWidth = doc.internal.pageSize.getWidth();
-  const pageHeight = doc.internal.pageSize.getHeight();
-
-  doc.setFillColor(250, 247, 238);
-  doc.rect(0, 0, pageWidth, pageHeight, "F");
-  doc.setDrawColor(120, 90, 40);
-  doc.setLineWidth(2);
-  doc.rect(8, 8, pageWidth - 16, pageHeight - 16);
-  doc.setDrawColor(165, 124, 44);
-  doc.setLineWidth(0.7);
-  doc.rect(12, 12, pageWidth - 24, pageHeight - 24);
-
-  let y = 34;
-  doc.setFont("times", "bold");
-  doc.setFontSize(24);
-  doc.setTextColor(111, 78, 55);
-  doc.text("Government of Himachal Pradesh", pageWidth / 2, y, {
-    align: "center",
-  });
-  y += 8;
-  doc.setFontSize(14);
-  doc.text("Department of Tourism & Civil Aviation", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 14;
-  doc.setFontSize(28);
-  doc.text("Certificate of Registration", pageWidth / 2, y, {
-    align: "center",
-  });
-
-  y += 12;
   doc.setFont("times", "italic");
-  doc.setFontSize(12);
-  doc.text(
-    `Certificate No. ${application.certificateNumber || "N/A"}`,
-    pageWidth / 2,
-    y,
-    { align: "center" },
-  );
-
-  y += 18;
-  doc.setFont("times", "normal");
-  doc.setFontSize(12);
-  doc.setTextColor(60, 60, 60);
-  doc.text(
-    "By the authority vested in the HP Tourism Department, this document affirms the registration of the homestay described below,",
-    pageWidth / 2,
-    y,
-    { align: "center", maxWidth: pageWidth - 50 },
-  );
-  y += 6;
-  doc.text(
-    "under the Himachal Pradesh Homestay Rules 2025, granting permission to host guests as a recognized establishment.",
-    pageWidth / 2,
-    y,
-    { align: "center", maxWidth: pageWidth - 50 },
-  );
-
-  y += 15;
-  doc.setDrawColor(165, 124, 44);
-  doc.setFillColor(253, 249, 241);
-  doc.roundedRect(25, y, pageWidth - 50, 85, 4, 4, "FD");
-
-  const writeRow = (label: string, value: string, rowY: number) => {
-    doc.setFont("times", "bold");
-    doc.setFontSize(11);
-    doc.setTextColor(111, 78, 55);
-    doc.text(label, 32, rowY);
-    doc.setFont("times", "normal");
-    doc.setTextColor(40, 40, 40);
-    doc.text(value || "—", 75, rowY);
-  };
-
-  let detailY = y + 12;
-  writeRow("Property Name", application.propertyName, detailY);
-  detailY += 10;
-  writeRow("Owner", application.ownerName, detailY);
-  detailY += 10;
-  writeRow("Location", buildAddress(application), detailY);
-  detailY += 10;
-  writeRow("Category", application.category || "—", detailY);
-  detailY += 10;
-  writeRow("Total Rooms", `${application.totalRooms || 0}`, detailY);
-  detailY += 10;
-  writeRow("Application No.", application.applicationNumber || "—", detailY);
-  detailY += 10;
-  writeRow("Issued On", formatDate(application.certificateIssuedDate), detailY);
-  detailY += 10;
-  writeRow("Valid Until", formatDate(application.certificateExpiryDate), detailY);
-
-  y += 100;
+  doc.setFontSize(10.5);
+  doc.text("(Prescribed Authority)", pageWidth - layout.marginX, signatureY + 2, { align: "right" });
   doc.setFont("times", "bold");
   doc.setFontSize(11);
-  doc.setTextColor(111, 78, 55);
-  doc.text("Important Stipulations", 25, y);
+  doc.text("District Tourism Development Officer", pageWidth - layout.marginX, signatureY + 8, { align: "right" });
   doc.setFont("times", "normal");
-  doc.setTextColor(60, 60, 60);
-  doc.text(
-    [
-      "• Display this certificate prominently at the homestay property.",
-      "• Registration remains subject to adherence with HP Homestay Rules 2025.",
-      "• Any change in ownership or property configuration must be reported for revalidation.",
-    ],
-    28,
-    y + 6,
-  );
+  doc.text(valueOrBlank(application.district), pageWidth - layout.marginX, signatureY + 14, { align: "right" });
 
-  drawSignatures(doc, pageWidth, pageHeight, application, {
-    primaryColor: [111, 78, 55],
-    italicFooter: true,
+  const instructionsLineHeight = layout.bodyLineHeight + 0.8;
+  const instructionsPadding = 14;
+  const totalInstructionsHeight = instructions.length * (instructionsLineHeight + 1.2) + instructionsPadding;
+  const instructionStart = Math.max(signatureY + 20, pageHeight - layout.marginTop - totalInstructionsHeight);
+  doc.setFont("times", "bold");
+  doc.setFontSize(11);
+  doc.text("Important Instructions:", layout.marginX, instructionStart);
+  doc.setFont("times", "normal");
+  doc.setFontSize(10.3);
+  let instructionY = instructionStart + 5;
+  instructions.forEach((line) => {
+    const bullet = "• ";
+    const wrapped = doc.splitTextToSize(`${bullet}${line}`, usableWidth) as string[];
+    wrapped.forEach((textLine, idx) => {
+      const drawX = idx === 0 ? layout.marginX : layout.marginX + 4;
+      doc.text(textLine, drawX, instructionY);
+      instructionY += layout.bodyLineHeight;
+    });
+    instructionY -= layout.bodyLineHeight / 2;
   });
 }
 
-function drawSignatures(
-  doc: jsPDF,
+function drawBorder(doc: JsPDFInstance, pageWidth: number, pageHeight: number, layout: PolicyLayout) {
+  const outerMargin = 8;
+  if (layout.colors.background) {
+    doc.setFillColor(...layout.colors.background);
+    doc.rect(0, 0, pageWidth, pageHeight, "F");
+  }
+  doc.setDrawColor(...layout.colors.borderOuter);
+  doc.setLineWidth(layout.colors.background ? 1.4 : 1.2);
+  doc.rect(outerMargin, outerMargin, pageWidth - outerMargin * 2, pageHeight - outerMargin * 2);
+  doc.setDrawColor(...layout.colors.borderInner);
+  doc.setLineWidth(layout.colors.background ? 0.9 : 0.6);
+  doc.rect(outerMargin + 4, outerMargin + 4, pageWidth - (outerMargin + 4) * 2, pageHeight - (outerMargin + 4) * 2);
+}
+
+function drawLogos(
+  doc: JsPDFInstance,
   pageWidth: number,
-  pageHeight: number,
-  application: HomestayApplication,
-  options?: { primaryColor?: [number, number, number]; italicFooter?: boolean },
+  govLogo: string,
+  tourismLogo: string,
+  layout: PolicyLayout,
+): number {
+  if (layout.showLogos === false) {
+    return layout.marginTop - 6;
+  }
+  const orientationKey = layout.orientation === "portrait" ? "portraitWidth" : "landscapeWidth";
+  const govWidth = LOGO_SPECS.gov[orientationKey];
+  const govHeight = govWidth * LOGO_SPECS.gov.aspectRatio;
+  const tourismWidth = LOGO_SPECS.tourism[orientationKey];
+  const tourismHeight = tourismWidth * LOGO_SPECS.tourism.aspectRatio;
+  const buffer = 4;
+  const logoY = Math.max(12, layout.marginTop - 10);
+  const drawLogo = (image: string, x: number, width: number, height: number) => {
+    doc.addImage(image, "PNG", x, logoY, width, height);
+    return logoY + height;
+  };
+  const govBottom = govLogo ? drawLogo(govLogo, layout.marginX, govWidth, govHeight) : logoY;
+  const tourismBottom = tourismLogo
+    ? drawLogo(tourismLogo, pageWidth - layout.marginX - tourismWidth, tourismWidth, tourismHeight)
+    : logoY;
+  doc.setDrawColor(...layout.colors.accent);
+  doc.setLineWidth(0.6);
+  doc.line(layout.marginX, Math.max(govBottom, tourismBottom) + 2, pageWidth - layout.marginX, Math.max(govBottom, tourismBottom) + 2);
+  return Math.max(govBottom, tourismBottom) + 2;
+}
+
+function appendInspectionReference(
+  doc: JsPDFInstance,
+  summary: InspectionReportSummary,
+  area: { x: number; y: number; maxWidth: number; lineHeight: number },
 ) {
-  const primary = options?.primaryColor ?? [80, 80, 80];
-  const leftX = 40;
-  const rightX = pageWidth - 90;
-  const baseY = pageHeight - 40;
-
-  doc.setDrawColor(primary[0], primary[1], primary[2]);
-  doc.setLineWidth(0.3);
-  doc.line(leftX, baseY, leftX + 50, baseY);
-  doc.line(rightX, baseY, rightX + 50, baseY);
-
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(9);
-  doc.setTextColor(primary[0], primary[1], primary[2]);
-  doc.text("Authorized Signatory", leftX + 10, baseY + 6);
-  doc.text("Seal & Signature", rightX + 12, baseY + 6);
-
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(8);
-  doc.text("District Tourism Officer", leftX + 8, baseY + 11);
-  doc.text("Department of Tourism", rightX + 8, baseY + 11);
-
-  doc.setFontSize(7);
-  doc.setTextColor(120, 120, 120);
-  doc.setFont("helvetica", options?.italicFooter ? "italic" : "normal");
-  doc.text(
-    "This is a computer-generated certificate issued by HP Tourism eServices Portal",
-    pageWidth / 2,
-    pageHeight - 18,
-    { align: "center" },
+  let cursorY = area.y;
+  const outcome = (summary.application.siteInspectionOutcome || summary.report.recommendation || "Pending").replace(
+    /_/g,
+    " ",
   );
-  doc.text(
-    `Verify online at https://eservices.himachaltourism.gov.in/verify/${application.certificateNumber || ""}`,
-    pageWidth / 2,
-    pageHeight - 13,
-    { align: "center" },
+  doc.setFont("times", "bold");
+  doc.setFontSize(11);
+  doc.text("Inspection Reference", area.x, cursorY);
+  cursorY += area.lineHeight;
+
+  doc.setFont("times", "normal");
+  doc.setFontSize(10.3);
+  const infoLines = [
+    `Inspection ID: ${summary.report.id}`,
+    `Report filed on ${formatDateLine(summary.report.submittedDate)} by ${summary.da?.fullName ?? "Field Officer"}`,
+    `Field inspection: ${formatDateLine(summary.report.actualInspectionDate)} | Recommendation: ${outcome}`,
+  ];
+  infoLines.forEach((line) => {
+    doc.text(line, area.x, cursorY);
+    cursorY += area.lineHeight;
+  });
+
+  const findings = summary.report.detailedFindings?.trim();
+  if (findings) {
+    cursorY = writeParagraph(doc, findings, {
+      x: area.x,
+      y: cursorY + 1,
+      maxWidth: area.maxWidth,
+      lineHeight: area.lineHeight,
+      fontSize: 10.3,
+    });
+  }
+
+  if (summary.report.reportDocumentUrl) {
+    cursorY += area.lineHeight;
+    doc.setFont("times", "italic");
+    doc.text("Full inspection dossier is archived in the eServices portal.", area.x, cursorY);
+    doc.setFont("times", "normal");
+  }
+
+  return cursorY;
+}
+
+function drawHeader(doc: JsPDFInstance, startY: number, pageWidth: number, layout: PolicyLayout) {
+  let cursorY = startY;
+  doc.setFont("times", "bold");
+  doc.setFontSize(17);
+  doc.setTextColor(...layout.colors.primary);
+  doc.text("GOVERNMENT OF HIMACHAL PRADESH", pageWidth / 2, cursorY, { align: "center" });
+
+  cursorY += layout.headerSpacing;
+  doc.setFontSize(13);
+  doc.text("DEPARTMENT OF TOURISM & CIVIL AVIATION", pageWidth / 2, cursorY, { align: "center" });
+
+  cursorY += layout.headerSpacing;
+  doc.setFontSize(12);
+  doc.text("CERTIFICATE OF REGISTRATION OF A HOME STAY UNIT", pageWidth / 2, cursorY, { align: "center" });
+
+  doc.setTextColor(...layout.colors.text);
+  return cursorY;
+}
+
+function drawAccommodationTable(
+  doc: JsPDFInstance,
+  application: HomestayApplication,
+  layout: PolicyLayout,
+  startY: number,
+) {
+  const rows = [
+    {
+      sl: "1.",
+      label: "Single bed rooms",
+      count: formatRooms(application.singleBedRooms),
+      rate: "—",
+    },
+    {
+      sl: "2.",
+      label: "Double bed rooms",
+      count: formatRooms(application.doubleBedRooms),
+      rate: "—",
+    },
+    {
+      sl: "3.",
+      label: "Family suite",
+      count: formatRooms(application.familySuites),
+      rate: "—",
+    },
+  ];
+
+  const header = ["Sl.No.", "Details of accommodation", "No. of rooms", "Proposed room rent per night"];
+  const totalWidth = layout.tableColumns.reduce((sum, width) => sum + width, 0);
+  const xStart = layout.marginX;
+  const totalHeight = layout.tableRowHeight * (rows.length + 1);
+
+  doc.setDrawColor(...layout.colors.text);
+  doc.setLineWidth(0.4);
+  doc.rect(xStart, startY, totalWidth, totalHeight);
+  doc.setFillColor(248, 234, 208);
+  doc.rect(xStart, startY, totalWidth, layout.tableRowHeight, "F");
+
+  // Column boundaries
+  let offsetX = xStart;
+  for (const width of layout.tableColumns) {
+    doc.line(offsetX, startY, offsetX, startY + totalHeight);
+    offsetX += width;
+  }
+  doc.line(offsetX, startY, offsetX, startY + totalHeight);
+
+  // Row boundaries
+  let offsetY = startY + layout.tableRowHeight;
+  for (let i = 0; i < rows.length; i++) {
+    doc.line(xStart, offsetY, xStart + totalWidth, offsetY);
+    offsetY += layout.tableRowHeight;
+  }
+
+  // Header
+  doc.setFont("times", "bold");
+  doc.setFontSize(10.5);
+  doc.setTextColor(...layout.colors.primary);
+  offsetX = xStart;
+  header.forEach((text, index) => {
+    drawCellText(doc, text, offsetX, startY, layout.tableColumns[index], layout.tableRowHeight, index === 1 ? "left" : "center");
+    offsetX += layout.tableColumns[index];
+  });
+
+  // Rows
+  doc.setFont("times", "normal");
+  doc.setFontSize(10.5);
+  doc.setTextColor(...layout.colors.text);
+  rows.forEach((row, rowIndex) => {
+    const rowY = startY + layout.tableRowHeight * (rowIndex + 1);
+    let cellX = xStart;
+    drawCellText(doc, row.sl, cellX, rowY, layout.tableColumns[0], layout.tableRowHeight, "center");
+    cellX += layout.tableColumns[0];
+    drawCellText(doc, row.label, cellX, rowY, layout.tableColumns[1], layout.tableRowHeight, "left");
+    cellX += layout.tableColumns[1];
+    drawCellText(doc, row.count, cellX, rowY, layout.tableColumns[2], layout.tableRowHeight, "center");
+    cellX += layout.tableColumns[2];
+    drawCellText(doc, row.rate, cellX, rowY, layout.tableColumns[3], layout.tableRowHeight, "center");
+  });
+
+  return startY + totalHeight;
+}
+
+function drawCellText(
+  doc: JsPDFInstance,
+  text: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  align: "left" | "center" | "right",
+) {
+  const paddingX = 3;
+  const paddingY = 2.2;
+  const maxWidth = Math.max(width - paddingX * 2, 10);
+  const lines = doc.splitTextToSize(text, maxWidth) as string[];
+  const lineHeight = 4;
+  let textY = y + paddingY + lineHeight / 2;
+
+  for (const line of lines) {
+    if (align === "center") {
+      doc.text(line, x + width / 2, textY, { align: "center" });
+    } else if (align === "right") {
+      doc.text(line, x + width - paddingX, textY, { align: "right" });
+    } else {
+      doc.text(line, x + paddingX, textY);
+    }
+    textY += lineHeight;
+  }
+}
+
+function writeParagraph(
+  doc: JsPDFInstance,
+  text: string,
+  options: { x: number; y: number; maxWidth: number; lineHeight?: number; fontSize?: number; fontStyle?: "normal" | "bold" | "italic"; color?: RGB },
+) {
+  const { x, y, maxWidth, lineHeight = 5.2, fontSize = 11, fontStyle = "normal", color } = options;
+  doc.setFont("times", fontStyle);
+  doc.setFontSize(fontSize);
+  if (color) {
+    doc.setTextColor(color[0], color[1], color[2]);
+  }
+  const lines = doc.splitTextToSize(text, maxWidth) as string[];
+  let cursorY = y;
+  for (const line of lines) {
+    doc.text(line, x, cursorY);
+    cursorY += lineHeight;
+  }
+  return cursorY;
+}
+
+function formatDateLine(value?: string | Date | null) {
+  const formatted = formatDate(value);
+  return formatted ?? BLANK;
+}
+
+function formatDate(value?: string | Date | null) {
+  if (!value) return null;
+  const resolvedDate = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(resolvedDate.getTime())) {
+    return null;
+  }
+  return resolvedDate.toLocaleDateString("en-IN", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function formatCurrency(value?: string | number | null) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string" && value.trim().length > 0 && /[<>]/.test(value)) {
+    return value.trim();
+  }
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "—";
+  }
+  return `₹${numeric.toLocaleString("en-IN")}/-`;
+}
+
+function formatRooms(value?: number | null) {
+  if (!value || value <= 0) {
+    return "—";
+  }
+  return `${value}`;
+}
+
+function resolveTouristArea(application: HomestayApplication) {
+  const parts = [
+    application.gramPanchayat,
+    application.block,
+    application.tehsil,
+    application.urbanBody,
+    application.district,
+  ].filter((value) => value && value.trim());
+  if (parts.length > 0) {
+    return parts.join(", ");
+  }
+  if (application.address) {
+    return application.address;
+  }
+  return application.district || "";
+}
+
+function resolvePlace(application: HomestayApplication) {
+  return (
+    application.district ||
+    application.tehsil ||
+    application.block ||
+    application.urbanBody ||
+    application.gramPanchayat ||
+    application.address ||
+    ""
   );
+}
+
+function resolveGuardianName(application: HomestayApplication) {
+  if (typeof application.guardianName === "string" && application.guardianName.trim()) {
+    return application.guardianName.trim();
+  }
+  const contextName = (application.serviceContext as any)?.legacyGuardianName;
+  if (typeof contextName === "string" && contextName.trim()) {
+    return contextName.trim();
+  }
+  const potentialFields = ["ownerGuardianName", "ownerParentName", "ownerParentage", "ownerFatherName", "ownerSpouseName"];
+  const record = application as Record<string, unknown>;
+  for (const field of potentialFields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  if (typeof console !== "undefined") {
+    const identifier = application.applicationNumber || application.id || "unknown-id";
+    console.warn(`[certificate] Guardian/father name missing for application ${identifier}. Please update the record in Admin RC queue.`);
+  }
+  return "";
+}
+
+function buildAddress(application: HomestayApplication) {
+  const segments = [
+    application.address,
+    application.gramPanchayat,
+    application.tehsil,
+    application.district,
+    application.pincode ? `PIN: ${application.pincode}` : "",
+  ].filter((segment) => segment && segment.trim());
+  return segments.join(", ") || BLANK;
+}
+
+function getOwnerHonorific(gender?: string | null) {
+  if (gender === "female") return "Smt.";
+  if (gender === "male") return "Shri";
+  return "Shri/Smt.";
+}
+
+function formatCategoryLabel(category?: string | null) {
+  if (!category) return BLANK;
+  return category.trim().toUpperCase();
+}
+
+function valueOrBlank(value?: string | null) {
+  if (value === null || value === undefined) {
+    return BLANK;
+  }
+  const trimmed = value.toString().trim();
+  return trimmed || BLANK;
+}
+
+function sanitizeFileSegment(value: string) {
+  return value.replace(/[^\w.-]+/g, "_");
 }

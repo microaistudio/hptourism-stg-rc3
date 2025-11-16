@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from "react";
 
-export type ThemeName = "classic-clean" | "classic" | "professional-blue" | "mountain-sky" | "heritage-gold" | "forest-green" | "vibrant" | "official-dual-logo";
+export type ThemeName = "classic" | "professional-blue" | "mountain-sky";
 
 interface ThemeContextType {
   theme: ThemeName;
@@ -11,14 +11,9 @@ const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
 const FALLBACK_THEME: ThemeName = "classic";
 const THEME_OPTIONS: ThemeName[] = [
-  "classic-clean",
   "classic",
   "professional-blue",
   "mountain-sky",
-  "heritage-gold",
-  "forest-green",
-  "vibrant",
-  "official-dual-logo",
 ];
 
 export function ThemeProvider({ children }: { children: ReactNode }) {

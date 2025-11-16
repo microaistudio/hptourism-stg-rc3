@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { format } from "date-fns";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, useLocation } from "wouter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -44,7 +45,12 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 import type { HomestayApplication, Document } from "@shared/schema";
-import { LOCATION_TYPE_LABELS, type LocationType } from "@shared/lgd-data";
+import { isLegacyApplication } from "@shared/legacy";
+import { LOCATION_TYPE_OPTIONS } from "@shared/regions";
+import type { LocationType } from "@shared/fee-calculator";
+
+import { ApplicationTimelineCard } from "@/components/application/application-timeline-card";
+import { InspectionReportCard } from "@/components/application/inspection-report-card";
 
 interface ApplicationData {
   application: HomestayApplication;
@@ -54,6 +60,13 @@ interface ApplicationData {
     email: string | null;
   } | null;
   documents: Document[];
+  sendBackEnabled?: boolean;
+  legacyForwardEnabled?: boolean;
+  correctionHistory?: Array<{
+    id: string;
+    createdAt: string;
+    feedback?: string | null;
+  }>;
 }
 
 interface DocumentVerification {
@@ -61,6 +74,12 @@ interface DocumentVerification {
   status: 'pending' | 'verified' | 'rejected' | 'needs_correction';
   notes: string;
 }
+
+const formatCorrectionTimestamp = (value?: string | null) => {
+  if (!value) return "No resubmission yet";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "No resubmission yet" : format(parsed, "PPP p");
+};
 
 export default function DAApplicationDetail() {
   const { id } = useParams<{ id: string }>();
@@ -79,13 +98,22 @@ export default function DAApplicationDetail() {
   const [forwardDialogOpen, setForwardDialogOpen] = useState(false);
   const [sendBackDialogOpen, setSendBackDialogOpen] = useState(false);
   const [clearAllDialogOpen, setClearAllDialogOpen] = useState(false);
+  const [legacyVerifyDialogOpen, setLegacyVerifyDialogOpen] = useState(false);
   const [remarks, setRemarks] = useState("");
   const [reason, setReason] = useState("");
+  const [legacyRemarks, setLegacyRemarks] = useState("");
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null);
   
   // Document verification state
   const [verifications, setVerifications] = useState<Record<string, DocumentVerification>>({});
   const [expandedNotes, setExpandedNotes] = useState<Record<string, boolean>>({});
+  const verificationsRef = useRef<Record<string, DocumentVerification>>({});
+  useEffect(() => {
+    verificationsRef.current = verifications;
+  }, [verifications]);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+  const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   
   // Navigation functions
   const navigateToApplication = (targetId: string) => {
@@ -128,6 +156,11 @@ export default function DAApplicationDetail() {
     queryKey: ["/api/da/applications", id],
     enabled: !!id, // Only run query if id exists
   });
+  const applicationStatus = data?.application?.status;
+  const sendBackEnabled = data?.sendBackEnabled ?? false;
+  const editableStatuses = new Set(["under_scrutiny", "legacy_rc_review"]);
+  const documentActionsDisabled = !editableStatuses.has(applicationStatus || "");
+  const correctionHistory = data?.correctionHistory ?? [];
 
   // Start Scrutiny Mutation
   const startScrutinyMutation = useMutation({
@@ -137,6 +170,7 @@ export default function DAApplicationDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/da/applications", id] });
       queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/applications", id, "timeline"] });
       toast({
         title: "Scrutiny Started",
         description: "Application is now under your review",
@@ -151,14 +185,62 @@ export default function DAApplicationDetail() {
     },
   });
 
-  // Save Scrutiny Progress Mutation
-  const saveProgressMutation = useMutation({
+  const legacyVerifyMutation = useMutation({
     mutationFn: async () => {
-      return await apiRequest("POST", `/api/da/applications/${id}/save-scrutiny`, {
-        verifications: Object.values(verifications),
+      return await apiRequest("POST", `/api/applications/${id}/legacy-verify`, {
+        remarks: legacyRemarks.trim() || undefined,
       });
     },
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/da/applications", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
+      toast({
+        title: "Legacy RC verified",
+        description: "Application marked complete without forwarding to DTDO.",
+      });
+      setLegacyVerifyDialogOpen(false);
+      setLegacyRemarks("");
+      setLocation("/da/dashboard");
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Failed to verify",
+        description: error.message || "Unable to verify this legacy request.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const saveVerifications = useCallback(async () => {
+    return await apiRequest("POST", `/api/da/applications/${id}/save-scrutiny`, {
+      verifications: Object.values(verificationsRef.current),
+    });
+  }, [id]);
+
+  const clearAutoSaveTimer = () => {
+    if (autoSaveTimeoutRef.current) {
+      clearTimeout(autoSaveTimeoutRef.current);
+      autoSaveTimeoutRef.current = null;
+    }
+  };
+
+  // Save Scrutiny Progress Mutation
+  const saveProgressMutation = useMutation({
+    mutationFn: async () => {
+      if (documentActionsDisabled) {
+        toast({
+          title: "Read-only",
+          description: "This application has already been forwarded to DTDO.",
+        });
+        return;
+      }
+      return await saveVerifications();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/da/applications", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
+      setHasUnsavedChanges(false);
+      setLastSavedAt(new Date());
       toast({
         title: "Progress Saved",
         description: "Your verification progress has been saved",
@@ -172,6 +254,64 @@ export default function DAApplicationDetail() {
       });
     },
   });
+  // Auto-save mutation
+  const autoSaveMutation = useMutation({
+    mutationFn: async () => {
+      if (documentActionsDisabled) return;
+      await saveVerifications();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/da/applications", id] });
+      setHasUnsavedChanges(false);
+      setLastSavedAt(new Date());
+    },
+    onError: () => {
+      toast({
+        title: "Auto-save failed",
+        description: "Could not save the latest verification updates. Click Save Progress to retry.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const statusMessage = useMemo(() => {
+    if (saveProgressMutation.isPending || autoSaveMutation.isPending) {
+      return "Saving...";
+    }
+    if (hasUnsavedChanges) {
+      return "Unsaved changes";
+    }
+    if (lastSavedAt) {
+      return `Saved at ${lastSavedAt.toLocaleTimeString()}`;
+    }
+    return "";
+  }, [
+    saveProgressMutation.isPending,
+    autoSaveMutation.isPending,
+    hasUnsavedChanges,
+    lastSavedAt,
+  ]);
+
+  const scheduleAutoSave = useCallback(() => {
+    if (documentActionsDisabled) {
+      return;
+    }
+    setHasUnsavedChanges(true);
+    if (autoSaveTimeoutRef.current) {
+      clearTimeout(autoSaveTimeoutRef.current);
+    }
+    autoSaveTimeoutRef.current = setTimeout(() => {
+      autoSaveMutation.mutate();
+      autoSaveTimeoutRef.current = null;
+    }, 1200);
+  }, [autoSaveMutation, documentActionsDisabled]);
+
+  useEffect(() => {
+    return () => {
+      clearAutoSaveTimer();
+    };
+  }, []);
+
 
   // Forward to DTDO Mutation
   const forwardMutation = useMutation({
@@ -180,6 +320,7 @@ export default function DAApplicationDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/applications", id, "timeline"] });
       setForwardDialogOpen(false);
       setRemarks("");
       toast({
@@ -204,6 +345,7 @@ export default function DAApplicationDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/applications", id, "timeline"] });
       setSendBackDialogOpen(false);
       setReason("");
       toast({
@@ -279,6 +421,14 @@ export default function DAApplicationDetail() {
   }
 
   const { application, owner, documents } = data;
+  const isLegacyRequest = isLegacyApplication(application);
+  const legacyForwardAllowed = !isLegacyRequest || data.legacyForwardEnabled !== false;
+  const canStartScrutiny = application.status === 'submitted';
+  const canEditDuringScrutiny = editableStatuses.has(application.status || "");
+  const showReadOnlyNotice = !canStartScrutiny && !canEditDuringScrutiny;
+  const canLegacyVerify =
+    isLegacyRequest &&
+    ["legacy_rc_review", "submitted", "under_scrutiny"].includes(application.status ?? "");
 
   const locationTypeLabel = formatLocationTypeLabel(application.locationType as LocationType | undefined);
   const projectTypeLabel = formatProjectTypeLabel(application.projectType);
@@ -287,7 +437,6 @@ export default function DAApplicationDetail() {
   const certificateValidityLabel = formatCertificateValidity(application.certificateValidityYears);
   const formattedAddress = formatMultilineAddress(application.address);
   const tehsilLabel = application.tehsilOther || application.tehsil;
-  const blockLabel = application.blockOther || application.block;
   const gramPanchayatLabel = application.gramPanchayatOther || application.gramPanchayat;
   const urbanBodyLabel = application.urbanBodyOther || application.urbanBody;
   const wardLabel = application.ward;
@@ -323,10 +472,8 @@ export default function DAApplicationDetail() {
     shopping: application.distanceShopping,
   });
 
-  const baseFeeValue = formatCurrency(application.baseFee);
-  const perRoomFeeValue = formatCurrency(application.perRoomFee);
-  const gstAmountValue = formatCurrency(application.gstAmount);
-  const totalFeeValue = formatCurrency(application.totalFee);
+  const baseFeeValue = formatCurrency(application.baseFee ?? 0);
+  const totalFeeValue = formatCurrency(application.totalFee ?? application.baseFee);
   const femaleDiscountValue = formatCurrency(application.femaleOwnerDiscount);
   const pangiDiscountValue = formatCurrency(application.pangiDiscount);
   const validityDiscountValue = formatCurrency(application.validityDiscount);
@@ -341,11 +488,59 @@ export default function DAApplicationDetail() {
   const completedDocs = Object.values(verifications).filter(v => v.status !== 'pending').length;
   const progress = totalDocs > 0 ? Math.round((completedDocs / totalDocs) * 100) : 0;
 
+  const requireAllDocumentsReviewed = () => {
+    if (!legacyForwardAllowed) {
+      toast({
+        title: "DTDO escalation disabled",
+        description: "Legacy RC onboarding must be verified and closed by the DA.",
+        variant: "destructive",
+      });
+      return false;
+    }
+    if (totalDocs === 0) {
+      toast({
+        title: "Documents required",
+        description: "Required documents must be uploaded and reviewed before forwarding to DTDO.",
+        variant: "destructive",
+      });
+      return false;
+    }
+    if (completedDocs < totalDocs) {
+      toast({
+        title: "Complete document verification",
+        description: "Mark every document as Verified / Needs correction / Rejected before forwarding.",
+        variant: "destructive",
+      });
+      return false;
+    }
+    return true;
+  };
+  const canForward = legacyForwardAllowed && totalDocs > 0 && completedDocs === totalDocs;
+  const requireRemarks = () => {
+    if (remarks.trim().length === 0) {
+      toast({
+        title: "Add your remarks",
+        description: "Summarize your scrutiny observations before forwarding to DTDO.",
+        variant: "destructive",
+      });
+      return false;
+    }
+    return true;
+  };
+
   const updateVerification = (docId: string, updates: Partial<DocumentVerification>) => {
+    if (documentActionsDisabled) {
+      toast({
+        title: "Read-only",
+        description: "This application has already been forwarded to DTDO.",
+      });
+      return;
+    }
     setVerifications(prev => ({
       ...prev,
       [docId]: { ...prev[docId], ...updates }
     }));
+    scheduleAutoSave();
   };
 
   const toggleNotes = (docId: string) => {
@@ -455,7 +650,22 @@ export default function DAApplicationDetail() {
 
           {/* Action Buttons */}
           <div className="flex gap-2 w-full sm:w-auto">
-            {application.status === 'submitted' && (
+            {canLegacyVerify && (
+              <>
+                <Button
+                  variant="outline"
+                  onClick={() => setLegacyVerifyDialogOpen(true)}
+                  disabled={legacyVerifyMutation.isPending}
+                  data-testid="button-legacy-verify-da"
+                >
+                  {legacyVerifyMutation.isPending && (
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  )}
+                  Verify Legacy RC
+                </Button>
+              </>
+            )}
+            {canStartScrutiny && (
               <Button
                 onClick={() => startScrutinyMutation.mutate()}
                 disabled={startScrutinyMutation.isPending}
@@ -466,40 +676,69 @@ export default function DAApplicationDetail() {
               </Button>
             )}
 
-            {application.status === 'under_scrutiny' && (
+            {canEditDuringScrutiny && (
               <>
-                <Button
-                  variant="outline"
-                  onClick={() => saveProgressMutation.mutate()}
-                  disabled={saveProgressMutation.isPending}
-                  data-testid="button-save-progress"
-                >
-                  <Save className="w-4 h-4 mr-2" />
-                  Save Progress
-                </Button>
-                <Button
-                  variant="warning"
-                  onClick={() => setSendBackDialogOpen(true)}
-                  data-testid="button-send-back"
-                >
-                  <XCircle className="w-4 h-4 mr-2" />
-                  Send Back
-                </Button>
-                <Button
-                  onClick={() => setForwardDialogOpen(true)}
-                  data-testid="button-forward"
-                >
-                  <Send className="w-4 h-4 mr-2" />
-                  Forward to DTDO
-                </Button>
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        clearAutoSaveTimer();
+                        saveProgressMutation.mutate();
+                      }}
+                      disabled={saveProgressMutation.isPending}
+                      data-testid="button-save-progress"
+                    >
+                      <Save className="w-4 h-4 mr-2" />
+                      Save Progress
+                    </Button>
+                  </div>
+                </div>
+                {sendBackEnabled && (
+                  <Button
+                    variant="warning"
+                    onClick={() => setSendBackDialogOpen(true)}
+                    data-testid="button-send-back"
+                  >
+                    <XCircle className="w-4 h-4 mr-2" />
+                    Send Back
+                  </Button>
+                )}
+                {legacyForwardAllowed ? (
+                  <Button
+                    onClick={() => {
+                      if (requireAllDocumentsReviewed()) {
+                        setForwardDialogOpen(true);
+                      }
+                    }}
+                    data-testid="button-forward"
+                    disabled={!canForward}
+                    title={!canForward ? "Verify every document before forwarding" : undefined}
+                  >
+                    <Send className="w-4 h-4 mr-2" />
+                    Forward to DTDO
+                  </Button>
+                ) : (
+                  isLegacyRequest && (
+                    <p className="text-xs text-muted-foreground max-w-xs">
+                      Legacy RC onboarding must be completed by the DA. DTDO escalation is currently disabled by admin settings.
+                    </p>
+                  )
+                )}
               </>
             )}
-          </div>
         </div>
       </div>
+    </div>
+
+      {showReadOnlyNotice && (
+        <div className="mb-6 rounded-lg border border-dashed bg-muted/40 p-4 text-sm text-muted-foreground">
+          This application is currently {application.status?.replace(/_/g, " ") || "processed"}. Document verification is read-only.
+        </div>
+      )}
 
       {/* Progress Bar */}
-      {application.status === 'under_scrutiny' && (
+      {canEditDuringScrutiny && (
         <Card className="mb-6">
           <CardContent className="pt-6">
             <div className="flex items-center justify-between mb-2">
@@ -615,7 +854,7 @@ export default function DAApplicationDetail() {
                     <CardDescription>Review and verify each document</CardDescription>
                   </div>
                   {documents.length > 0 && (
-                    <div className="flex gap-2">
+                    <div className="flex items-center gap-2">
                       <Button
                         variant="outline"
                         size="sm"
@@ -628,6 +867,7 @@ export default function DAApplicationDetail() {
                             description: `${documents.length} documents marked as verified`,
                           });
                         }}
+                        disabled={documentActionsDisabled}
                         data-testid="button-verify-all"
                       >
                         <CheckCircle className="w-4 h-4 mr-2" />
@@ -637,6 +877,7 @@ export default function DAApplicationDetail() {
                         variant="outline"
                         size="sm"
                         onClick={() => setClearAllDialogOpen(true)}
+                        disabled={documentActionsDisabled}
                         data-testid="button-clear-all"
                       >
                         <RotateCcw className="w-4 h-4 mr-2" />
@@ -677,6 +918,11 @@ export default function DAApplicationDetail() {
                         data-testid="progress-bar-fill"
                       />
                     </div>
+                    {statusMessage && (
+                      <div className="text-xs text-muted-foreground text-right">
+                        {statusMessage}
+                      </div>
+                    )}
                   </div>
                 )}
               </CardHeader>
@@ -731,6 +977,7 @@ export default function DAApplicationDetail() {
                                 }}
                                 className="mt-1"
                                 data-testid={`checkbox-verify-${doc.id}`}
+                                disabled={documentActionsDisabled}
                               />
 
                               {/* Document Info */}
@@ -767,6 +1014,7 @@ export default function DAApplicationDetail() {
                                     variant={verifications[doc.id]?.status === 'verified' ? 'default' : 'outline'}
                                     className={verifications[doc.id]?.status === 'verified' ? 'bg-green-600' : ''}
                                     onClick={() => updateVerification(doc.id, { status: 'verified' })}
+                                    disabled={documentActionsDisabled}
                                     data-testid={`button-verify-${doc.id}`}
                                   >
                                     <CheckCircle className="w-3 h-3 mr-1" />
@@ -776,6 +1024,7 @@ export default function DAApplicationDetail() {
                                     size="sm"
                                     variant={verifications[doc.id]?.status === 'needs_correction' ? 'secondary' : 'outline'}
                                     onClick={() => updateVerification(doc.id, { status: 'needs_correction' })}
+                                    disabled={documentActionsDisabled}
                                     data-testid={`button-correction-${doc.id}`}
                                   >
                                     <AlertCircle className="w-3 h-3 mr-1" />
@@ -785,6 +1034,7 @@ export default function DAApplicationDetail() {
                                     size="sm"
                                     variant={verifications[doc.id]?.status === 'rejected' ? 'destructive' : 'outline'}
                                     onClick={() => updateVerification(doc.id, { status: 'rejected' })}
+                                    disabled={documentActionsDisabled}
                                     data-testid={`button-reject-${doc.id}`}
                                   >
                                     <XCircle className="w-3 h-3 mr-1" />
@@ -831,6 +1081,7 @@ export default function DAApplicationDetail() {
                                 onChange={(e) => updateVerification(doc.id, { notes: e.target.value })}
                                 rows={3}
                                 className="text-sm"
+                                readOnly={documentActionsDisabled}
                                 data-testid={`textarea-notes-${doc.id}`}
                               />
                               {verifications[doc.id]?.notes && (
@@ -839,6 +1090,7 @@ export default function DAApplicationDetail() {
                                   size="sm"
                                   className="mt-2"
                                   onClick={() => updateVerification(doc.id, { notes: '' })}
+                                  disabled={documentActionsDisabled}
                                   data-testid={`button-clear-notes-${doc.id}`}
                                 >
                                   Clear Notes
@@ -877,6 +1129,38 @@ export default function DAApplicationDetail() {
               </CardContent>
             </Card>
 
+            {/* Corrections & Owner Confirmation */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Correction Window</CardTitle>
+                <CardDescription>Applicants can submit limited corrections.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <DetailRow
+                  label="Corrections Used"
+                  value={`${application.correctionSubmissionCount ?? 0}`}
+                />
+                <DetailRow
+                  label="Owner Confirmation"
+                  value={formatCorrectionTimestamp(correctionHistory[0]?.createdAt)}
+                />
+                {correctionHistory[0]?.feedback && (
+                  <p className="text-xs text-muted-foreground rounded-lg border bg-muted/30 p-3">
+                    {correctionHistory[0].feedback}
+                  </p>
+                )}
+                {correctionHistory.length > 1 && (
+                  <p className="text-xs text-muted-foreground">
+                    Previous confirmations:{" "}
+                    {correctionHistory
+                      .slice(1)
+                      .map((entry) => formatCorrectionTimestamp(entry.createdAt))
+                      .join(", ")}
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+
             {/* Owner Details */}
             <Card>
               <CardHeader>
@@ -900,8 +1184,7 @@ export default function DAApplicationDetail() {
                 <DetailRow label="Address" value={formattedAddress} />
                 <DetailRow label="District" value={application.district} />
                 <DetailRow label="Tehsil" value={tehsilLabel} />
-                <DetailRow label="Block / Sub-Division" value={blockLabel} />
-                <DetailRow label="Gram Panchayat" value={gramPanchayatLabel} />
+                <DetailRow label="Village / Locality" value={gramPanchayatLabel} />
                 <DetailRow label="Urban Body" value={urbanBodyLabel} />
                 <DetailRow label="Ward" value={wardLabel} />
                 <DetailRow label="Pincode" value={application.pincode} />
@@ -935,9 +1218,7 @@ export default function DAApplicationDetail() {
                 <CardTitle>Fees & Discounts</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                <DetailRow label="Base Fee" value={baseFeeValue} />
-                <DetailRow label="Per Room Fee" value={perRoomFeeValue} />
-                <DetailRow label="GST Amount" value={gstAmountValue} />
+                <DetailRow label="Annual Registration Fee" value={baseFeeValue} />
                 <DetailRow label="Female Owner Discount" value={femaleDiscountValue} />
                 <DetailRow label="Pangi Sub-division Discount" value={pangiDiscountValue} />
                 <DetailRow label="Validity Discount" value={validityDiscountValue} />
@@ -971,9 +1252,96 @@ export default function DAApplicationDetail() {
                 <DetailRow label="Distance Summary" value={distanceSummary} />
               </CardContent>
             </Card>
+
+            {(application.districtNotes || application.stateNotes) && (
+              <Card className="md:col-span-2 xl:col-span-3">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <FileText className="w-5 h-5 text-primary" />
+                    Officer Remarks
+                  </CardTitle>
+                  <CardDescription>DTDO / State remarks are visible only to staff users.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {application.districtNotes && (
+                    <div>
+                      <div className="flex items-center gap-2 text-sm font-semibold">
+                        <Badge variant="outline">DTDO</Badge>
+                        District Remarks
+                      </div>
+                      <p className="text-sm text-muted-foreground mt-1 whitespace-pre-line">
+                        {application.districtNotes}
+                      </p>
+                    </div>
+                  )}
+                  {application.districtNotes && application.stateNotes && <Separator />}
+                  {application.stateNotes && (
+                    <div>
+                      <div className="flex items-center gap-2 text-sm font-semibold">
+                        <Badge variant="outline">State</Badge>
+                        State Remarks
+                      </div>
+                      <p className="text-sm text-muted-foreground mt-1 whitespace-pre-line">
+                        {application.stateNotes}
+                      </p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+            <InspectionReportCard applicationId={id} className="md:col-span-2 xl:col-span-3" />
+
+            <ApplicationTimelineCard
+              applicationId={id}
+              className="md:col-span-2 xl:col-span-3"
+              description="Every action taken as the application moves between DA, DTDO, and the applicant."
+            />
           </div>
         </TabsContent>
       </Tabs>
+
+      <Dialog
+        open={legacyVerifyDialogOpen}
+        onOpenChange={(open) => {
+          setLegacyVerifyDialogOpen(open);
+          if (!open) {
+            setLegacyRemarks("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Verify Legacy RC</DialogTitle>
+            <DialogDescription>
+              Confirm that this existing license has been verified and can be closed without DTDO
+              review.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Label htmlFor="legacy-remarks-da">Remarks (optional)</Label>
+            <Textarea
+              id="legacy-remarks-da"
+              placeholder="Notes for audit trail"
+              value={legacyRemarks}
+              onChange={(e) => setLegacyRemarks(e.target.value)}
+            />
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setLegacyVerifyDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => legacyVerifyMutation.mutate()}
+              disabled={legacyVerifyMutation.isPending}
+            >
+              {legacyVerifyMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Verify & Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Forward to DTDO Dialog */}
       <Dialog open={forwardDialogOpen} onOpenChange={setForwardDialogOpen}>
@@ -1002,8 +1370,16 @@ export default function DAApplicationDetail() {
               Cancel
             </Button>
             <Button
-              onClick={() => forwardMutation.mutate()}
-              disabled={forwardMutation.isPending}
+              onClick={() => {
+                if (!requireAllDocumentsReviewed()) {
+                  return;
+                }
+                if (!requireRemarks()) {
+                  return;
+                }
+                forwardMutation.mutate();
+              }}
+              disabled={forwardMutation.isPending || !canForward}
               data-testid="button-confirm-forward"
             >
               {forwardMutation.isPending && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
@@ -1013,44 +1389,48 @@ export default function DAApplicationDetail() {
         </DialogContent>
       </Dialog>
 
-      {/* Send Back Dialog */}
-      <Dialog open={sendBackDialogOpen} onOpenChange={setSendBackDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Send Back to Applicant</DialogTitle>
-            <DialogDescription>
-              Specify what corrections or additional information is required from the applicant.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div>
-              <Label htmlFor="reason">Reason for Sending Back *</Label>
-              <Textarea
-                id="reason"
-                placeholder="Please specify the corrections needed..."
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                rows={4}
-                data-testid="textarea-reason"
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setSendBackDialogOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              variant="warning"
-              onClick={() => sendBackMutation.mutate()}
-              disabled={sendBackMutation.isPending || !reason.trim()}
-              data-testid="button-confirm-send-back"
-            >
-              {sendBackMutation.isPending && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Send Back
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {sendBackEnabled && (
+        <>
+          {/* Send Back Dialog */}
+          <Dialog open={sendBackDialogOpen} onOpenChange={setSendBackDialogOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Send Back to Applicant</DialogTitle>
+                <DialogDescription>
+                  Specify what corrections or additional information is required from the applicant.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4">
+                <div>
+                  <Label htmlFor="reason">Reason for Sending Back *</Label>
+                  <Textarea
+                    id="reason"
+                    placeholder="Please specify the corrections needed..."
+                    value={reason}
+                    onChange={(e) => setReason(e.target.value)}
+                    rows={4}
+                    data-testid="textarea-reason"
+                  />
+                </div>
+              </div>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setSendBackDialogOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="warning"
+                  onClick={() => sendBackMutation.mutate()}
+                  disabled={sendBackMutation.isPending || !reason.trim()}
+                  data-testid="button-confirm-send-back"
+                >
+                  {sendBackMutation.isPending && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                  Send Back
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </>
+      )}
 
       {/* Clear All Confirmation Dialog */}
       <Dialog open={clearAllDialogOpen} onOpenChange={setClearAllDialogOpen}>
@@ -1089,7 +1469,7 @@ export default function DAApplicationDetail() {
   );
 }
 
-function DetailRow({ label, value }: { label: string; value?: string }) {
+function DetailRow({ label, value }: { label: string; value?: string | null }) {
   return (
     <div className="flex gap-4 text-sm">
       <span className="text-muted-foreground shrink-0">{label}:</span>
@@ -1105,6 +1485,11 @@ const currencyFormatter = new Intl.NumberFormat("en-IN", {
   currency: "INR",
   maximumFractionDigits: 2,
 });
+
+const LOCATION_LABEL_MAP = LOCATION_TYPE_OPTIONS.reduce(
+  (acc, option) => ({ ...acc, [option.value]: option.label }),
+  {} as Record<string, string>,
+);
 
 function toNumber(value?: string | number | null): number | undefined {
   if (value === null || value === undefined || value === "") {
@@ -1126,8 +1511,9 @@ function formatCount(value?: string | number | null): string | undefined {
 
 function formatLocationTypeLabel(value?: LocationType | string): string | undefined {
   if (!value) return undefined;
-  if (LOCATION_TYPE_LABELS[value as LocationType]) {
-    return LOCATION_TYPE_LABELS[value as LocationType];
+  const label = LOCATION_LABEL_MAP[value as LocationType];
+  if (label) {
+    return label;
   }
   return typeof value === "string" ? value.toUpperCase() : undefined;
 }
@@ -1219,5 +1605,8 @@ function buildDistanceSummary(distances: {
 
 function formatDistance(value?: number | string | null): string | undefined {
   const numeric = toNumber(value);
-  return numeric !== undefined ? `${numeric} km` : undefined;
+  if (numeric === undefined || numeric <= 0) {
+    return undefined;
+  }
+  return `${numeric} km`;
 }

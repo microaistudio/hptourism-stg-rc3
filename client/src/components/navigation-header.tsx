@@ -2,7 +2,6 @@ import { Button } from "@/components/ui/button";
 import { Home, ArrowLeft } from "lucide-react";
 import { useLocation } from "wouter";
 import himachalTourismLogo from "@assets/WhatsApp Image 2025-10-25 at 07.59.16_5c0e8739_1761362811579.jpg";
-import hpGovtLogo from "@assets/WhatsApp Image 2025-10-25 at 08.03.16_1cdc4198_1761362811579.jpg";
 
 interface NavigationHeaderProps {
   title?: string;
@@ -11,6 +10,7 @@ interface NavigationHeaderProps {
   showBack?: boolean;
   backTo?: string;
   actions?: React.ReactNode;
+  onPrimaryLogoToggle?: () => void;
 }
 
 export function NavigationHeader({ 
@@ -19,7 +19,8 @@ export function NavigationHeader({
   showHome = true, 
   showBack = true, 
   backTo,
-  actions 
+  actions,
+  onPrimaryLogoToggle,
 }: NavigationHeaderProps) {
   const [, setLocation] = useLocation();
 
@@ -34,8 +35,8 @@ export function NavigationHeader({
   return (
     <div className="border-b bg-background sticky top-0 z-50">
       <div className="container mx-auto px-4 py-3">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-1 min-w-0 items-center gap-3">
             {showBack && (
               <Button
                 variant="ghost"
@@ -57,20 +58,36 @@ export function NavigationHeader({
               </Button>
             )}
             {title && (
-              <div className="flex items-center gap-3">
-                <img 
-                  src={himachalTourismLogo} 
-                  alt="Himachal Tourism" 
-                  className="h-12 w-auto object-contain"
-                  data-testid="img-hp-tourism-logo"
-                />
+              <div className="flex items-center gap-3 min-w-0">
+                {onPrimaryLogoToggle ? (
+                  <button
+                    type="button"
+                    onClick={onPrimaryLogoToggle}
+                    className="relative p-0 border-none bg-transparent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
+                    aria-label="Toggle alternate hero image"
+                  >
+                    <img 
+                      src={himachalTourismLogo} 
+                      alt="Himachal Tourism" 
+                      className="h-12 w-auto object-contain"
+                      data-testid="img-hp-tourism-logo"
+                    />
+                  </button>
+                ) : (
+                  <img 
+                    src={himachalTourismLogo} 
+                    alt="Himachal Tourism" 
+                    className="h-12 w-auto object-contain"
+                    data-testid="img-hp-tourism-logo"
+                  />
+                )}
                 <div className="border-l h-12 border-border"></div>
-                <div>
-                  <h1 className="text-lg font-semibold leading-tight" data-testid="text-page-title">
+                <div className="min-w-0">
+                  <h1 className="text-lg font-semibold leading-tight truncate" data-testid="text-page-title">
                     {title}
                   </h1>
                   {subtitle && (
-                    <p className="text-sm text-muted-foreground leading-tight" data-testid="text-page-subtitle">
+                    <p className="text-sm text-muted-foreground leading-tight truncate" data-testid="text-page-subtitle">
                       {subtitle}
                     </p>
                   )}
@@ -79,14 +96,7 @@ export function NavigationHeader({
             )}
           </div>
           {actions && (
-            <div className="flex items-center gap-3">
-              <img 
-                src={hpGovtLogo} 
-                alt="Himachal Government" 
-                className="h-10 w-auto object-contain"
-                data-testid="img-hp-govt-logo"
-              />
-              <div className="border-l h-10 border-border"></div>
+            <div className="flex flex-wrap items-center justify-end gap-2 w-full sm:w-auto">
               {actions}
             </div>
           )}

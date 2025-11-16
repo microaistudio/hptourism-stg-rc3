@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { CheckCircle2, XCircle, Building2, User, MapPin, Phone, Mail, Bed, IndianRupee, Calendar, FileText, ArrowLeftCircle, ClipboardCheck, CalendarClock, FileImage, Download, Images, Award, CreditCard, QrCode, Printer } from "lucide-react";
+import { CheckCircle2, XCircle, Building2, User, MapPin, Phone, Mail, Bed, IndianRupee, FileText, ArrowLeftCircle, ClipboardCheck, CalendarClock, FileImage, Download, Images, Award, CreditCard, QrCode, Printer } from "lucide-react";
 import himachalTourismLogo from "@assets/WhatsApp Image 2025-10-25 at 07.59.16_5c0e8739_1761362811579.jpg";
 import hpGovtLogo from "@assets/WhatsApp Image 2025-10-25 at 08.03.16_1cdc4198_1761362811579.jpg";
 import type { HomestayApplication, User as UserType, Document } from "@shared/schema";
@@ -19,9 +19,63 @@ import { ImageGallery } from "@/components/ImageGallery";
 import { Checkbox } from "@/components/ui/checkbox";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { generateCertificatePDF, type CertificateFormat } from "@/lib/certificateGenerator";
+import { fetchInspectionReportSummary } from "@/lib/inspection-report";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertCircle } from "lucide-react";
 import { buildObjectViewUrl } from "@/lib/utils";
+import { ApplicationTimelineCard } from "@/components/application/application-timeline-card";
+import { InspectionReportCard } from "@/components/application/inspection-report-card";
+import { isCorrectionRequiredStatus } from "@/constants/workflow";
+import { formatDistanceToNow } from "date-fns";
+
+type DocumentStatusMeta = {
+  label: string;
+  badgeClass: string;
+  noteBgClass: string;
+  noteTextClass: string;
+};
+
+const DOCUMENT_STATUS_META: Record<string, DocumentStatusMeta> = {
+  pending: {
+    label: "Pending review",
+    badgeClass: "bg-slate-100 text-slate-700",
+    noteBgClass: "bg-slate-50 border-slate-200",
+    noteTextClass: "text-slate-700",
+  },
+  verified: {
+    label: "Verified",
+    badgeClass: "bg-emerald-50 text-emerald-700",
+    noteBgClass: "bg-emerald-50 border-emerald-200",
+    noteTextClass: "text-emerald-800",
+  },
+  needs_correction: {
+    label: "Needs correction",
+    badgeClass: "bg-amber-50 text-amber-800",
+    noteBgClass: "bg-amber-50 border-amber-200",
+    noteTextClass: "text-amber-900",
+  },
+  rejected: {
+    label: "Rejected",
+    badgeClass: "bg-rose-50 text-rose-700",
+    noteBgClass: "bg-rose-50 border-rose-200",
+    noteTextClass: "text-rose-800",
+  },
+};
+
+const getDocumentStatusMeta = (status?: string | null): DocumentStatusMeta | null => {
+  if (!status) return null;
+  const normalized = status.toLowerCase();
+  if (DOCUMENT_STATUS_META[normalized]) {
+    return DOCUMENT_STATUS_META[normalized];
+  }
+  const fallbackLabel = status.replace(/_/g, " ");
+  return {
+    label: fallbackLabel,
+    badgeClass: "bg-muted text-muted-foreground",
+    noteBgClass: "bg-muted/40 border-border",
+    noteTextClass: "text-muted-foreground",
+  };
+};
 
 export default function ApplicationDetail() {
   const [, params] = useRoute("/applications/:id");
@@ -47,12 +101,11 @@ export default function ApplicationDetail() {
   const [issuesFound, setIssuesFound] = useState("");
   const [inspectionCompletionNotes, setInspectionCompletionNotes] = useState("");
   const certificateFormatOptions: { value: CertificateFormat; label: string; description: string }[] = [
-    { value: "classic", label: "Format 1", description: "Official teal design" },
-    { value: "modern", label: "Format 2", description: "Contemporary card layout" },
-    { value: "heritage", label: "Format 3", description: "Heritage parchment style" },
+    { value: "policy_heritage", label: "Official RC Format", description: "Golden bordered Form-A certificate approved for issuance" },
   ];
   const [certificateFormat, setCertificateFormat] =
-    useState<CertificateFormat>("classic");
+    useState<CertificateFormat>("policy_heritage");
+  const [isGeneratingCertificate, setIsGeneratingCertificate] = useState(false);
   const activeCertificateFormat =
     certificateFormatOptions.find((option) => option.value === certificateFormat) ??
     certificateFormatOptions[0];
@@ -249,6 +302,35 @@ export default function ApplicationDetail() {
   }
 
   const app = applicationData.application;
+
+  const handleGenerateCertificate = async () => {
+    if (!app) {
+      return;
+    }
+    setIsGeneratingCertificate(true);
+    try {
+      let inspectionSummary = null;
+      if (applicationId) {
+        try {
+          inspectionSummary = await fetchInspectionReportSummary(applicationId);
+        } catch (error) {
+          console.warn("[certificate] Failed to fetch inspection reference", error);
+        }
+      }
+
+      generateCertificatePDF(app, certificateFormat, {
+        inspectionReport: inspectionSummary ?? undefined,
+      });
+    } catch (error) {
+      toast({
+        title: "Download failed",
+        description: error instanceof Error ? error.message : "Unable to prepare certificate right now.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsGeneratingCertificate(false);
+    }
+  };
   const user = userData?.user;
   const isDistrictOfficer = user?.role === "district_officer";
   const isStateOfficer = user?.role === "state_officer";
@@ -260,7 +342,16 @@ export default function ApplicationDetail() {
     'sent_back_for_corrections',
     'reverted_to_applicant',
     'reverted_by_dtdo',
+    'objection_raised',
   ];
+  const needsCorrectionsAlert =
+    isPropertyOwner && isCorrectionRequiredStatus(currentStatus);
+  const correctionMessage =
+    app.clarificationRequested || (app as any).dtdoRemarks || (app as any).daRemarks || null;
+  const correctionRelative =
+    needsCorrectionsAlert && app.updatedAt
+      ? formatDistanceToNow(new Date(app.updatedAt), { addSuffix: true })
+      : null;
   const canEdit = isPropertyOwner && ownerEditableStatuses.includes(currentStatus);
   
   // District officers can review pending applications
@@ -282,6 +373,7 @@ export default function ApplicationDetail() {
       draft: { label: "Draft", variant: "outline" as const },
       pending: { label: "District Review", variant: "secondary" as const },
       state_review: { label: "State Review", variant: "secondary" as const },
+      objection_raised: { label: "DTDO Objection", variant: "warning" as const },
       approved: { label: "Approved", variant: "default" as const },
       rejected: { label: "Rejected", variant: "destructive" as const },
     };
@@ -309,9 +401,9 @@ export default function ApplicationDetail() {
   };
 
   const locationTypeLabels: Record<string, string> = {
-    mc: "Municipal Council / Corporation",
-    tcp: "Town & Country Planning",
-    gp: "Gram Panchayat (Rural)",
+    mc: "Municipal Corporation / Municipal Council",
+    tcp: "Town & Country Planning / SADA / NP Area",
+    gp: "Gram Panchayat",
   };
 
   const handlePrint = () => {
@@ -332,7 +424,7 @@ export default function ApplicationDetail() {
 
   const formatDistance = (value: unknown) => {
     const num = asNumber(value);
-    if (num === null || num === 0) return "—";
+    if (num === null || num <= 0) return "Enter distance in KM";
     return `${num} km`;
   };
 
@@ -455,15 +547,11 @@ export default function ApplicationDetail() {
               <p>{displayValue(app.district)}</p>
             </div>
             <div>
-              <p className="text-xs uppercase text-gray-600">Tehsil / Sub-Division</p>
+              <p className="text-xs uppercase text-gray-600">Tehsil</p>
               <p>{displayValue(app.tehsil)}</p>
             </div>
             <div>
-              <p className="text-xs uppercase text-gray-600">Block / Development Block</p>
-              <p>{displayValue(app.block)}</p>
-            </div>
-            <div>
-              <p className="text-xs uppercase text-gray-600">Gram Panchayat / Village</p>
+              <p className="text-xs uppercase text-gray-600">Village / Locality</p>
               <p>{displayValue(app.gramPanchayat)}</p>
             </div>
             <div>
@@ -680,11 +768,7 @@ export default function ApplicationDetail() {
               <p className="text-xs uppercase text-gray-600">Total Discounts</p>
               <p>{formatCurrency(app.totalDiscount)}</p>
             </div>
-            <div>
-              <p className="text-xs uppercase text-gray-600">GST Amount</p>
-              <p>{formatCurrency(app.gstAmount)}</p>
-            </div>
-            <div>
+            <div className="col-span-2">
               <p className="text-xs uppercase text-gray-600">Total Payable Fee</p>
               <p className="font-semibold">{formatCurrency(app.totalFee)}</p>
             </div>
@@ -698,7 +782,32 @@ export default function ApplicationDetail() {
         </section>
       </div>
 
-      <div className="print:hidden container mx-auto px-4 py-8">
+      <div className="print:hidden container mx-auto px-4 py-8 space-y-4">
+        {needsCorrectionsAlert && (
+          <Alert className="border-amber-300 bg-amber-50 md:sticky md:top-4 z-10">
+            <AlertCircle className="h-4 w-4 text-amber-600" />
+            <div>
+              <AlertTitle>Corrections required</AlertTitle>
+              <AlertDescription className="space-y-2">
+                <p className="text-sm">
+                  Your application requires updates before we can continue processing.{" "}
+                  {correctionRelative ? `Last updated ${correctionRelative}.` : null}
+                </p>
+                {correctionMessage ? (
+                  <p className="text-sm text-amber-700 whitespace-pre-line">{correctionMessage}</p>
+                ) : null}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setLocation(`/applications/new?application=${app.id}`)}
+                  data-testid="button-banner-continue-corrections"
+                >
+                  Continue Corrections
+                </Button>
+              </AlertDescription>
+            </div>
+          </Alert>
+        )}
       <div className="max-w-6xl mx-auto">
         <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-2">
@@ -763,19 +872,13 @@ export default function ApplicationDetail() {
                     </p>
                   </div>
                 </div>
-                <div className="grid md:grid-cols-2 gap-4">
-                  <div>
-                    <Label className="text-muted-foreground">Tehsil / Sub-Division</Label>
-                    <p data-testid="text-tehsil">{displayValue(app.tehsil)}</p>
-                  </div>
-                  <div>
-                    <Label className="text-muted-foreground">Block / Development Block</Label>
-                    <p data-testid="text-block">{displayValue(app.block)}</p>
-                  </div>
+                <div>
+                  <Label className="text-muted-foreground">Tehsil</Label>
+                  <p data-testid="text-tehsil">{displayValue(app.tehsil)}</p>
                 </div>
                 <div className="grid md:grid-cols-2 gap-4">
                   <div>
-                    <Label className="text-muted-foreground">Gram Panchayat / Village</Label>
+                    <Label className="text-muted-foreground">Village / Locality</Label>
                     <p data-testid="text-gram-panchayat">{displayValue(app.gramPanchayat)}</p>
                   </div>
                   <div>
@@ -896,11 +999,12 @@ export default function ApplicationDetail() {
                   <div className="flex gap-2 pt-2">
                     <Button 
                       className="flex-1 bg-green-600 hover:bg-green-700" 
-                      onClick={() => generateCertificatePDF(app, certificateFormat)}
+                      onClick={handleGenerateCertificate}
                       data-testid="button-download-certificate"
+                      disabled={isGeneratingCertificate}
                     >
                       <Download className="w-4 h-4 mr-2" />
-                      Download {activeCertificateFormat.label}
+                      {isGeneratingCertificate ? "Preparing certificate..." : `Download ${activeCertificateFormat.label}`}
                     </Button>
                   </div>
                 </CardContent>
@@ -1132,25 +1236,54 @@ export default function ApplicationDetail() {
                                       })
                                     : undefined);
 
+                                const statusMeta = getDocumentStatusMeta(photo.verificationStatus);
+                                const normalizedNotes =
+                                  typeof photo.verificationNotes === "string" && photo.verificationNotes.trim().length > 0
+                                    ? photo.verificationNotes.trim()
+                                    : "";
                                 return (
                                 <div
                                   key={photo.id}
-                                  className="aspect-square border rounded-md overflow-hidden cursor-pointer hover-elevate active-elevate-2"
-                                  onClick={() => {
-                                    setGalleryInitialIndex(index);
-                                    setIsGalleryOpen(true);
-                                  }}
-                                  data-testid={`thumbnail-property-${index}`}
+                                  className="space-y-2"
                                 >
-                                  {resolvedSrc ? (
-                                    <img
-                                      src={resolvedSrc}
-                                      alt={photo.fileName || `Property photo ${index + 1}`}
-                                      className="w-full h-full object-cover"
-                                    />
-                                  ) : (
-                                    <div className="w-full h-full flex items-center justify-center text-xs text-muted-foreground bg-muted">
-                                      Missing Image
+                                  <div
+                                    className="aspect-square border rounded-md overflow-hidden cursor-pointer hover-elevate active-elevate-2"
+                                    onClick={() => {
+                                      setGalleryInitialIndex(index);
+                                      setIsGalleryOpen(true);
+                                    }}
+                                    data-testid={`thumbnail-property-${index}`}
+                                  >
+                                    {resolvedSrc ? (
+                                      <img
+                                        src={resolvedSrc}
+                                        alt={photo.fileName || `Property photo ${index + 1}`}
+                                        className="w-full h-full object-cover"
+                                      />
+                                    ) : (
+                                      <div className="w-full h-full flex items-center justify-center text-xs text-muted-foreground bg-muted">
+                                        Missing Image
+                                      </div>
+                                    )}
+                                  </div>
+                                  {(statusMeta || normalizedNotes) && (
+                                    <div
+                                      className={`rounded-md border px-2 py-1.5 text-xs space-y-1 ${
+                                        statusMeta?.noteBgClass ?? "bg-muted/40 border-border/40"
+                                      }`}
+                                    >
+                                      {statusMeta && (
+                                        <span
+                                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${statusMeta.badgeClass}`}
+                                        >
+                                          {statusMeta.label}
+                                        </span>
+                                      )}
+                                      {normalizedNotes && (
+                                        <p className={`text-sm leading-relaxed ${statusMeta?.noteTextClass ?? "text-muted-foreground"}`}>
+                                          {normalizedNotes}
+                                        </p>
+                                      )}
                                     </div>
                                   )}
                                 </div>
@@ -1174,43 +1307,72 @@ export default function ApplicationDetail() {
                           <div className="space-y-2">
                             <p className="text-sm font-medium text-muted-foreground mb-2">Supporting Documents</p>
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                              {otherDocs.map((doc) => (
-                                <div key={doc.id} className="flex flex-col p-3 border rounded-md hover-elevate">
-                                  <div className="flex items-center gap-3 mb-2">
-                                    <div className="p-2 bg-primary/10 rounded flex-shrink-0">
-                                      {doc.mimeType.startsWith('image/') ? (
-                                        <FileImage className="w-5 h-5 text-primary" />
-                                      ) : (
-                                        <FileText className="w-5 h-5 text-primary" />
-                                      )}
+                              {otherDocs.map((doc) => {
+                                const statusMeta = getDocumentStatusMeta(doc.verificationStatus);
+                                const normalizedNotes =
+                                  typeof doc.verificationNotes === "string" && doc.verificationNotes.trim().length > 0
+                                    ? doc.verificationNotes.trim()
+                                    : "";
+                                return (
+                                  <div key={doc.id} className="flex flex-col p-3 border rounded-md hover-elevate space-y-3">
+                                    <div className="flex items-center gap-3">
+                                      <div className="p-2 bg-primary/10 rounded flex-shrink-0">
+                                        {doc.mimeType.startsWith('image/') ? (
+                                          <FileImage className="w-5 h-5 text-primary" />
+                                        ) : (
+                                          <FileText className="w-5 h-5 text-primary" />
+                                        )}
+                                      </div>
+                                      <div className="flex-1 min-w-0">
+                                        <p className="font-medium text-sm truncate">{doc.fileName}</p>
+                                        <p className="text-xs text-muted-foreground capitalize">{doc.documentType.replace(/_/g, ' ')}</p>
+                                      </div>
                                     </div>
-                                    <div className="flex-1 min-w-0">
-                                      <p className="font-medium text-sm truncate">{doc.fileName}</p>
-                                      <p className="text-xs text-muted-foreground capitalize">{doc.documentType.replace(/_/g, ' ')}</p>
+                                    {(statusMeta || normalizedNotes) && (
+                                      <div
+                                        className={`rounded-md border px-2 py-1.5 text-xs space-y-1 ${
+                                          statusMeta?.noteBgClass ?? "bg-muted/40 border-border/40"
+                                        }`}
+                                      >
+                                        {statusMeta && (
+                                          <span
+                                            className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${statusMeta.badgeClass}`}
+                                          >
+                                            {statusMeta.label}
+                                          </span>
+                                        )}
+                                        {normalizedNotes && (
+                                          <p className={`text-sm leading-relaxed ${statusMeta?.noteTextClass ?? "text-muted-foreground"}`}>
+                                            {normalizedNotes}
+                                          </p>
+                                        )}
+                                      </div>
+                                    )}
+                                    <div className="flex items-center justify-between pt-2 border-t">
+                                      <span className="text-xs text-muted-foreground">
+                                        {doc.fileSize ? (doc.fileSize / 1024).toFixed(1) : "0.0"} KB
+                                      </span>
+                                      <Button 
+                                        size="sm" 
+                                        variant="outline"
+                                        onClick={() =>
+                                          window.open(
+                                            buildObjectViewUrl(doc.filePath, {
+                                              mimeType: doc.mimeType,
+                                              fileName: doc.fileName,
+                                            }),
+                                            '_blank'
+                                          )
+                                        }
+                                        data-testid={`button-view-document-${doc.id}`}
+                                      >
+                                        <Download className="w-4 h-4 mr-1" />
+                                        View
+                                      </Button>
                                     </div>
                                   </div>
-                                  <div className="flex items-center justify-between mt-auto pt-2 border-t">
-                                    <span className="text-xs text-muted-foreground">{(doc.fileSize / 1024).toFixed(1)} KB</span>
-                                    <Button 
-                                      size="sm" 
-                                      variant="outline"
-                                      onClick={() =>
-                                        window.open(
-                                          buildObjectViewUrl(doc.filePath, {
-                                            mimeType: doc.mimeType,
-                                            fileName: doc.fileName,
-                                          }),
-                                          '_blank'
-                                        )
-                                      }
-                                      data-testid={`button-view-document-${doc.id}`}
-                                    >
-                                      <Download className="w-4 h-4 mr-1" />
-                                      View
-                                    </Button>
-                                  </div>
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           </div>
                         );
@@ -1751,59 +1913,53 @@ export default function ApplicationDetail() {
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Base Fee</span>
-                  <span data-testid="text-base-fee">₹{Number(app.baseFee).toFixed(2)}</span>
+                  <span className="text-muted-foreground">Annual Registration Fee</span>
+                  <span data-testid="text-base-fee">₹{Number(app.baseFee ?? 0).toFixed(2)}</span>
                 </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">Per Room Fee ({app.totalRooms} rooms)</span>
-                  <span data-testid="text-room-fee">₹{(Number(app.perRoomFee) * app.totalRooms).toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-muted-foreground">GST (18%)</span>
-                  <span data-testid="text-gst">₹{Number(app.gstAmount).toFixed(2)}</span>
+                <div className="space-y-1 text-sm mt-3 border-t pt-3">
+                  {Number(app.femaleOwnerDiscount) > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Female Owner Discount</span>
+                      <span className="text-green-600">-₹{Number(app.femaleOwnerDiscount).toFixed(2)}</span>
+                    </div>
+                  )}
+                  {Number(app.pangiDiscount) > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Pangi Sub-division Discount</span>
+                      <span className="text-green-600">-₹{Number(app.pangiDiscount).toFixed(2)}</span>
+                    </div>
+                  )}
+                  {Number(app.validityDiscount) > 0 && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Validity Discount</span>
+                      <span className="text-green-600">-₹{Number(app.validityDiscount).toFixed(2)}</span>
+                    </div>
+                  )}
+                  {Number(app.totalDiscount) > 0 && (
+                    <div className="flex justify-between font-medium text-sm">
+                      <span className="text-muted-foreground">Total Discount</span>
+                      <span className="text-green-700">-₹{Number(app.totalDiscount).toFixed(2)}</span>
+                    </div>
+                  )}
                 </div>
                 <div className="pt-3 border-t flex justify-between font-semibold">
-                  <span>Total Fee</span>
-                  <span className="text-primary" data-testid="text-total">₹{Number(app.totalFee).toFixed(2)}</span>
+                  <span>Total Payable</span>
+                  <span className="text-primary" data-testid="text-total">₹{Number(app.totalFee ?? app.baseFee).toFixed(2)}</span>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  HP Tourism Policy 2025 collects a single consolidated fee (no per-room add-ons or GST line items).
+                </p>
               </CardContent>
             </Card>
 
-            {/* Timeline */}
-            <Card>
-              <CardHeader>
-                <div className="flex items-center gap-2">
-                  <Calendar className="w-5 h-5 text-primary" />
-                  <CardTitle>Timeline</CardTitle>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div>
-                  <Label className="text-muted-foreground text-xs">Submitted</Label>
-                  <p className="text-sm" data-testid="text-submitted-date">
-                    {app.createdAt ? new Date(app.createdAt).toLocaleDateString('en-IN', { 
-                      day: 'numeric', 
-                      month: 'long', 
-                      year: 'numeric' 
-                    }) : 'N/A'}
-                  </p>
-                </div>
-                {app.updatedAt && (
-                  <div>
-                    <Label className="text-muted-foreground text-xs">Last Updated</Label>
-                    <p className="text-sm" data-testid="text-updated-date">
-                      {new Date(app.updatedAt).toLocaleDateString('en-IN', { 
-                        day: 'numeric', 
-                        month: 'long', 
-                        year: 'numeric' 
-                      })}
-                    </p>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
+            <InspectionReportCard applicationId={applicationId ?? null} />
 
-            {(app.districtNotes || app.stateNotes) && (
+            <ApplicationTimelineCard
+              applicationId={applicationId ?? null}
+              description="Tracks DA, DTDO, and owner actions for this application."
+            />
+
+            {!isPropertyOwner && (app.districtNotes || app.stateNotes) && (
               <Card>
                 <CardHeader>
                   <div className="flex items-center gap-2">

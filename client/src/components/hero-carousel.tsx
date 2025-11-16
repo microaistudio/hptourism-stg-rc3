@@ -7,9 +7,10 @@ interface HeroCarouselProps {
   images: string[];
   interval?: number;
   onSlideChange?: (index: number) => void;
+  overlayClassName?: string;
 }
 
-export function HeroCarousel({ images, interval = 5000, onSlideChange }: HeroCarouselProps) {
+export function HeroCarousel({ images, interval = 5000, onSlideChange, overlayClassName }: HeroCarouselProps) {
   const [emblaRef, emblaApi] = useEmblaCarousel({ loop: true });
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
@@ -68,7 +69,11 @@ export function HeroCarousel({ images, interval = 5000, onSlideChange }: HeroCar
               className="absolute inset-0 bg-cover bg-center transition-transform duration-700"
               style={{ backgroundImage: `url(${image})` }}
             />
-            <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/50 to-black/60" />
+            <div
+              className={`absolute inset-0 ${
+                overlayClassName || "bg-gradient-to-b from-black/60 via-black/50 to-black/60"
+              }`}
+            />
           </div>
         ))}
       </div>

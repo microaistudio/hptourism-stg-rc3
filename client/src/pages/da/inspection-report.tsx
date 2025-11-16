@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { format } from "date-fns";
+import { differenceInCalendarDays, format, subDays } from "date-fns";
 import { ArrowLeft, Save, Send, CheckCircle, XCircle, AlertCircle, Calendar, MapPin, User, FileText, Shield, Star, CheckSquare, SquareX } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -17,14 +17,17 @@ import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 
+const EARLY_OVERRIDE_WINDOW_DAYS = 7;
+
 const inspectionReportSchema = z.object({
   actualInspectionDate: z.string().min(1, "Inspection date is required"),
-  roomCountVerified: z.boolean(),
+  roomCountVerified: z.boolean().optional(),
   actualRoomCount: z.number().int().min(0).optional(),
-  categoryMeetsStandards: z.boolean(),
+  categoryMeetsStandards: z.boolean().optional(),
   recommendedCategory: z.enum(['diamond', 'gold', 'silver']).optional(),
   
   // ANNEXURE-III Mandatory Checklist (18 points)
@@ -76,10 +79,82 @@ const inspectionReportSchema = z.object({
   // Legacy fields for compatibility
   fireSafetyCompliant: z.boolean().optional(),
   structuralSafety: z.boolean().optional(),
-  overallSatisfactory: z.boolean(),
+  overallSatisfactory: z.boolean().optional(),
   recommendation: z.enum(['approve', 'raise_objections']),
   detailedFindings: z.string().min(20, "Detailed findings must be at least 20 characters"),
-  daRemarks: z.string().optional(),
+  objectionDetails: z.string().optional(),
+  earlyInspectionOverride: z.boolean().optional(),
+  earlyInspectionReason: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.earlyInspectionOverride) {
+    if (!data.earlyInspectionReason || data.earlyInspectionReason.trim().length < 15) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['earlyInspectionReason'],
+        message: "Please provide at least 15 characters explaining why the inspection happened before the scheduled date.",
+      });
+    }
+  }
+
+  if (data.roomCountVerified === false && data.recommendation !== 'raise_objections') {
+    if (typeof data.actualRoomCount !== "number" || Number.isNaN(data.actualRoomCount)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['actualRoomCount'],
+        message: "Enter the verified room count if it does not match the application.",
+      });
+    }
+  }
+
+  if (data.categoryMeetsStandards === false && data.recommendation !== 'raise_objections') {
+    if (!data.recommendedCategory) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['recommendedCategory'],
+        message: "Select the category you recommend when standards are not met.",
+      });
+    }
+  }
+
+  if (data.recommendation === 'approve') {
+    const mandatoryValues = Object.values(data.mandatoryChecklist || {});
+    if (!mandatoryValues.every(Boolean)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['mandatoryChecklist'],
+        message: "Turn on all mandatory checklist items before recommending verification.",
+      });
+    }
+    if (data.roomCountVerified !== true) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['roomCountVerified'],
+        message: "Room count must match before recommending verification.",
+      });
+    }
+    if (data.categoryMeetsStandards !== true) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['categoryMeetsStandards'],
+        message: "Confirm that the category meets standards before recommending verification.",
+      });
+    }
+    if (data.overallSatisfactory !== true) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['overallSatisfactory'],
+        message: "Mark the property as satisfactory before recommending verification.",
+      });
+    }
+  } else if (data.recommendation === 'raise_objections') {
+    if (!data.objectionDetails || data.objectionDetails.trim().length < 10) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['objectionDetails'],
+        message: "Provide objection details (minimum 10 characters).",
+      });
+    }
+  }
 });
 
 type InspectionReportForm = z.infer<typeof inspectionReportSchema>;
@@ -97,6 +172,7 @@ type InspectionData = {
     propertyName: string;
     category: string;
     totalRooms: number;
+    dtdoRemarks?: string | null;
   };
   owner: {
     fullName: string;
@@ -149,70 +225,45 @@ const DESIRABLE_CHECKPOINTS = [
   { key: 'rainwaterHarvesting', label: 'Rainwater harvesting system' },
 ] as const;
 
+const buildChecklistDefaults = (checkpoints: readonly { key: string }[]) =>
+  checkpoints.reduce<Record<string, boolean>>((acc, checkpoint) => {
+    acc[checkpoint.key] = false;
+    return acc;
+  }, {});
+
 export default function DAInspectionReport() {
   const { id } = useParams();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
 
-  const { data, isLoading} = useQuery<InspectionData>({
+  const { data, isLoading, refetch } = useQuery<InspectionData>({
     queryKey: [`/api/da/inspections/${id}`],
     enabled: !!id,
+    staleTime: 0,
+    refetchOnMount: true,
   });
 
   const form = useForm<InspectionReportForm>({
     resolver: zodResolver(inspectionReportSchema),
+    mode: "onChange",
     defaultValues: {
       actualInspectionDate: format(new Date(), 'yyyy-MM-dd'),
-      roomCountVerified: false,
-      categoryMeetsStandards: false,
-      mandatoryChecklist: {
-        applicationForm: false,
-        documents: false,
-        onlinePayment: false,
-        wellMaintained: false,
-        cleanRooms: false,
-        comfortableBedding: false,
-        roomSize: false,
-        cleanKitchen: false,
-        cutleryCrockery: false,
-        waterFacility: false,
-        wasteDisposal: false,
-        energySavingLights: false,
-        visitorBook: false,
-        doctorDetails: false,
-        luggageAssistance: false,
-        fireEquipment: false,
-        guestRegister: false,
-        cctvCameras: false,
-      },
+      roomCountVerified: undefined,
+      categoryMeetsStandards: undefined,
+      mandatoryChecklist: buildChecklistDefaults(MANDATORY_CHECKPOINTS) as any,
       mandatoryRemarks: '',
-      desirableChecklist: {
-        parking: false,
-        attachedBathroom: false,
-        toiletAmenities: false,
-        hotColdWater: false,
-        waterConservation: false,
-        diningArea: false,
-        wardrobe: false,
-        storage: false,
-        furniture: false,
-        laundry: false,
-        refrigerator: false,
-        lounge: false,
-        heatingCooling: false,
-        luggageHelp: false,
-        safeStorage: false,
-        securityGuard: false,
-        himachaliCrafts: false,
-        rainwaterHarvesting: false,
-      },
+      desirableChecklist: buildChecklistDefaults(DESIRABLE_CHECKPOINTS) as any,
       desirableRemarks: '',
       fireSafetyCompliant: false,
       structuralSafety: false,
-      overallSatisfactory: false,
-    recommendation: 'approve',
+      overallSatisfactory: undefined,
+      recommendedCategory: undefined,
+      actualRoomCount: undefined,
+      recommendation: 'approve',
       detailedFindings: '',
-      daRemarks: '',
+      objectionDetails: '',
+      earlyInspectionOverride: false,
+      earlyInspectionReason: '',
     },
   });
 
@@ -226,6 +277,8 @@ export default function DAInspectionReport() {
         description: "Your inspection report has been submitted successfully.",
       });
       queryClient.invalidateQueries({ queryKey: ['/api/da/inspections'] });
+      queryClient.invalidateQueries({ queryKey: [`/api/da/inspections/${id}`] });
+      refetch();
       setLocation('/da/inspections');
     },
     onError: (error: Error) => {
@@ -287,17 +340,93 @@ export default function DAInspectionReport() {
   }
 
   const { order, application, owner } = data;
+  const scheduledDate = new Date(order.inspectionDate);
+  const today = new Date();
+  const earlyOverrideEnabled = form.watch('earlyInspectionOverride') ?? false;
+  const earliestOverrideDateObj = subDays(scheduledDate, EARLY_OVERRIDE_WINDOW_DAYS);
+  const minDate = format(scheduledDate, 'yyyy-MM-dd');
+  const todayDateOnly = format(today, 'yyyy-MM-dd');
+  const scheduleHasStarted = scheduledDate <= today;
+  const baseMaxDateObj = scheduleHasStarted ? today : scheduledDate;
+  const maxDate = format(baseMaxDateObj, 'yyyy-MM-dd');
+  const overrideWindowOpen = earliestOverrideDateObj <= baseMaxDateObj;
+  const computedMinDateObj = earlyOverrideEnabled
+    ? (overrideWindowOpen ? earliestOverrideDateObj : baseMaxDateObj)
+    : scheduledDate;
+  const computedMinDate = format(computedMinDateObj, 'yyyy-MM-dd');
+  const earliestOverrideDate = format(earliestOverrideDateObj, 'yyyy-MM-dd');
+  const overdueDays = Math.max(0, differenceInCalendarDays(today, scheduledDate));
+  const isOverdue = overdueDays > 0;
+  const earlyOverrideWindowLabel = `${EARLY_OVERRIDE_WINDOW_DAYS} day${EARLY_OVERRIDE_WINDOW_DAYS === 1 ? '' : 's'}`;
 
-  // Calculate compliance percentages
-  const mandatoryValues = Object.values(form.watch('mandatoryChecklist') || {});
-  const mandatoryCompliance = mandatoryValues.length > 0 
-    ? Math.round((mandatoryValues.filter(Boolean).length / mandatoryValues.length) * 100)
-    : 0;
-    
-  const desirableValues = Object.values(form.watch('desirableChecklist') || {});
-  const desirableCompliance = desirableValues.length > 0
-    ? Math.round((desirableValues.filter(Boolean).length / desirableValues.length) * 100)
-    : 0;
+  const mandatoryChecklistValues = form.watch('mandatoryChecklist') || {};
+  const desirableChecklistValues = form.watch('desirableChecklist') || {};
+  const mandatoryValues = Object.values(mandatoryChecklistValues);
+  const desirableValues = Object.values(desirableChecklistValues);
+  const mandatoryCheckedCount = mandatoryValues.filter(Boolean).length;
+  const desirableCheckedCount = desirableValues.filter(Boolean).length;
+  const mandatoryTotal = MANDATORY_CHECKPOINTS.length;
+  const desirableTotal = DESIRABLE_CHECKPOINTS.length;
+  const mandatoryComplete = mandatoryCheckedCount === mandatoryTotal;
+  const recommendationValue = form.watch("recommendation");
+  const requiresFullChecklist = recommendationValue !== "raise_objections";
+  const canSubmit = form.formState.isValid && (!requiresFullChecklist || mandatoryComplete);
+
+  const mandatoryPalette = [
+    "border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-100",
+    "border-orange-200 bg-orange-50 text-orange-900 dark:border-orange-900 dark:bg-orange-950/40 dark:text-orange-100",
+    "border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100",
+    "border-yellow-200 bg-yellow-50 text-yellow-900 dark:border-yellow-900 dark:bg-yellow-950/40 dark:text-yellow-100",
+    "border-lime-200 bg-lime-50 text-lime-900 dark:border-lime-900 dark:bg-lime-950/40 dark:text-lime-100",
+    "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-100",
+  ];
+  const mandatoryToneIndex = Math.min(Math.floor(mandatoryCheckedCount / 3), mandatoryPalette.length - 1);
+  const mandatoryBannerTone = requiresFullChecklist
+    ? mandatoryPalette[mandatoryToneIndex]
+    : "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-100";
+  const mandatorySegmentPalette = [
+    "bg-rose-300 border-rose-400 dark:bg-rose-900 dark:border-rose-800",
+    "bg-orange-300 border-orange-400 dark:bg-orange-900 dark:border-orange-800",
+    "bg-amber-300 border-amber-400 dark:bg-amber-900 dark:border-amber-800",
+    "bg-yellow-300 border-yellow-400 dark:bg-yellow-900 dark:border-yellow-800",
+    "bg-lime-300 border-lime-400 dark:bg-lime-900 dark:border-lime-800",
+    "bg-green-300 border-green-400 dark:bg-green-900 dark:border-green-800",
+  ];
+  const mandatorySegments = Array.from({ length: Math.ceil(mandatoryTotal / 3) }, (_, index) => {
+    const threshold = (index + 1) * 3;
+    return {
+      threshold,
+      active: mandatoryCheckedCount >= threshold,
+      tone: mandatorySegmentPalette[Math.min(index, mandatorySegmentPalette.length - 1)],
+    };
+  });
+
+  const desirablePalette = [
+    "border-slate-200 bg-slate-50 text-slate-700 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-200",
+    "border-slate-200 bg-slate-100 text-slate-800 dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-100",
+    "border-sky-200 bg-sky-50 text-sky-900 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-100",
+    "border-blue-200 bg-blue-50 text-blue-900 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100",
+    "border-indigo-200 bg-indigo-50 text-indigo-900 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-indigo-100",
+    "border-indigo-200 bg-indigo-100 text-indigo-900 dark:border-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-50",
+  ];
+  const desirableToneIndex = Math.min(Math.floor(desirableCheckedCount / 3), desirablePalette.length - 1);
+  const desirableBannerTone = desirablePalette[desirableToneIndex];
+  const desirableSegmentPalette = [
+    "bg-slate-200 border-slate-300 dark:bg-slate-800 dark:border-slate-700",
+    "bg-slate-300 border-slate-400 dark:bg-slate-700 dark:border-slate-600",
+    "bg-sky-200 border-sky-300 dark:bg-sky-900 dark:border-sky-800",
+    "bg-sky-300 border-sky-400 dark:bg-sky-800 dark:border-sky-700",
+    "bg-blue-300 border-blue-400 dark:bg-blue-800 dark:border-blue-700",
+    "bg-indigo-300 border-indigo-400 dark:bg-indigo-800 dark:border-indigo-700",
+  ];
+  const desirableSegments = Array.from({ length: Math.ceil(desirableTotal / 3) }, (_, index) => {
+    const threshold = (index + 1) * 3;
+    return {
+      threshold,
+      active: desirableCheckedCount >= threshold,
+      tone: desirableSegmentPalette[Math.min(index, desirableSegmentPalette.length - 1)],
+    };
+  });
 
   // Select/Clear All handlers
   const handleSelectAllMandatory = () => {
@@ -305,7 +434,7 @@ export default function DAInspectionReport() {
       acc[checkpoint.key] = true;
       return acc;
     }, {} as any);
-    form.setValue('mandatoryChecklist', allChecked);
+    form.setValue('mandatoryChecklist', allChecked, { shouldDirty: true, shouldValidate: true });
   };
 
   const handleClearAllMandatory = () => {
@@ -313,7 +442,7 @@ export default function DAInspectionReport() {
       acc[checkpoint.key] = false;
       return acc;
     }, {} as any);
-    form.setValue('mandatoryChecklist', allUnchecked);
+    form.setValue('mandatoryChecklist', allUnchecked, { shouldDirty: true, shouldValidate: true });
   };
 
   const handleSelectAllDesirable = () => {
@@ -321,7 +450,7 @@ export default function DAInspectionReport() {
       acc[checkpoint.key] = true;
       return acc;
     }, {} as any);
-    form.setValue('desirableChecklist', allChecked);
+    form.setValue('desirableChecklist', allChecked, { shouldDirty: true, shouldValidate: true });
   };
 
   const handleClearAllDesirable = () => {
@@ -329,7 +458,7 @@ export default function DAInspectionReport() {
       acc[checkpoint.key] = false;
       return acc;
     }, {} as any);
-    form.setValue('desirableChecklist', allUnchecked);
+    form.setValue('desirableChecklist', allUnchecked, { shouldDirty: true, shouldValidate: true });
   };
 
   return (
@@ -392,9 +521,15 @@ export default function DAInspectionReport() {
                 {format(new Date(order.inspectionDate), 'PPP')}
               </p>
             </div>
+            {application?.dtdoRemarks && (
+              <div className="md:col-span-2">
+                <span className="text-sm text-sky-700 font-medium">DTDO Instructions (Required)</span>
+                <p className="mt-1 p-3 bg-sky-50 dark:bg-sky-950/20 rounded-lg">{application.dtdoRemarks}</p>
+              </div>
+            )}
             {order.specialInstructions && (
               <div className="md:col-span-2">
-                <span className="text-sm text-orange-600 font-medium">Special Instructions</span>
+                <span className="text-sm text-orange-600 font-medium">Owner Message</span>
                 <p className="mt-1 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-lg">{order.specialInstructions}</p>
               </div>
             )}
@@ -417,13 +552,100 @@ export default function DAInspectionReport() {
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>Actual Inspection Date *</FormLabel>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <Badge variant="outline" className="bg-muted/40">
+                        Scheduled: {format(scheduledDate, 'PPP')}
+                      </Badge>
+                      {isOverdue ? (
+                        <Badge variant="destructive">
+                          {overdueDays} {overdueDays === 1 ? 'day' : 'days'} overdue
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline" className="bg-emerald-50 text-emerald-700 dark:bg-emerald-950/20">
+                          On schedule
+                        </Badge>
+                      )}
+                    </div>
                     <FormControl>
-                      <Input type="date" {...field} data-testid="input-inspection-date" />
+                      <Input
+                        type="date"
+                        min={computedMinDate}
+                        max={maxDate}
+                        {...field}
+                        data-testid="input-inspection-date"
+                      />
                     </FormControl>
+                    <FormDescription>
+                      {scheduleHasStarted ? (
+                        <>
+                          Select a visit date between{" "}
+                          {format(earlyOverrideEnabled ? earliestOverrideDateObj : scheduledDate, 'PPP')} and{" "}
+                          {format(today, 'PPP')}.
+                        </>
+                      ) : (
+                        <>
+                          Inspection is scheduled for {format(scheduledDate, 'PPP')}. If you inspected up to{" "}
+                          {earlyOverrideWindowLabel} early, enable the override and add a justification.
+                        </>
+                      )}
+                    </FormDescription>
+                    {earlyOverrideEnabled && !overrideWindowOpen && (
+                      <p className="text-xs text-amber-600">
+                        Early visit logging opens on {format(earliestOverrideDateObj, 'PPP')} (7 days before schedule).
+                      </p>
+                    )}
+                    {isOverdue && (
+                      <p className="text-sm text-amber-600">
+                        Inspection is {overdueDays} {overdueDays === 1 ? 'day' : 'days'} past schedule. Request DTDO for a new date if the visit could not be completed.
+                      </p>
+                    )}
                     <FormMessage />
                   </FormItem>
                 )}
               />
+
+              <FormField
+                control={form.control}
+                name="earlyInspectionOverride"
+                render={({ field }) => (
+                  <FormItem className="flex flex-col gap-2 rounded-lg border p-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <FormLabel className="text-base">Log Earlier Visit</FormLabel>
+                        <FormDescription>
+                          Enable if the physical inspection happened up to {earlyOverrideWindowLabel} before the scheduled date.
+                        </FormDescription>
+                      </div>
+                      <FormControl>
+                        <Switch checked={field.value} onCheckedChange={field.onChange} />
+                      </FormControl>
+                    </div>
+                  </FormItem>
+                )}
+              />
+
+              {earlyOverrideEnabled && (
+                <FormField
+                  control={form.control}
+                  name="earlyInspectionReason"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Reason for Early Inspection</FormLabel>
+                      <FormDescription>
+                        Provide context for DTDO on why the visit was advanced (minimum 15 characters).
+                      </FormDescription>
+                      <FormControl>
+                        <Textarea
+                          {...field}
+                          rows={3}
+                          placeholder="Explain why the inspection was completed ahead of the scheduled date."
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
             </CardContent>
           </Card>
 
@@ -448,16 +670,17 @@ export default function DAInspectionReport() {
                     </div>
                     <FormControl>
                       <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
+                        checked={field.value === true}
+                        onCheckedChange={(checked) => field.onChange(checked)}
                         data-testid="switch-room-count"
                       />
                     </FormControl>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
 
-              {!form.watch('roomCountVerified') && (
+              {form.watch('roomCountVerified') === false && (
                 <FormField
                   control={form.control}
                   name="actualRoomCount"
@@ -468,7 +691,15 @@ export default function DAInspectionReport() {
                         <Input
                           type="number"
                           {...field}
-                          onChange={(e) => field.onChange(parseInt(e.target.value))}
+                          onChange={(e) => {
+                            const value = e.target.value;
+                            if (value === "") {
+                              field.onChange(undefined);
+                              return;
+                            }
+                            const parsed = parseInt(value, 10);
+                            field.onChange(Number.isNaN(parsed) ? undefined : parsed);
+                          }}
                           data-testid="input-actual-room-count"
                         />
                       </FormControl>
@@ -494,16 +725,17 @@ export default function DAInspectionReport() {
                     </div>
                     <FormControl>
                       <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
+                        checked={field.value === true}
+                        onCheckedChange={(checked) => field.onChange(checked)}
                         data-testid="switch-category-standards"
                       />
                     </FormControl>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
 
-              {!form.watch('categoryMeetsStandards') && (
+              {form.watch('categoryMeetsStandards') === false && (
                 <FormField
                   control={form.control}
                   name="recommendedCategory"
@@ -544,194 +776,240 @@ export default function DAInspectionReport() {
               <CardTitle className="flex items-center gap-2">
                 <Shield className="w-5 h-5 text-primary" />
                 ANNEXURE-III Compliance Checklist
-              </CardTitle>
-              <CardDescription>
-                HP Homestay Rules 2025 - Official Inspection Requirements
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Tabs defaultValue="mandatory" className="w-full">
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="mandatory" className="flex items-center gap-2" data-testid="tab-mandatory">
-                    <Shield className="w-4 h-4" />
-                    <span>Section A: Mandatory</span>
-                    <Badge variant="secondary" className="ml-auto">{mandatoryCompliance}%</Badge>
-                  </TabsTrigger>
-                  <TabsTrigger value="desirable" className="flex items-center gap-2" data-testid="tab-desirable">
-                    <Star className="w-4 h-4" />
-                    <span>Section B: Desirable</span>
-                    <Badge variant="secondary" className="ml-auto">{desirableCompliance}%</Badge>
-                  </TabsTrigger>
-                </TabsList>
+          </CardTitle>
+          <CardDescription>
+            HP Homestay Rules 2025 - Official Inspection Requirements
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className={`rounded-xl border p-4 text-sm shadow-sm ${mandatoryBannerTone}`}>
+            {requiresFullChecklist ? (
+              <>
+                <p className="text-base font-semibold">
+                  {mandatoryCheckedCount}/{mandatoryTotal} mandatory checks ON
+                </p>
+                <p>
+                  {mandatoryComplete
+                    ? "All mandatory requirements are ON. You can recommend verification."
+                    : "Turn on the remaining mandatory checks before recommending verification."}
+                </p>
+                <div className="mt-3 grid grid-cols-6 gap-1">
+                  {mandatorySegments.map((segment, index) => (
+                    <span
+                      key={`mandatory-segment-${segment.threshold}`}
+                      className={`h-2 w-full rounded-full border transition-colors ${
+                        segment.active ? segment.tone : "bg-white/70 border-white/80 dark:bg-slate-900/30 dark:border-slate-800"
+                      }`}
+                      aria-label={`Mandatory checkpoints ${(index * 3) + 1} to ${Math.min(segment.threshold, mandatoryTotal)} ${
+                        segment.active ? "complete" : "pending"
+                      }`}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-base font-semibold">Submitting with objections</p>
+                <p>Mandatory checks can stay OFF while you document the issues below.</p>
+                <div className="mt-3 grid grid-cols-6 gap-1 opacity-70">
+                  {mandatorySegments.map((segment, index) => (
+                    <span
+                      key={`mandatory-segment-override-${segment.threshold}`}
+                      className={`h-2 w-full rounded-full border ${
+                        segment.active ? segment.tone : "bg-white/70 border-white/80 dark:bg-slate-900/30 dark:border-slate-800"
+                      }`}
+                      aria-label={`Mandatory checkpoints ${(index * 3) + 1} to ${Math.min(segment.threshold, mandatoryTotal)} progress`}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+          <Tabs defaultValue="mandatory" className="w-full">
+            <TabsList className="grid w-full grid-cols-2">
+              <TabsTrigger value="mandatory" className="flex items-center gap-2" data-testid="tab-mandatory">
+                <Shield className="w-4 h-4" />
+                <span>Section A: Mandatory</span>
+                <Badge variant="outline" className="ml-auto">
+                  {mandatoryCheckedCount}/{mandatoryTotal}
+                </Badge>
+              </TabsTrigger>
+              <TabsTrigger value="desirable" className="flex items-center gap-2" data-testid="tab-desirable">
+                <Star className="w-4 h-4" />
+                <span>Section B: Desirable</span>
+                <Badge variant="outline" className="ml-auto">
+                  {desirableCheckedCount}/{desirableTotal}
+                </Badge>
+              </TabsTrigger>
+            </TabsList>
 
                 <TabsContent value="mandatory" className="space-y-4 mt-6">
-                  <div className="bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900 rounded-lg p-4 mb-4">
-                    <p className="text-sm text-red-800 dark:text-red-200 font-medium">
-                      <Shield className="w-4 h-4 inline mr-2" />
-                      All 18 mandatory requirements must be met for homestay approval
-                    </p>
-                  </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 p-4 dark:border-rose-900/50 dark:bg-rose-950/30">
+                <div>
+                  <p className="text-sm font-semibold">Mandatory requirements</p>
+                  <p className="text-xs text-muted-foreground">
+                    All {mandatoryTotal} switches must be ON to recommend verification.
+                  </p>
+                </div>
+                <Badge variant={mandatoryComplete ? "default" : "destructive"}>
+                  {mandatoryCheckedCount}/{mandatoryTotal}
+                </Badge>
+              </div>
 
-                  {/* Select/Clear All Buttons */}
-                  <div className="flex gap-2 justify-end mb-4">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={handleSelectAllMandatory}
-                      data-testid="button-select-all-mandatory"
-                    >
-                      <CheckSquare className="w-4 h-4 mr-2" />
-                      Select All
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={handleClearAllMandatory}
-                      data-testid="button-clear-all-mandatory"
-                    >
-                      <SquareX className="w-4 h-4 mr-2" />
-                      Clear All
-                    </Button>
-                  </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <p>Toggle each clause to mark compliance.</p>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleSelectAllMandatory}
+                    data-testid="button-select-all-mandatory"
+                  >
+                    <CheckSquare className="w-4 h-4 mr-2" />
+                    Mark all Yes
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleClearAllMandatory}
+                    data-testid="button-clear-all-mandatory"
+                  >
+                    <SquareX className="w-4 h-4 mr-2" />
+                    Clear all
+                  </Button>
+                </div>
+              </div>
 
-                  <div className="grid grid-cols-1 gap-3">
-                    {MANDATORY_CHECKPOINTS.map((checkpoint, index) => (
-                      <FormField
-                        key={checkpoint.key}
-                        control={form.control}
-                        name={`mandatoryChecklist.${checkpoint.key}`}
-                        render={({ field }) => (
-                          <FormItem className="flex flex-row items-start space-x-3 space-y-0 rounded-lg border p-4 hover-elevate">
-                            <FormControl>
-                              <Switch
-                                checked={field.value}
-                                onCheckedChange={field.onChange}
-                                data-testid={`switch-mandatory-${checkpoint.key}`}
-                              />
-                            </FormControl>
-                            <div className="flex-1">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm font-medium text-muted-foreground">#{index + 1}</span>
-                                <FormLabel className="text-base font-normal cursor-pointer">
-                                  {checkpoint.label}
-                                </FormLabel>
-                              </div>
-                            </div>
-                          </FormItem>
-                        )}
-                      />
-                    ))}
-                  </div>
-
+              <div className="space-y-3">
+                {MANDATORY_CHECKPOINTS.map((checkpoint, index) => (
                   <FormField
+                    key={checkpoint.key}
                     control={form.control}
-                    name="mandatoryRemarks"
+                    name={`mandatoryChecklist.${checkpoint.key}`}
                     render={({ field }) => (
-                      <FormItem className="mt-4">
-                        <FormLabel>Mandatory Section Remarks</FormLabel>
-                        <FormDescription>
-                          Add any notes about mandatory requirements
-                        </FormDescription>
+                      <FormItem className="rounded-lg border p-3 flex items-center justify-between gap-4">
+                        <div className="space-y-1">
+                          <FormLabel className="text-sm font-medium flex items-center gap-2">
+                            <span className="text-muted-foreground text-xs font-mono">
+                              #{String(index + 1).padStart(2, '0')}
+                            </span>
+                            {checkpoint.label}
+                          </FormLabel>
+                          <p className="text-xs text-muted-foreground">
+                            Tap the switch to confirm availability.
+                          </p>
+                        </div>
                         <FormControl>
-                          <Textarea
-                            placeholder="Any observations or issues with mandatory requirements..."
-                            className="min-h-[100px]"
-                            {...field}
-                            data-testid="textarea-mandatory-remarks"
-                          />
+                          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide">
+                            <span className={field.value ? "text-emerald-600" : "text-rose-600"}>
+                              {field.value ? "Yes" : "No"}
+                            </span>
+                            <Switch
+                              checked={field.value === true}
+                              onCheckedChange={(checked) => field.onChange(checked)}
+                            />
+                          </div>
                         </FormControl>
-                        <FormMessage />
                       </FormItem>
                     )}
                   />
-                </TabsContent>
+                ))}
+              </div>
+            </TabsContent>
 
-                <TabsContent value="desirable" className="space-y-4 mt-6">
-                  <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900 rounded-lg p-4 mb-4">
-                    <p className="text-sm text-blue-800 dark:text-blue-200 font-medium">
-                      <Star className="w-4 h-4 inline mr-2" />
-                      Desirable requirements enhance guest experience and property rating
-                    </p>
-                  </div>
+            <TabsContent value="desirable" className="space-y-4 mt-6">
+              <div className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border p-4 shadow-sm ${desirableBannerTone}`}>
+                <div>
+                  <p className="text-sm font-semibold">Desirable enhancements</p>
+                  <p className="text-xs text-muted-foreground">
+                    Recommended improvements for guest comfort (optional).
+                  </p>
+                </div>
+                <Badge variant="secondary">
+                  {desirableCheckedCount}/{desirableTotal}
+                </Badge>
+              </div>
+              <div className="grid grid-cols-6 gap-1">
+                {desirableSegments.map((segment, index) => (
+                  <span
+                    key={`desirable-segment-${segment.threshold}`}
+                    className={`h-2 rounded-full border ${
+                      segment.active
+                        ? segment.tone
+                        : "bg-white/60 border-white/70 dark:bg-slate-900/30 dark:border-slate-800"
+                    }`}
+                    aria-label={`Desirable checkpoints ${(index * 3) + 1} to ${Math.min(segment.threshold, desirableTotal)} ${
+                      segment.active ? "available" : "pending"
+                    }`}
+                  />
+                ))}
+              </div>
 
-                  {/* Select/Clear All Buttons */}
-                  <div className="flex gap-2 justify-end mb-4">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={handleSelectAllDesirable}
-                      data-testid="button-select-all-desirable"
-                    >
-                      <CheckSquare className="w-4 h-4 mr-2" />
-                      Select All
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={handleClearAllDesirable}
-                      data-testid="button-clear-all-desirable"
-                    >
-                      <SquareX className="w-4 h-4 mr-2" />
-                      Clear All
-                    </Button>
-                  </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                <p>Mark what is available today.</p>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleSelectAllDesirable}
+                    data-testid="button-select-all-desirable"
+                  >
+                    <CheckSquare className="w-4 h-4 mr-2" />
+                    Mark all Yes
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleClearAllDesirable}
+                    data-testid="button-clear-all-desirable"
+                  >
+                    <SquareX className="w-4 h-4 mr-2" />
+                    Clear all
+                  </Button>
+                </div>
+              </div>
 
-                  <div className="grid grid-cols-1 gap-3">
-                    {DESIRABLE_CHECKPOINTS.map((checkpoint, index) => (
-                      <FormField
-                        key={checkpoint.key}
-                        control={form.control}
-                        name={`desirableChecklist.${checkpoint.key}`}
-                        render={({ field }) => (
-                          <FormItem className="flex flex-row items-start space-x-3 space-y-0 rounded-lg border p-4 hover-elevate">
-                            <FormControl>
-                              <Switch
-                                checked={field.value}
-                                onCheckedChange={field.onChange}
-                                data-testid={`switch-desirable-${checkpoint.key}`}
-                              />
-                            </FormControl>
-                            <div className="flex-1">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm font-medium text-muted-foreground">#{index + 1}</span>
-                                <FormLabel className="text-base font-normal cursor-pointer">
-                                  {checkpoint.label}
-                                </FormLabel>
-                              </div>
-                            </div>
-                          </FormItem>
-                        )}
-                      />
-                    ))}
-                  </div>
-
+              <div className="space-y-3">
+                {DESIRABLE_CHECKPOINTS.map((checkpoint, index) => (
                   <FormField
+                    key={checkpoint.key}
                     control={form.control}
-                    name="desirableRemarks"
+                    name={`desirableChecklist.${checkpoint.key}`}
                     render={({ field }) => (
-                      <FormItem className="mt-4">
-                        <FormLabel>Desirable Section Remarks</FormLabel>
-                        <FormDescription>
-                          Add any notes about desirable amenities
-                        </FormDescription>
+                      <FormItem className="rounded-lg border p-3 flex items-center justify-between gap-4">
+                        <div className="space-y-1">
+                          <FormLabel className="text-sm font-medium flex items-center gap-2">
+                            <span className="text-muted-foreground text-xs font-mono">
+                              #{String(index + 1).padStart(2, '0')}
+                            </span>
+                            {checkpoint.label}
+                          </FormLabel>
+                          <p className="text-xs text-muted-foreground">
+                            Optional comfort upgrade.
+                          </p>
+                        </div>
                         <FormControl>
-                          <Textarea
-                            placeholder="Any observations about desirable amenities..."
-                            className="min-h-[100px]"
-                            {...field}
-                            data-testid="textarea-desirable-remarks"
-                          />
+                          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide">
+                            <span className={field.value ? "text-emerald-600" : "text-muted-foreground"}>
+                              {field.value ? "Yes" : "No"}
+                            </span>
+                            <Switch
+                              checked={field.value === true}
+                              onCheckedChange={(checked) => field.onChange(checked)}
+                            />
+                          </div>
                         </FormControl>
-                        <FormMessage />
                       </FormItem>
                     )}
                   />
-                </TabsContent>
-              </Tabs>
+                ))}
+              </div>
+            </TabsContent>
+          </Tabs>
             </CardContent>
           </Card>
 
@@ -754,11 +1032,12 @@ export default function DAInspectionReport() {
                     </div>
                     <FormControl>
                       <Switch
-                        checked={field.value}
-                        onCheckedChange={field.onChange}
+                        checked={field.value === true}
+                        onCheckedChange={(checked) => field.onChange(checked)}
                         data-testid="switch-overall-satisfactory"
                       />
                     </FormControl>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
@@ -776,13 +1055,13 @@ export default function DAInspectionReport() {
                 name="detailedFindings"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Detailed Findings *</FormLabel>
+                    <FormLabel>Overall Inspection Summary *</FormLabel>
                     <FormDescription>
-                      Comprehensive report of your inspection (minimum 20 characters)
+                      Capture the key highlights of this visit (minimum 20 characters). This summary is stored with the RC.
                     </FormDescription>
                     <FormControl>
                       <Textarea
-                        placeholder="Describe your findings in detail..."
+                        placeholder="Example: Property meets Gold benchmarks. All rooms spotless and safety gear in place..."
                         className="min-h-[150px]"
                         {...field}
                         data-testid="textarea-detailed-findings"
@@ -811,8 +1090,8 @@ export default function DAInspectionReport() {
                           <FormLabel htmlFor="approve" className="flex items-center gap-2 font-normal cursor-pointer flex-1">
                             <CheckCircle className="w-5 h-5 text-green-600" />
                             <div>
-                              <div className="font-medium">Approve</div>
-                              <div className="text-xs text-muted-foreground">Meets all requirements</div>
+                              <div className="font-medium">Recommended for Verification</div>
+                              <div className="text-xs text-muted-foreground">Ready for DTDO verification</div>
                             </div>
                           </FormLabel>
                         </div>
@@ -834,18 +1113,41 @@ export default function DAInspectionReport() {
                 )}
               />
 
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 flex items-start gap-3">
+                <Checkbox
+                  id="objectionOverride"
+                  checked={form.watch("recommendation") === "raise_objections"}
+                  onCheckedChange={(checked) => {
+                    form.setValue("recommendation", checked ? "raise_objections" : "approve", {
+                      shouldValidate: true,
+                      shouldDirty: true,
+                    });
+                  }}
+                />
+                <label htmlFor="objectionOverride" className="text-sm text-amber-900 space-y-1 cursor-pointer flex-1">
+                  <span className="font-semibold block">Allow submission with objections</span>
+                  <span className="text-amber-900/80 block">
+                    Automatically selects "Raise Objections" so you can submit the report even if some verification steps are incomplete. Provide the objection details below.
+                  </span>
+                </label>
+              </div>
+
               <FormField
                 control={form.control}
-                name="daRemarks"
+                name="objectionDetails"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Additional Remarks (Optional)</FormLabel>
+                    <FormLabel>Objection Details</FormLabel>
+                    <FormDescription>
+                      Visible only when submitting with objections. Share what needs correction.
+                    </FormDescription>
                     <FormControl>
                       <Textarea
-                        placeholder="Any additional comments or recommendations..."
+                        placeholder="Describe the issues that must be resolved before approval..."
                         className="min-h-[100px]"
                         {...field}
-                        data-testid="textarea-da-remarks"
+                        disabled={form.watch("recommendation") !== "raise_objections"}
+                        data-testid="textarea-objection-details"
                       />
                     </FormControl>
                     <FormMessage />
@@ -856,32 +1158,41 @@ export default function DAInspectionReport() {
           </Card>
 
           {/* Submit Button */}
-          <div className="flex justify-end gap-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setLocation('/da/inspections')}
-              data-testid="button-cancel"
+          <div className="flex flex-col gap-2">
+            {!canSubmit && (
+              <p className="text-sm text-amber-600 text-right">
+                {requiresFullChecklist && !mandatoryComplete
+                  ? "Turn on every mandatory checklist item before recommending verification."
+                  : "Complete all required fields (detailed findings, early visit justification, etc.) before submitting."}
+              </p>
+            )}
+            <div className="flex justify-end gap-4">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setLocation('/da/inspections')}
+                data-testid="button-cancel"
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              disabled={submitReportMutation.isPending}
-              data-testid="button-submit-report"
-            >
-              {submitReportMutation.isPending ? (
-                <>
-                  <Save className="w-4 h-4 mr-2 animate-spin" />
-                  Submitting...
-                </>
-              ) : (
-                <>
-                  <Send className="w-4 h-4 mr-2" />
-                  Submit Report
-                </>
-              )}
-            </Button>
+              <Button
+                type="submit"
+                disabled={!canSubmit || submitReportMutation.isPending}
+                data-testid="button-submit-report"
+              >
+                {submitReportMutation.isPending ? (
+                  <>
+                    <Save className="w-4 h-4 mr-2 animate-spin" />
+                    Submitting...
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-4 h-4 mr-2" />
+                    Submit Report
+                  </>
+                )}
+              </Button>
+            </div>
           </div>
         </form>
       </Form>

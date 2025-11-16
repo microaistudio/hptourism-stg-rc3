@@ -1,4 +1,4 @@
-import { Home, FileText, Bell, BarChart3, BarChart, Users, ClipboardList, Settings, Database, ClipboardCheck, User, Activity, MapPin, Search } from "lucide-react";
+import { Home, FileText, Bell, BarChart3, BarChart, Users, ClipboardList, Settings, Database, ClipboardCheck, User, Activity, MapPin, Search, Download } from "lucide-react";
 import { LucideIcon } from "lucide-react";
 
 export interface NavItem {
@@ -16,7 +16,7 @@ export interface NavSection {
 // Property Owner Navigation Menu
 export const ownerNavigation: NavSection[] = [
   {
-    title: "Main",
+    title: "New Registration",
     items: [
       {
         title: "Dashboard",
@@ -24,14 +24,34 @@ export const ownerNavigation: NavSection[] = [
         icon: Home,
       },
       {
+        title: "New Application",
+        url: "/applications/new",
+        icon: ClipboardList,
+      },
+    ],
+  },
+  {
+    title: "Current License Holders",
+    items: [
+      {
+        title: "Existing RC Registration",
+        url: "/existing-owner",
+        icon: FileText,
+      },
+    ],
+  },
+  {
+    title: "Account",
+    items: [
+      {
         title: "My Profile",
         url: "/profile",
         icon: User,
       },
       {
-        title: "New Application",
-        url: "/applications/new",
-        icon: ClipboardList,
+        title: "Download RC",
+        url: "/dashboard?filter=approved",
+        icon: Download,
       },
     ],
   },
@@ -132,7 +152,7 @@ export const superAdminNavigation: NavSection[] = [
 // Dealing Assistant Navigation Menu
 export const daNavigation: NavSection[] = [
   {
-    title: "Main",
+    title: "Main Workflow",
     items: [
       {
         title: "Dashboard",
@@ -166,12 +186,22 @@ export const daNavigation: NavSection[] = [
       },
     ],
   },
+  {
+    title: "Current License Holders",
+    items: [
+      {
+        title: "Existing RC Registration",
+        url: "/da/legacy",
+        icon: FileText,
+      },
+    ],
+  },
 ];
 
 // DTDO Navigation Menu
 export const dtdoNavigation: NavSection[] = [
   {
-    title: "Main",
+    title: "Main Workflow",
     items: [
       {
         title: "Dashboard",
@@ -197,6 +227,16 @@ export const dtdoNavigation: NavSection[] = [
         title: "My Profile",
         url: "/dtdo/profile",
         icon: User,
+      },
+    ],
+  },
+  {
+    title: "Current License Holders",
+    items: [
+      {
+        title: "Existing RC Queue",
+        url: "/dtdo/dashboard?view=legacy",
+        icon: FileText,
       },
     ],
   },

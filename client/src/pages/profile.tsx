@@ -1,6 +1,7 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import { useEffect } from "react";
 import { insertUserProfileSchema, type UserProfile } from "@shared/schema";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,18 +26,32 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
-import { Loader2, Save, User } from "lucide-react";
+import { Loader2, Save, User, ShieldCheck } from "lucide-react";
 import type { User as UserType } from "@shared/schema";
-import { 
-  getDistricts, 
-  getTehsilsForDistrict, 
-  getBlocksForTehsil, 
-  getUrbanBodiesForDistrict, 
-  getWardsForUrbanBody 
-} from "@shared/lgd-data";
+import { DEFAULT_STATE, getDistricts, getTehsilsForDistrict } from "@shared/regions";
+import { useLocation } from "wouter";
+
+const changePasswordSchema = z
+  .object({
+    currentPassword: z.string().min(6, "Current password is required"),
+    newPassword: z.string().min(6, "New password must be at least 6 characters"),
+    confirmPassword: z.string().min(6, "Please confirm the new password"),
+  })
+  .superRefine((data, ctx) => {
+    if (data.newPassword !== data.confirmPassword) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Passwords do not match",
+        path: ["confirmPassword"],
+      });
+    }
+  });
+
+const HP_STATE = DEFAULT_STATE;
 
 export default function ProfilePage() {
   const { toast } = useToast();
+  const [, navigate] = useLocation();
   
   // Fetch current user
   const { data: userData } = useQuery<{ user: UserType }>({
@@ -48,7 +63,7 @@ export default function ProfilePage() {
   // Fetch existing profile
   const { data: profile, isLoading: isLoadingProfile } = useQuery<UserProfile>({
     queryKey: ['/api/profile'],
-    enabled: !!user,
+    enabled: !!user && user.role === "property_owner",
     retry: false,
   });
 
@@ -63,7 +78,6 @@ export default function ProfilePage() {
       email: "",
       district: "",
       tehsil: "",
-      block: "",
       gramPanchayat: "",
       urbanBody: "",
       ward: "",
@@ -72,6 +86,28 @@ export default function ProfilePage() {
       telephone: "",
     },
   });
+
+  const changePasswordForm = useForm<z.infer<typeof changePasswordSchema>>({
+    resolver: zodResolver(changePasswordSchema),
+    defaultValues: {
+      currentPassword: "",
+      newPassword: "",
+      confirmPassword: "",
+    },
+  });
+
+  useEffect(() => {
+    if (!user) return;
+    if (user.role && user.role !== "property_owner") {
+      if (user.role === "dealing_assistant") {
+        navigate("/da/profile");
+      } else if (user.role === "district_tourism_officer") {
+        navigate("/dtdo/profile");
+      } else {
+        navigate("/");
+      }
+    }
+  }, [user, navigate]);
 
   // Reset form when profile data is loaded
   useEffect(() => {
@@ -84,7 +120,6 @@ export default function ProfilePage() {
         email: profile.email || "",
         district: profile.district || "",
         tehsil: profile.tehsil || "",
-        block: profile.block || "",
         gramPanchayat: profile.gramPanchayat || "",
         urbanBody: profile.urbanBody || "",
         ward: profile.ward || "",
@@ -102,7 +137,6 @@ export default function ProfilePage() {
         email: user.email || "",
         district: user.district || "",
         tehsil: "",
-        block: "",
         gramPanchayat: "",
         urbanBody: "",
         ward: "",
@@ -134,9 +168,37 @@ export default function ProfilePage() {
     },
   });
 
+  const changePasswordMutation = useMutation({
+    mutationFn: async (payload: z.infer<typeof changePasswordSchema>) => {
+      return await apiRequest("POST", "/api/owner/change-password", payload);
+    },
+    onSuccess: () => {
+      changePasswordForm.reset();
+      toast({
+        title: "Password updated",
+        description: "Your password has been changed successfully.",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        variant: "destructive",
+        title: "Failed to change password",
+        description: error?.message || "Please check your current password and try again.",
+      });
+    },
+  });
+
   const onSubmit = (data: any) => {
     saveProfileMutation.mutate(data);
   };
+
+  const onChangePassword = (values: z.infer<typeof changePasswordSchema>) => {
+    changePasswordMutation.mutate(values);
+  };
+
+  if (user && user.role !== "property_owner") {
+    return null;
+  }
 
   if (isLoadingProfile) {
     return (
@@ -181,6 +243,8 @@ export default function ProfilePage() {
                         {...field} 
                         placeholder="Enter your full name as per official documents"
                         data-testid="input-profile-fullname"
+                        characterRestriction="alpha-space"
+                        maxLength={120}
                       />
                     </FormControl>
                     <FormMessage />
@@ -222,12 +286,13 @@ export default function ProfilePage() {
                     <FormItem>
                       <FormLabel>Aadhaar Number</FormLabel>
                       <FormControl>
-                        <Input 
-                          {...field} 
-                          placeholder="123456789012" 
-                          maxLength={12}
-                          data-testid="input-profile-aadhaar"
-                        />
+                      <Input 
+                        {...field} 
+                        placeholder="123456789012" 
+                        maxLength={12}
+                        data-testid="input-profile-aadhaar"
+                        characterRestriction="numeric"
+                      />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -241,12 +306,13 @@ export default function ProfilePage() {
                     <FormItem>
                       <FormLabel>Mobile Number *</FormLabel>
                       <FormControl>
-                        <Input 
-                          {...field} 
-                          placeholder="9876543210" 
-                          maxLength={10}
-                          data-testid="input-profile-mobile"
-                        />
+                      <Input 
+                        {...field} 
+                        placeholder="9876543210" 
+                        maxLength={10}
+                        data-testid="input-profile-mobile"
+                        characterRestriction="numeric"
+                      />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -284,7 +350,12 @@ export default function ProfilePage() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <FormLabel>State</FormLabel>
+                  <Input value={HP_STATE} readOnly disabled className="bg-muted/60" aria-readonly />
+                  <p className="text-xs text-muted-foreground">Homestay pilot currently covers Himachal Pradesh.</p>
+                </div>
                 <FormField
                   control={form.control}
                   name="district"
@@ -296,7 +367,6 @@ export default function ProfilePage() {
                           field.onChange(value);
                           // Reset dependent fields when district changes
                           form.setValue('tehsil', '');
-                          form.setValue('block', '');
                           form.setValue('gramPanchayat', '');
                           form.setValue('urbanBody', '');
                           form.setValue('ward', '');
@@ -327,13 +397,14 @@ export default function ProfilePage() {
                   name="tehsil"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Tehsil / Sub-Division</FormLabel>
+                      <FormLabel>Tehsil</FormLabel>
                       <Select 
                         onValueChange={(value) => {
                           field.onChange(value);
-                          // Reset block/GP when tehsil changes
-                          form.setValue('block', '');
+                          // Reset GP when tehsil changes
                           form.setValue('gramPanchayat', '');
+                          form.setValue('urbanBody', '');
+                          form.setValue('ward', '');
                         }} 
                         value={field.value}
                         disabled={!form.watch('district')}
@@ -361,49 +432,18 @@ export default function ProfilePage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <FormField
                   control={form.control}
-                  name="block"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Block (for rural areas)</FormLabel>
-                      <Select 
-                        onValueChange={field.onChange} 
-                        value={field.value}
-                        disabled={!form.watch('tehsil')}
-                      >
-                        <FormControl>
-                          <SelectTrigger data-testid="select-profile-block">
-                            <SelectValue placeholder="Select block" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {getBlocksForTehsil(form.watch('district'), form.watch('tehsil')).map((block) => (
-                            <SelectItem key={block} value={block}>
-                              {block}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>Rural development block</FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
                   name="gramPanchayat"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Gram Panchayat / Village (for rural areas)</FormLabel>
+                      <FormLabel>Village / Locality (PO)</FormLabel>
                       <FormControl>
-                        <Input 
-                          {...field} 
-                          placeholder="Enter Gram Panchayat name"
+                        <Input
+                          {...field}
+                          placeholder="Village, locality, or Post Office"
                           data-testid="input-profile-gp"
-                          disabled={!form.watch('block')}
                         />
                       </FormControl>
-                      <FormDescription>Enter the specific GP/village name</FormDescription>
+                      <FormDescription>Required for Gram Panchayat areas; optional for MC/TCP.</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -414,32 +454,18 @@ export default function ProfilePage() {
                 <FormField
                   control={form.control}
                   name="urbanBody"
-                  render={({ field }) => (
+                  render={({ field, fieldState }) => (
                     <FormItem>
                       <FormLabel>Urban Body / MC / TCP (for urban areas)</FormLabel>
-                      <Select 
-                        onValueChange={(value) => {
-                          field.onChange(value);
-                          // Reset ward when urban body changes
-                          form.setValue('ward', '');
-                        }} 
-                        value={field.value}
-                        disabled={!form.watch('district')}
-                      >
-                        <FormControl>
-                          <SelectTrigger data-testid="select-profile-urban-body">
-                            <SelectValue placeholder="Select urban body" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {getUrbanBodiesForDistrict(form.watch('district')).map((ub) => (
-                            <SelectItem key={ub.name} value={ub.name}>
-                              {ub.name}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>Municipal Corporation or Town & Country Planning</FormDescription>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="Type your MC/TCP/Nagar Panchayat"
+                          data-testid="input-profile-urban-body"
+                          aria-invalid={fieldState.invalid}
+                        />
+                      </FormControl>
+                      <FormDescription>Enter the name of the urban local body manually.</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -448,28 +474,18 @@ export default function ProfilePage() {
                 <FormField
                   control={form.control}
                   name="ward"
-                  render={({ field }) => (
+                  render={({ field, fieldState }) => (
                     <FormItem>
                       <FormLabel>Ward / Zone (for urban areas)</FormLabel>
-                      <Select 
-                        onValueChange={field.onChange} 
-                        value={field.value}
-                        disabled={!form.watch('urbanBody')}
-                      >
-                        <FormControl>
-                          <SelectTrigger data-testid="select-profile-ward">
-                            <SelectValue placeholder="Select ward" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {getWardsForUrbanBody(form.watch('district'), form.watch('urbanBody')).map((ward) => (
-                            <SelectItem key={ward} value={ward}>
-                              {ward}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>Ward number in the selected urban body</FormDescription>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="Enter ward or zone"
+                          data-testid="input-profile-ward-manual"
+                          aria-invalid={fieldState.invalid}
+                        />
+                      </FormControl>
+                      <FormDescription>Enter the ward / zone number manually.</FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}
@@ -503,12 +519,13 @@ export default function ProfilePage() {
                     <FormItem>
                       <FormLabel>Pincode</FormLabel>
                       <FormControl>
-                        <Input 
-                          {...field} 
-                          placeholder="171001" 
-                          maxLength={6}
-                          data-testid="input-profile-pincode"
-                        />
+                      <Input 
+                        {...field} 
+                        placeholder="171001" 
+                        maxLength={6}
+                        data-testid="input-profile-pincode"
+                        characterRestriction="numeric"
+                      />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -559,6 +576,79 @@ export default function ProfilePage() {
           </div>
         </form>
       </Form>
+
+      <Card className="mt-8">
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5 text-primary" />
+            <div>
+              <CardTitle>Security</CardTitle>
+              <CardDescription>Update your password regularly to keep the account secure.</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <Form {...changePasswordForm}>
+            <form onSubmit={changePasswordForm.handleSubmit(onChangePassword)} className="grid gap-4 md:grid-cols-3">
+              <FormField
+                control={changePasswordForm.control}
+                name="currentPassword"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Current password</FormLabel>
+                    <FormControl>
+                      <Input type="password" placeholder="Enter current password" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={changePasswordForm.control}
+                name="newPassword"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>New password</FormLabel>
+                    <FormControl>
+                      <Input type="password" placeholder="Enter new password" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={changePasswordForm.control}
+                name="confirmPassword"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Confirm new password</FormLabel>
+                    <FormControl>
+                      <Input type="password" placeholder="Re-enter new password" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="md:col-span-3 flex justify-end">
+                <Button
+                  type="submit"
+                  disabled={changePasswordMutation.isPending}
+                  className="w-full md:w-auto"
+                >
+                  {changePasswordMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Updating...
+                    </>
+                  ) : (
+                    "Update password"
+                  )}
+                </Button>
+              </div>
+            </form>
+          </Form>
+        </CardContent>
+      </Card>
     </div>
   );
 }

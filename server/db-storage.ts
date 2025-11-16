@@ -1,4 +1,4 @@
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, and, desc, sql } from 'drizzle-orm';
 import { db } from './db';
 import {
   users, homestayApplications, documents, payments, productionStats, notifications, applicationActions,
@@ -10,6 +10,19 @@ import {
   type ApplicationAction, type InsertApplicationAction
 } from '../shared/schema';
 import type { IStorage } from './storage';
+import { normalizeUsername } from '@shared/userUtils';
+import { formatApplicationNumber } from '@shared/applicationNumber';
+import { lookupStaffAccountByIdentifier } from '@shared/districtStaffManifest';
+
+const APPLICATION_NUMBER_UNIQUE_CONSTRAINT = 'homestay_applications_application_number_key';
+
+const isApplicationNumberUniqueViolation = (error: unknown) => {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const err = error as { code?: string; constraint?: string };
+  return err.code === '23505' && err.constraint === APPLICATION_NUMBER_UNIQUE_CONSTRAINT;
+};
 
 export class DbStorage implements IStorage {
   // User methods
@@ -23,6 +36,35 @@ export class DbStorage implements IStorage {
     return result[0];
   }
 
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const normalized = normalizeUsername(username);
+    if (!normalized) {
+      return undefined;
+    }
+    const result = await db.select().from(users).where(eq(users.username, normalized)).limit(1);
+    if (result[0]) {
+      return result[0];
+    }
+    const manifestEntry = lookupStaffAccountByIdentifier(normalized);
+    if (manifestEntry) {
+      return this.getUserByMobile(manifestEntry.mobile);
+    }
+    return undefined;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const normalized = email?.trim().toLowerCase();
+    if (!normalized) {
+      return undefined;
+    }
+    const result = await db
+      .select()
+      .from(users)
+      .where(sql`LOWER(${users.email}) = ${normalized}`)
+      .limit(1);
+    return result[0];
+  }
+
   async getAllUsers(): Promise<User[]> {
     return await db.select().from(users);
   }
@@ -30,13 +72,23 @@ export class DbStorage implements IStorage {
   async createUser(insertUser: InsertUser): Promise<User> {
     // Password should already be hashed by the caller (routes.ts)
     // Do NOT hash here to avoid double-hashing
-    const result = await db.insert(users).values(insertUser).returning();
+    const payload = {
+      ...insertUser,
+      username: normalizeUsername(insertUser.username),
+    };
+    const result = await db.insert(users).values(payload).returning();
     return result[0];
   }
 
   async updateUser(id: string, updates: Partial<User>): Promise<User | undefined> {
+    const payload: Partial<User> = {
+      ...updates,
+    };
+    if (updates.username !== undefined) {
+      payload.username = normalizeUsername(updates.username);
+    }
     const result = await db.update(users)
-      .set({ ...updates, updatedAt: new Date() })
+      .set({ ...payload, updatedAt: new Date() })
       .where(eq(users.id, id))
       .returning();
     return result[0];
@@ -77,21 +129,40 @@ export class DbStorage implements IStorage {
   }
 
   async createApplication(insertApp: InsertHomestayApplication, options?: { trusted?: boolean }): Promise<HomestayApplication> {
-    // Generate application number
-    const allApps = await this.getAllApplications();
-    const applicationNumber = `HP-HS-2025-${String(allApps.length + 1).padStart(6, '0')}`;
-    
     // Security: Only trusted server code can override status
     const status = options?.trusted ? (insertApp.status || 'draft') : 'draft';
-    
-    const appToInsert: any = {
+
+    const basePayload: Omit<InsertHomestayApplication, 'applicationNumber'> & {
+      status: string;
+      applicationKind: string;
+    } = {
       ...insertApp,
-      applicationNumber,
+      applicationKind: insertApp.applicationKind ?? 'new_registration',
       status,
     };
-    
-    const result = await db.insert(homestayApplications).values([appToInsert]).returning();
-    return result[0];
+
+    let sequence = await this.nextApplicationSequence();
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const applicationNumber = formatApplicationNumber(sequence, insertApp.district);
+      const appToInsert: any = {
+        ...basePayload,
+        applicationNumber,
+      };
+
+      try {
+        const result = await db.insert(homestayApplications).values([appToInsert]).returning();
+        return result[0];
+      } catch (error) {
+        if (isApplicationNumberUniqueViolation(error)) {
+          sequence += 1;
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error('Unable to generate unique application number after multiple attempts');
   }
 
   async updateApplication(id: string, updates: Partial<HomestayApplication>): Promise<HomestayApplication | undefined> {
@@ -249,5 +320,16 @@ export class DbStorage implements IStorage {
       pendingApplications: result[0].pendingApplications,
       scrapedAt: result[0].scrapedAt || new Date()
     };
+  }
+
+  private async nextApplicationSequence(): Promise<number> {
+    const [row] = await db
+      .select({
+        maxSerial: sql<number>`COALESCE(MAX(CAST(substring(${homestayApplications.applicationNumber} from '([0-9]+)$') AS INTEGER)), 0)`,
+      })
+      .from(homestayApplications);
+
+    const maxSerial = row?.maxSerial ?? 0;
+    return maxSerial + 1;
   }
 }

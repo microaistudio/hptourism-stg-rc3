@@ -4,14 +4,17 @@ import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
 import { pool, db } from "./db";
 import { storage } from "./storage";
-import { 
-  insertUserSchema, 
-  type User, 
-  type HomestayApplication, 
-  homestayApplications, 
-  documents, 
-  payments, 
-  productionStats, 
+import { logApplicationAction } from "./audit";
+import {
+  insertUserSchema,
+  type User,
+  type HomestayApplication,
+  type InsertHomestayApplication,
+  type ApplicationServiceContext,
+  homestayApplications,
+  documents,
+  payments,
+  productionStats,
   users,
   userProfiles,
   insertUserProfileSchema,
@@ -29,6 +32,8 @@ import {
   ddoCodes,
   systemSettings,
   type SystemSetting,
+  loginOtpChallenges,
+  passwordResetChallenges,
   lgdDistricts,
   lgdTehsils,
   lgdBlocks,
@@ -43,26 +48,65 @@ import {
 } from "@shared/uploadPolicy";
 import {
   DEFAULT_CATEGORY_ENFORCEMENT,
+  DEFAULT_CATEGORY_RATE_BANDS,
+  DEFAULT_ROOM_CALC_MODE,
   ENFORCE_CATEGORY_SETTING_KEY,
+  ROOM_RATE_BANDS_SETTING_KEY,
+  ROOM_CALC_MODE_SETTING_KEY,
+  DA_SEND_BACK_SETTING_KEY,
+  LEGACY_DTD0_FORWARD_SETTING_KEY,
+  LOGIN_OTP_SETTING_KEY,
+  EXISTING_RC_MIN_ISSUE_DATE_SETTING_KEY,
+  DEFAULT_EXISTING_RC_MIN_ISSUE_DATE,
   normalizeCategoryEnforcementSetting,
+  normalizeCategoryRateBands,
+  normalizeRoomCalcModeSetting,
+  normalizeBooleanSetting,
+  normalizeIsoDateSetting,
 } from "@shared/appSettings";
+import { isLegacyApplication as isLegacyApplicationRecord } from "@shared/legacy";
 import express from "express";
-import { randomUUID } from "crypto";
+import { randomUUID, randomInt } from "crypto";
 import path from "path";
 import fs from "fs";
 import fsPromises from "fs/promises";
 import { z } from "zod";
 import bcrypt from "bcrypt";
-import { eq, desc, ne, notInArray, and, sql, gte, lte, leftJoin } from "drizzle-orm";
+import { eq, desc, ne, notInArray, and, or, sql, gte, lte, like, ilike, inArray, type AnyColumn } from "drizzle-orm";
 import { startScraperScheduler } from "./scraper";
 import { ObjectStorageService, OBJECT_STORAGE_MODE, LOCAL_OBJECT_DIR, LOCAL_MAX_UPLOAD_BYTES } from "./objectStorage";
+import { differenceInCalendarDays, format, subDays } from "date-fns";
+import {
+  DEFAULT_EMAIL_BODY,
+  DEFAULT_EMAIL_SUBJECT,
+  DEFAULT_SMS_BODY,
+  sendTestEmail,
+  sendTestSms,
+  sendTwilioSms,
+  type EmailGatewaySettings,
+  type SmsGatewaySettings,
+  type TwilioGatewaySettings,
+} from "./services/communications";
 import himkoshRoutes from "./himkosh/routes";
-import { MAX_ROOMS_ALLOWED, MAX_BEDS_ALLOWED } from "@shared/fee-calculator";
+import { MAX_ROOMS_ALLOWED, MAX_BEDS_ALLOWED, validateCategorySelection } from "@shared/fee-calculator";
+import type { CategoryType } from "@shared/fee-calculator";
+import {
+  lookupStaffAccountByIdentifier,
+  lookupStaffAccountByMobile,
+  getManifestDerivedUsername,
+  getDistrictStaffManifest,
+} from "@shared/districtStaffManifest";
+import "./staffManifestSync";
+
+const CORRECTION_CONSENT_TEXT =
+  "I confirm that every issue highlighted by DA/DTDO has been fully addressed. I understand that my application may be rejected if the corrections remain unsatisfactory.";
 
 // Extend express-session types
 declare module 'express-session' {
   interface SessionData {
     userId: string;
+    captchaAnswer?: string | null;
+    captchaIssuedAt?: number | null;
   }
 }
 
@@ -90,10 +134,97 @@ export function requireRole(...roles: string[]) {
   };
 }
 
-const normalizeStringField = (value: unknown, fallback = "") => {
+const TIMELINE_PRIVILEGED_ROLES = new Set([
+  "admin",
+  "super_admin",
+  "state_officer",
+  "admin_rc",
+  "district_tourism_officer",
+]);
+
+const TIMELINE_DISTRICT_ROLES = new Set([
+  "dealing_assistant",
+  "district_officer",
+]);
+
+const normalizeDistrictValue = (value?: string | null) => {
+  if (!value) return "";
+  return value
+    .toLowerCase()
+    .replace(/division|district|dist\.|dist|office/g, "")
+    .replace(/[-,]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+const districtMatches = (userDistrictRaw?: string | null, applicationDistrictRaw?: string | null) => {
+  const userDistrict = normalizeDistrictValue(userDistrictRaw);
+  const applicationDistrict = normalizeDistrictValue(applicationDistrictRaw);
+  if (!userDistrict || !applicationDistrict) {
+    return false;
+  }
+  return (
+    userDistrict === applicationDistrict ||
+    userDistrict.includes(applicationDistrict) ||
+    applicationDistrict.includes(userDistrict)
+  );
+};
+
+const canViewApplicationTimeline = (user: User | null, application: HomestayApplication | null) => {
+  if (!user || !application) {
+    return false;
+  }
+
+  if (user.role === "property_owner") {
+    return user.id === application.userId;
+  }
+
+  // Other authenticated roles can view timelines
+  return true;
+};
+
+const summarizeTimelineActor = (user?: User | null) => {
+  if (!user) {
+    return null;
+  }
+
+  const displayName = user.fullName || user.username || user.mobile || "Officer";
+  return {
+    id: user.id,
+    name: displayName,
+    role: user.role,
+    designation: user.designation ?? null,
+    district: user.district ?? null,
+  };
+};
+
+const normalizeStringField = (value: unknown, fallback = "", maxLength?: number) => {
   if (typeof value !== "string") return fallback;
   const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : fallback;
+  if (!trimmed) {
+    return fallback;
+  }
+  if (typeof maxLength === "number" && maxLength > 0 && trimmed.length > maxLength) {
+    return trimmed.slice(0, maxLength);
+  }
+  return trimmed;
+};
+
+const toNullableString = (value: unknown, maxLength?: number) => {
+  const normalized = normalizeStringField(value, "", maxLength);
+  return normalized || null;
+};
+
+const formatUserForResponse = (user: User) => {
+  const { password, ...userWithoutPassword } = user;
+  const derivedUsername = getManifestDerivedUsername(
+    userWithoutPassword.mobile,
+    userWithoutPassword.username ?? undefined,
+  );
+  return {
+    ...userWithoutPassword,
+    username: derivedUsername ?? userWithoutPassword.username ?? null,
+  };
 };
 
 const preprocessNumericInput = (val: unknown) => {
@@ -124,6 +255,931 @@ const coerceNumberField = (value: unknown, fallback = 0) => {
   return fallback;
 };
 
+const toDateOnly = (value: Date) => {
+  const normalized = new Date(value);
+  normalized.setHours(0, 0, 0, 0);
+  return normalized;
+};
+
+const EARLY_INSPECTION_OVERRIDE_WINDOW_DAYS = 7;
+
+const STAFF_PROFILE_ROLES = ['dealing_assistant', 'district_tourism_officer', 'district_officer'] as const;
+
+const staffProfileSchema = z.object({
+  fullName: z.string().min(3, "Full name must be at least 3 characters"),
+  firstName: z.string().min(1).optional().or(z.literal("")),
+  lastName: z.string().min(1).optional().or(z.literal("")),
+  mobile: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit mobile number"),
+  email: z.string().email("Enter a valid email address").optional().or(z.literal("")),
+  alternatePhone: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit alternate number").optional().or(z.literal("")),
+  officePhone: z.string().regex(/^[0-9+\-()\s]{5,20}$/, "Enter a valid office contact number").optional().or(z.literal("")),
+  designation: z.string().max(120, "Designation must be 120 characters or fewer").optional().or(z.literal("")),
+  department: z.string().max(120, "Department must be 120 characters or fewer").optional().or(z.literal("")),
+  employeeId: z.string().max(50, "Employee ID must be 50 characters or fewer").optional().or(z.literal("")),
+  officeAddress: z.string().max(500, "Office address must be 500 characters or fewer").optional().or(z.literal("")),
+});
+
+const LEGACY_RC_PREFIX = "LEGACY-";
+const ADMIN_RC_ALLOWED_ROLES = ['admin_rc', 'admin', 'super_admin'] as const;
+const LEGACY_CATEGORY_OPTIONS = ['diamond', 'gold', 'silver'] as const;
+const LEGACY_LOCATION_TYPES = ['mc', 'tcp', 'gp'] as const;
+const LEGACY_PROPERTY_OWNERSHIP = ['owned', 'leased'] as const;
+const LEGACY_OWNER_GENDERS = ['male', 'female', 'other'] as const;
+const LEGACY_STATUS_OPTIONS = [
+  'draft',
+  'legacy_rc_review',
+  'submitted',
+  'under_scrutiny',
+  'forwarded_to_dtdo',
+  'dtdo_review',
+  'inspection_scheduled',
+  'inspection_under_review',
+  'verified_for_payment',
+  'payment_pending',
+  'approved',
+  'rejected',
+] as const;
+
+const trimOptionalString = (value: string | null | undefined) => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+};
+
+const trimRequiredString = (value: string) => {
+  const trimmed = value.trim();
+  return trimmed;
+};
+
+const numberOrNull = (value: number | null | undefined) => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return null;
+  }
+  return value;
+};
+
+const EMAIL_GATEWAY_SETTING_KEY = "comm_email_gateway";
+const SMS_GATEWAY_SETTING_KEY = "comm_sms_gateway";
+
+type EmailGatewayProvider = "custom" | "nic" | "sendgrid";
+
+type EmailGatewaySecretSettings = {
+  host?: string;
+  port?: number;
+  username?: string;
+  password?: string;
+  fromEmail?: string;
+};
+
+type EmailGatewaySettingValue = {
+  provider?: EmailGatewayProvider;
+  custom?: EmailGatewaySecretSettings;
+  nic?: EmailGatewaySecretSettings;
+  sendgrid?: EmailGatewaySecretSettings;
+  updatedAt?: string;
+  updatedBy?: string | null;
+} & Partial<EmailGatewaySecretSettings>;
+
+type SmsGatewayProvider = "nic" | "twilio";
+
+type NicSmsGatewaySettings = SmsGatewaySettings & {
+  password?: string;
+};
+
+type TwilioSmsGatewaySettings = TwilioGatewaySettings & {
+  authToken?: string;
+};
+
+type SmsGatewaySettingValue = {
+  provider?: SmsGatewayProvider;
+  nic?: NicSmsGatewaySettings;
+  twilio?: TwilioSmsGatewaySettings;
+  updatedAt?: string;
+  updatedBy?: string | null;
+};
+
+const emailProviders: EmailGatewayProvider[] = ["custom", "nic", "sendgrid"];
+
+const extractLegacyEmailProfile = (value?: EmailGatewaySettingValue | null): EmailGatewaySecretSettings | undefined => {
+  if (!value) return undefined;
+  if (value.custom || value.nic || value.sendgrid) {
+    return undefined;
+  }
+  if (!value.host && !value.fromEmail && !value.username && !value.password) {
+    return undefined;
+  }
+  return {
+    host: value.host,
+    port: value.port,
+    username: value.username,
+    password: value.password,
+    fromEmail: value.fromEmail,
+  };
+};
+
+const getEmailProfileFromValue = (
+  value: EmailGatewaySettingValue,
+  provider: EmailGatewayProvider,
+): EmailGatewaySecretSettings | undefined => {
+  const legacy = extractLegacyEmailProfile(value);
+  if (provider === "custom") {
+    return value.custom ?? legacy;
+  }
+  if (provider === "nic") {
+    return value.nic ?? (legacy && value.provider === "nic" ? legacy : undefined);
+  }
+  if (provider === "sendgrid") {
+    return value.sendgrid ?? (legacy && value.provider === "sendgrid" ? legacy : undefined);
+  }
+  return legacy;
+};
+
+const sanitizeEmailGateway = (value?: EmailGatewaySettingValue | null) => {
+  if (!value) return null;
+  const provider: EmailGatewayProvider = value.provider ?? "custom";
+  const legacy = extractLegacyEmailProfile(value);
+  const mapProfile = (profile?: EmailGatewaySecretSettings) => {
+    if (!profile) return undefined;
+    return {
+      host: profile.host ?? "",
+      port: Number(profile.port) || 25,
+      username: profile.username ?? "",
+      fromEmail: profile.fromEmail ?? "",
+      passwordSet: Boolean(profile.password),
+    };
+  };
+  return {
+    provider,
+    custom: mapProfile(value.custom ?? (provider === "custom" ? legacy : undefined) ?? legacy),
+    nic: mapProfile(value.nic),
+    sendgrid: mapProfile(value.sendgrid),
+  };
+};
+
+const sanitizeSmsGateway = (value?: SmsGatewaySettingValue | null) => {
+  if (!value) return null;
+  const provider: SmsGatewayProvider = value.provider ?? "nic";
+  const nic = value.nic
+    ? {
+        username: value.nic.username,
+        senderId: value.nic.senderId,
+        departmentKey: value.nic.departmentKey,
+        templateId: value.nic.templateId,
+        postUrl: value.nic.postUrl,
+        passwordSet: Boolean(value.nic.password),
+      }
+    : undefined;
+  const twilio = value.twilio
+    ? {
+        accountSid: value.twilio.accountSid,
+        fromNumber: value.twilio.fromNumber,
+        messagingServiceSid: value.twilio.messagingServiceSid,
+        authTokenSet: Boolean(value.twilio.authToken),
+      }
+    : undefined;
+  return {
+    provider,
+    nic,
+    twilio,
+  };
+};
+
+const getSystemSettingRecord = async (key: string) => {
+  const [record] = await db
+    .select()
+    .from(systemSettings)
+    .where(eq(systemSettings.settingKey, key))
+    .limit(1);
+  return record ?? null;
+};
+
+const formatGatewaySetting = <T,>(
+  record: SystemSetting | null,
+  sanitizer: (value?: any) => T | null,
+) => {
+  if (!record) {
+    return null;
+  }
+  const sanitized = sanitizer(record.settingValue as unknown);
+  if (!sanitized) {
+    return null;
+  }
+  return {
+    ...sanitized,
+    updatedAt: record.updatedAt,
+    updatedBy: record.updatedBy,
+  };
+};
+
+const NOTIFICATION_RULES_SETTING_KEY = "comm_notification_rules";
+
+type NotificationEventId =
+  | "otp"
+  | "password_reset"
+  | "application_submitted"
+  | "forwarded_to_dtdo"
+  | "inspection_scheduled"
+  | "verified_for_payment"
+  | "da_send_back"
+  | "dtdo_revert"
+  | "dtdo_objection";
+
+type NotificationRuleValue = {
+  id: NotificationEventId;
+  smsEnabled?: boolean;
+  smsTemplate?: string;
+  emailEnabled?: boolean;
+  emailSubject?: string;
+  emailBody?: string;
+};
+
+type NotificationSettingsValue = {
+  rules?: NotificationRuleValue[];
+};
+
+type NotificationEventDefinition = {
+  id: NotificationEventId;
+  label: string;
+  description: string;
+  defaultSmsTemplate: string;
+  defaultEmailSubject: string;
+  defaultEmailBody: string;
+  placeholders: string[];
+  defaultSmsEnabled?: boolean;
+  defaultEmailEnabled?: boolean;
+};
+
+const notificationEventDefinitions: NotificationEventDefinition[] = [
+  {
+    id: "otp",
+    label: "OTP verification",
+    description: "Sent when an owner requests an OTP to access or confirm submissions.",
+    defaultSmsTemplate: DEFAULT_SMS_BODY,
+    defaultEmailSubject: "Himachal Tourism OTP",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\n{{OTP}} is your one-time password for Himachal Tourism eServices. It expires in 10 minutes.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "OTP"],
+    defaultSmsEnabled: true,
+    defaultEmailEnabled: true,
+  },
+  {
+    id: "password_reset",
+    label: "Password reset",
+    description: "Delivers the one-time code owners need to reset their account password.",
+    defaultSmsTemplate:
+      "{{OTP}} is your password reset code for Himachal Tourism eServices. Enter it in the portal within 10 minutes to set a new password.",
+    defaultEmailSubject: "Password reset code",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nUse the code {{OTP}} to reset your Himachal Tourism eServices password. This code expires in 10 minutes. If you did not request a reset, you can ignore this email.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "OTP"],
+    defaultSmsEnabled: true,
+    defaultEmailEnabled: true,
+  },
+  {
+    id: "application_submitted",
+    label: "Application submitted",
+    description: "Confirms that an owner successfully submitted a homestay application.",
+    defaultSmsTemplate:
+      "Your Himachal Tourism application {{APPLICATION_ID}} was submitted successfully. We will update you on the next steps.",
+    defaultEmailSubject: "Application {{APPLICATION_ID}} submitted",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nWe received your homestay application {{APPLICATION_ID}}. We will notify you as it moves through scrutiny and inspection.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID"],
+  },
+  {
+    id: "forwarded_to_dtdo",
+    label: "Forwarded to DTDO",
+    description: "Notifies the owner that scrutiny is complete and the case moved to DTDO.",
+    defaultSmsTemplate:
+      "Application {{APPLICATION_ID}} has moved to DTDO review for site inspection. Keep your documents handy.",
+    defaultEmailSubject: "Application {{APPLICATION_ID}} forwarded for DTDO review",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nYour application {{APPLICATION_ID}} cleared scrutiny and has been forwarded to the DTDO for field inspection. Please stay available for coordination.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID"],
+  },
+  {
+    id: "inspection_scheduled",
+    label: "Inspection scheduled",
+    description: "Alerts the owner about the scheduled inspection date.",
+    defaultSmsTemplate:
+      "DTDO scheduled a site inspection for application {{APPLICATION_ID}} on {{INSPECTION_DATE}}. Please ensure availability.",
+    defaultEmailSubject: "Site inspection scheduled – Application {{APPLICATION_ID}}",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nA site inspection for application {{APPLICATION_ID}} is scheduled on {{INSPECTION_DATE}}. Kindly keep the property accessible and documents ready for verification.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID", "INSPECTION_DATE"],
+  },
+  {
+    id: "verified_for_payment",
+    label: "Verified for payment",
+    description: "Informs the owner that the application is cleared for payment and certificate issue.",
+    defaultSmsTemplate:
+      "Application {{APPLICATION_ID}} is verified for payment. Log in to complete the fee and download your certificate after approval.",
+    defaultEmailSubject: "Application {{APPLICATION_ID}} verified for payment",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nYour application {{APPLICATION_ID}} has been verified for payment. Please sign in to complete the fee so we can issue the certificate.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID"],
+  },
+  {
+    id: "da_send_back",
+    label: "DA send-back",
+    description: "Alerts the owner that the Dealing Assistant sent the application back for corrections.",
+    defaultSmsTemplate:
+      "Application {{APPLICATION_ID}} needs corrections. DA remarks: {{REMARKS}}. Please update and resubmit.",
+    defaultEmailSubject: "Corrections requested – Application {{APPLICATION_ID}}",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nOur Dealing Assistant reviewed application {{APPLICATION_ID}} and requested corrections.\n\nRemarks:\n{{REMARKS}}\n\nPlease sign in, update the form, and resubmit at the earliest.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID", "REMARKS"],
+    defaultSmsEnabled: true,
+    defaultEmailEnabled: true,
+  },
+  {
+    id: "dtdo_revert",
+    label: "DTDO revert",
+    description: "Notifies the owner that DTDO returned the application for additional corrections after inspection.",
+    defaultSmsTemplate:
+      "DTDO returned application {{APPLICATION_ID}} for updates. Remarks: {{REMARKS}}. Please review and resubmit.",
+    defaultEmailSubject: "DTDO corrections – Application {{APPLICATION_ID}}",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nDuring district review we found items that need attention for application {{APPLICATION_ID}}.\n\nRemarks:\n{{REMARKS}}\n\nPlease update the application and resubmit so we can continue processing.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID", "REMARKS"],
+    defaultSmsEnabled: true,
+    defaultEmailEnabled: true,
+  },
+  {
+    id: "dtdo_objection",
+    label: "DTDO objection raised",
+    description: "Informs the owner that DTDO raised objections after the inspection report.",
+    defaultSmsTemplate:
+      "Inspection objections raised for application {{APPLICATION_ID}}. Remarks: {{REMARKS}}. Update the application to continue.",
+    defaultEmailSubject: "Inspection objections – Application {{APPLICATION_ID}}",
+    defaultEmailBody:
+      "Hello {{OWNER_NAME}},\n\nAfter reviewing the inspection report for application {{APPLICATION_ID}}, the DTDO raised the following objections:\n\n{{REMARKS}}\n\nPlease sign in, address the feedback, and resubmit. Ignoring objections may lead to rejection.\n\n- Tourism Department",
+    placeholders: ["OWNER_NAME", "APPLICATION_ID", "REMARKS"],
+    defaultSmsEnabled: true,
+    defaultEmailEnabled: true,
+  },
+];
+
+const notificationDefinitionMap = new Map(
+  notificationEventDefinitions.map((definition) => [definition.id, definition]),
+);
+
+type NotificationTriggerOptions = {
+  application?: HomestayApplication | null;
+  applicationId?: string;
+  owner?: User | null;
+  recipientMobile?: string | null;
+  recipientEmail?: string | null;
+  recipientName?: string | null;
+  otp?: string;
+  extras?: Record<string, string | undefined>;
+};
+
+const buildNotificationResponse = (record: SystemSetting | null) => {
+  const value: NotificationSettingsValue | undefined =
+    (record?.settingValue as NotificationSettingsValue) ?? undefined;
+  const storedRules = value?.rules ?? [];
+  const ruleMap = new Map(storedRules.map((rule) => [rule.id, rule]));
+  return {
+    events: notificationEventDefinitions.map((definition) => {
+      const stored = ruleMap.get(definition.id);
+      return {
+        id: definition.id,
+        label: definition.label,
+        description: definition.description,
+        placeholders: definition.placeholders,
+        smsEnabled: stored?.smsEnabled ?? definition.defaultSmsEnabled ?? false,
+        smsTemplate: stored?.smsTemplate ?? definition.defaultSmsTemplate,
+        emailEnabled: stored?.emailEnabled ?? definition.defaultEmailEnabled ?? false,
+        emailSubject: stored?.emailSubject ?? definition.defaultEmailSubject,
+        emailBody: stored?.emailBody ?? definition.defaultEmailBody,
+      };
+    }),
+    updatedAt: record?.updatedAt ?? null,
+    updatedBy: record?.updatedBy ?? null,
+  };
+};
+
+const renderTemplate = (template: string, variables: Record<string, string>) =>
+  template.replace(/{{\s*([^}]+)\s*}}/g, (_, token) => {
+    const key = token.trim().toUpperCase();
+    return variables[key] ?? "";
+  });
+
+const buildTemplateVariables = ({
+  application,
+  owner,
+  recipientName,
+  otp,
+  extras,
+}: {
+  application?: HomestayApplication | null;
+  owner?: User | null;
+  recipientName?: string | null;
+  otp?: string;
+  extras?: Record<string, string | undefined>;
+}) => {
+  const inspectionDate =
+    extras?.INSPECTION_DATE ??
+    (application?.siteInspectionScheduledDate
+      ? format(new Date(application.siteInspectionScheduledDate), "dd MMM yyyy")
+      : "");
+
+  return {
+    APPLICATION_ID: application?.applicationNumber ?? application?.id ?? "",
+    OWNER_NAME: recipientName ?? owner?.fullName ?? "",
+    OWNER_MOBILE: owner?.mobile ?? "",
+    OWNER_EMAIL: owner?.email ?? "",
+    STATUS: application?.status ?? "",
+    OTP: otp ?? "",
+    INSPECTION_DATE: inspectionDate,
+    REMARKS: extras?.REMARKS ?? "",
+  };
+};
+
+const deliverNotificationSms = async (mobile: string, message: string) => {
+  try {
+    const record = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
+    if (!record) {
+      console.warn("[notifications] SMS gateway not configured");
+      return;
+    }
+    const config = (record.settingValue as SmsGatewaySettingValue) ?? {};
+    const provider: SmsGatewayProvider = config.provider ?? "nic";
+    if (provider === "twilio") {
+      const twilioConfig =
+        config.twilio ??
+        ({
+          accountSid: (config as any).accountSid,
+          authToken: (config as any).authToken,
+          fromNumber: (config as any).fromNumber,
+          messagingServiceSid: (config as any).messagingServiceSid,
+        } as TwilioSmsGatewaySettings);
+      if (
+        !twilioConfig ||
+        !twilioConfig.accountSid ||
+        !twilioConfig.authToken ||
+        (!twilioConfig.fromNumber && !twilioConfig.messagingServiceSid)
+      ) {
+        console.warn("[notifications] Twilio SMS settings incomplete");
+        return;
+      }
+      await sendTwilioSms(
+        {
+          accountSid: twilioConfig.accountSid,
+          authToken: twilioConfig.authToken,
+          fromNumber: twilioConfig.fromNumber,
+          messagingServiceSid: twilioConfig.messagingServiceSid,
+        },
+        { mobile, message },
+      );
+      return;
+    }
+    const nicConfig =
+      config.nic ??
+      ({
+        username: (config as any).username,
+        password: (config as any).password,
+        senderId: (config as any).senderId,
+        departmentKey: (config as any).departmentKey,
+        templateId: (config as any).templateId,
+        postUrl: (config as any).postUrl,
+      } as NicSmsGatewaySettings);
+    if (
+      !nicConfig ||
+      !nicConfig.username ||
+      !nicConfig.password ||
+      !nicConfig.senderId ||
+      !nicConfig.departmentKey ||
+      !nicConfig.templateId ||
+      !nicConfig.postUrl
+    ) {
+      console.warn("[notifications] NIC SMS settings incomplete");
+      return;
+    }
+    await sendTestSms(
+      {
+        username: nicConfig.username,
+        password: nicConfig.password,
+        senderId: nicConfig.senderId,
+        departmentKey: nicConfig.departmentKey,
+        templateId: nicConfig.templateId,
+        postUrl: nicConfig.postUrl,
+      },
+      { mobile, message },
+    );
+  } catch (error) {
+    console.error("[notifications] Failed to send SMS:", error);
+  }
+};
+
+const deliverNotificationEmail = async (to: string, subject: string, body: string) => {
+  try {
+    const record = await getSystemSettingRecord(EMAIL_GATEWAY_SETTING_KEY);
+    if (!record) {
+      console.warn("[notifications] SMTP gateway not configured");
+      return;
+    }
+    const value = (record.settingValue as EmailGatewaySettingValue) ?? {};
+    const provider: EmailGatewayProvider = value.provider ?? "custom";
+    const profile = getEmailProfileFromValue(value, provider) ?? extractLegacyEmailProfile(value);
+    if (!profile?.host || !profile?.fromEmail || !profile?.password) {
+      console.warn("[notifications] SMTP settings incomplete");
+      return;
+    }
+    await sendTestEmail(
+      {
+        host: profile.host,
+        port: Number(profile.port) || 25,
+        username: profile.username,
+        password: profile.password,
+        fromEmail: profile.fromEmail,
+      },
+      {
+        to,
+        subject,
+        body,
+      },
+    );
+  } catch (error) {
+    console.error("[notifications] Failed to send email:", error);
+  }
+};
+
+const triggerNotification = async (
+  eventId: NotificationEventId,
+  options: NotificationTriggerOptions = {},
+) => {
+  const definition = notificationDefinitionMap.get(eventId);
+  if (!definition) {
+    return;
+  }
+
+  const record = await getSystemSettingRecord(NOTIFICATION_RULES_SETTING_KEY);
+  const value: NotificationSettingsValue | undefined =
+    (record?.settingValue as NotificationSettingsValue) ?? undefined;
+  const stored = value?.rules?.find((rule) => rule.id === eventId);
+  const smsEnabled = stored?.smsEnabled ?? definition.defaultSmsEnabled ?? false;
+  const emailEnabled = stored?.emailEnabled ?? definition.defaultEmailEnabled ?? false;
+  const smsActive = smsEnabled;
+  const emailActive = emailEnabled;
+  if (!smsActive && !emailActive) {
+    return;
+  }
+
+  let application = options.application ?? null;
+  if (!application && options.applicationId) {
+    const loadedApplication = await storage.getApplication(options.applicationId);
+    application = loadedApplication ?? null;
+  }
+  let owner = options.owner ?? null;
+  if (!owner && application?.userId) {
+    const loadedOwner = await storage.getUser(application.userId);
+    owner = loadedOwner ?? null;
+  }
+
+  const variables = buildTemplateVariables({
+    application,
+    owner,
+    recipientName: options.recipientName,
+    otp: options.otp,
+    extras: options.extras,
+  });
+  const targetMobile =
+    options.recipientMobile !== undefined ? options.recipientMobile : owner?.mobile ?? null;
+  const targetEmail =
+    options.recipientEmail !== undefined ? options.recipientEmail : owner?.email ?? null;
+
+  if (smsActive && targetMobile) {
+    const smsTemplate = stored?.smsTemplate ?? definition.defaultSmsTemplate;
+    const smsMessage = renderTemplate(smsTemplate, variables);
+    await deliverNotificationSms(targetMobile, smsMessage);
+  }
+
+  if (emailActive && targetEmail) {
+    const emailSubjectTemplate = stored?.emailSubject ?? definition.defaultEmailSubject;
+    const emailBodyTemplate = stored?.emailBody ?? definition.defaultEmailBody;
+    const emailSubject = renderTemplate(emailSubjectTemplate, variables);
+    const emailBody = renderTemplate(emailBodyTemplate, variables);
+    await deliverNotificationEmail(targetEmail, emailSubject, emailBody);
+  }
+};
+
+const queueNotification = (
+  eventId: NotificationEventId,
+  options: NotificationTriggerOptions = {},
+) => {
+  triggerNotification(eventId, options).catch((error) => {
+    console.error(`[notifications] Failed to send ${eventId} notification:`, error);
+  });
+};
+
+async function createInAppNotification({
+  userId,
+  applicationId,
+  type,
+  title,
+  message,
+}: {
+  userId: string;
+  applicationId?: string | null;
+  type: string;
+  title: string;
+  message: string;
+}) {
+  try {
+    await db.insert(notifications).values({
+      userId,
+      applicationId: applicationId ?? null,
+      type,
+      title,
+      message,
+      channels: { inapp: true },
+    });
+  } catch (error) {
+    console.error("[notifications] Failed to create notification", { userId, applicationId, type, error });
+  }
+}
+
+const LOGIN_OTP_CODE_LENGTH = 6;
+const LOGIN_OTP_EXPIRY_MINUTES = 10;
+const PASSWORD_RESET_EXPIRY_MINUTES = 10;
+type PasswordResetChannel = "sms" | "email";
+
+const maskMobileNumber = (mobile?: string | null) => {
+  if (!mobile) {
+    return "";
+  }
+  const digits = mobile.replace(/\s+/g, "");
+  if (digits.length <= 4) {
+    return digits;
+  }
+  const visible = digits.slice(-4);
+  return `${"•".repeat(Math.max(0, digits.length - 4))}${visible}`;
+};
+
+const maskEmailAddress = (email?: string | null) => {
+  if (!email) {
+    return "";
+  }
+  const [local, domain] = email.split("@");
+  if (!domain) {
+    return email;
+  }
+  if (!local || local.length <= 2) {
+    return `${local?.[0] ?? ""}***@${domain}`;
+  }
+  return `${local.slice(0, 1)}***${local.slice(-1)}@${domain}`;
+};
+
+const generateLoginOtpCode = () =>
+  randomInt(0, 10 ** LOGIN_OTP_CODE_LENGTH)
+    .toString()
+    .padStart(LOGIN_OTP_CODE_LENGTH, "0");
+
+const getLoginOtpSetting = async () => {
+  const record = await getSystemSettingRecord(LOGIN_OTP_SETTING_KEY);
+  return normalizeBooleanSetting(record?.settingValue, false);
+};
+
+type LoginAuthMode = "password" | "otp";
+
+const createLoginOtpChallenge = async (user: User, channel: PasswordResetChannel) => {
+  const otp = generateLoginOtpCode();
+  const otpHash = await bcrypt.hash(otp, 10);
+  const expiresAt = new Date(Date.now() + LOGIN_OTP_EXPIRY_MINUTES * 60 * 1000);
+
+  await db.delete(loginOtpChallenges).where(eq(loginOtpChallenges.userId, user.id));
+
+  const [challenge] = await db
+    .insert(loginOtpChallenges)
+    .values({
+      userId: user.id,
+      otpHash,
+      expiresAt,
+    })
+    .returning();
+
+  queueNotification("otp", {
+    owner: user,
+    otp,
+    recipientMobile: channel === "sms" ? user.mobile ?? null : null,
+    recipientEmail: channel === "email" ? user.email ?? null : null,
+  });
+
+  return {
+    id: challenge.id,
+    expiresAt,
+    channel,
+  };
+};
+
+let passwordResetTableReady = false;
+
+const ensurePasswordResetTable = async () => {
+  if (passwordResetTableReady) {
+    return;
+  }
+  try {
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS password_reset_challenges (
+        id VARCHAR PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id VARCHAR NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        channel VARCHAR(32) NOT NULL,
+        recipient VARCHAR(255),
+        otp_hash VARCHAR(255) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        consumed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT now()
+      )
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_password_reset_challenges_user_id
+        ON password_reset_challenges(user_id)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS idx_password_reset_challenges_expires_at
+        ON password_reset_challenges(expires_at)
+    `);
+    passwordResetTableReady = true;
+  } catch (error) {
+    console.error("[auth] Failed to ensure password_reset_challenges table", error);
+    throw error;
+  }
+};
+
+const createPasswordResetChallenge = async (user: User, channel: PasswordResetChannel) => {
+  await ensurePasswordResetTable();
+  const otp = generateLoginOtpCode();
+  const otpHash = await bcrypt.hash(otp, 10);
+  const expiresAt = new Date(Date.now() + PASSWORD_RESET_EXPIRY_MINUTES * 60 * 1000);
+
+  await db.delete(passwordResetChallenges).where(eq(passwordResetChallenges.userId, user.id));
+
+  const recipient =
+    channel === "sms" ? user.mobile ?? null : user.email ?? null;
+
+  const [challenge] = await db
+    .insert(passwordResetChallenges)
+    .values({
+      userId: user.id,
+      channel,
+      recipient,
+      otpHash,
+      expiresAt,
+    })
+    .returning();
+
+  queueNotification("password_reset", {
+    owner: user,
+    otp,
+    recipientMobile: channel === "sms" ? recipient : undefined,
+    recipientEmail: channel === "email" ? recipient : undefined,
+  });
+
+  return {
+    id: challenge.id,
+    expiresAt,
+  };
+};
+
+const findUserByIdentifier = async (rawIdentifier: string): Promise<User | null> => {
+  const identifier = rawIdentifier.trim();
+  if (!identifier) {
+    return null;
+  }
+  const normalizedMobile = identifier.replace(/\s+/g, "");
+  const looksLikeMobile = /^[0-9]{8,15}$/.test(normalizedMobile);
+  const normalizedEmail = identifier.toLowerCase();
+  const looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+  const manifestFromIdentifier = lookupStaffAccountByIdentifier(identifier);
+  const manifestFromMobile = looksLikeMobile ? lookupStaffAccountByMobile(normalizedMobile) : undefined;
+
+  let user =
+    looksLikeMobile
+      ? await storage.getUserByMobile(normalizedMobile)
+      : looksLikeEmail
+        ? await storage.getUserByEmail(normalizedEmail)
+        : undefined;
+
+  if (!user && manifestFromMobile && manifestFromMobile.mobile !== normalizedMobile) {
+    user = await storage.getUserByMobile(manifestFromMobile.mobile);
+  }
+
+  if (!user) {
+    user = await storage.getUserByUsername(identifier);
+  }
+
+  if (!user && manifestFromIdentifier) {
+    user = await storage.getUserByMobile(manifestFromIdentifier.mobile);
+  }
+
+  if (!user && looksLikeEmail) {
+    user = await storage.getUserByEmail(normalizedEmail);
+  }
+
+  return user ?? null;
+};
+
+const parseIsoDateOrNull = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const getExistingOwnerIntakeCutoff = async () => {
+  const record = await getSystemSettingRecord(EXISTING_RC_MIN_ISSUE_DATE_SETTING_KEY);
+  const iso = normalizeIsoDateSetting(record?.settingValue, DEFAULT_EXISTING_RC_MIN_ISSUE_DATE);
+  return parseIsoDateOrNull(iso) ?? parseIsoDateOrNull(DEFAULT_EXISTING_RC_MIN_ISSUE_DATE) ?? new Date("2022-01-01");
+};
+
+const getLegacyForwardEnabled = async () => {
+  const record = await getSystemSettingRecord(LEGACY_DTD0_FORWARD_SETTING_KEY);
+  return normalizeBooleanSetting(record?.settingValue, true);
+};
+
+const isServiceApplicationKind = (kind?: HomestayApplication["applicationKind"] | null) =>
+  Boolean(kind && kind !== "new_registration");
+
+const findActiveExistingOwnerRequest = async (userId: string) => {
+  const [application] = await db
+    .select({
+      id: homestayApplications.id,
+      applicationNumber: homestayApplications.applicationNumber,
+      status: homestayApplications.status,
+      createdAt: homestayApplications.createdAt,
+    })
+    .from(homestayApplications)
+    .where(
+      and(
+        eq(homestayApplications.userId, userId),
+        inArray(homestayApplications.status, ['legacy_rc_review']),
+      ),
+    )
+    .orderBy(desc(homestayApplications.createdAt))
+    .limit(1);
+
+  return application || null;
+};
+
+const findApplicationByCertificateNumber = async (certificateNumber: string) => {
+  const normalized = certificateNumber?.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const [application] = await db
+    .select({
+      id: homestayApplications.id,
+      applicationNumber: homestayApplications.applicationNumber,
+      status: homestayApplications.status,
+      userId: homestayApplications.userId,
+    })
+    .from(homestayApplications)
+    .where(eq(homestayApplications.certificateNumber, normalized))
+    .limit(1);
+
+  return application ?? null;
+};
+
+const isPgUniqueViolation = (error: unknown, constraint?: string): error is { code: string; constraint?: string } => {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const pgErr = error as { code?: string; constraint?: string };
+  if (pgErr.code !== "23505") {
+    return false;
+  }
+  if (constraint && pgErr.constraint !== constraint) {
+    return false;
+  }
+  return true;
+};
+
+const toNumberFromUnknown = (value: unknown) => {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
 const decimalToString = (value?: number | null) =>
   value === undefined || value === null ? null : String(value);
 
@@ -131,6 +1187,21 @@ const removeUndefined = <T extends Record<string, any>>(obj: T): T =>
   Object.fromEntries(
     Object.entries(obj).filter(([, value]) => value !== undefined),
   ) as T;
+
+const generateCaptcha = () => {
+  const first = Math.floor(Math.random() * 9) + 1;
+  const second = Math.floor(Math.random() * 9) + 1;
+  const operations = [
+    { symbol: "+", apply: (a: number, b: number) => a + b },
+    { symbol: "-", apply: (a: number, b: number) => a - b },
+    { symbol: "×", apply: (a: number, b: number) => a * b },
+  ] as const;
+  const op = operations[Math.floor(Math.random() * operations.length)];
+  return {
+    question: `${first} ${op.symbol} ${second}`,
+    answer: String(op.apply(first, second)),
+  };
+};
 
 const normalizeDocumentsForPersistence = (
   docs: Array<{
@@ -228,6 +1299,55 @@ const isValidMimeType = (candidate: string) =>
   /^[a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+$/.test(candidate);
 const sanitizeDownloadFilename = (name: string) =>
   name.replace(/[^a-zA-Z0-9.\-\_\s]/g, "_");
+
+const normalizeDistrictForMatch = (value?: string | null) => {
+  if (!value) return [];
+  const cleaned = value
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/\b(division|sub-division|subdivision|hq|office|district|development|tourism|ddo|dto|dt|section|unit|range|circle|zone|serving|for|the|at|and)\b/g, " ")
+    .replace(/[^a-z\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) {
+    return [];
+  }
+
+  const tokens = cleaned
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2);
+
+  return Array.from(new Set(tokens));
+};
+
+const districtsMatch = (officerDistrict?: string | null, targetDistrict?: string | null) => {
+  const normalize = (val?: string | null) => (val ?? "").trim().toLowerCase();
+  if (!officerDistrict || !targetDistrict) {
+    return normalize(officerDistrict) === normalize(targetDistrict);
+  }
+  if (normalize(officerDistrict) === normalize(targetDistrict)) {
+    return true;
+  }
+  const officerTokens = normalizeDistrictForMatch(officerDistrict);
+  const targetTokens = normalizeDistrictForMatch(targetDistrict);
+  if (officerTokens.length === 0 || targetTokens.length === 0) {
+    return false;
+  }
+  return officerTokens.some((token) => targetTokens.includes(token));
+};
+
+const buildDistrictWhereClause = <T extends AnyColumn>(column: T, officerDistrict: string) => {
+  const tokens = normalizeDistrictForMatch(officerDistrict);
+  if (tokens.length === 0) {
+    return eq(column, officerDistrict);
+  }
+  return or(
+    eq(column, officerDistrict),
+    ...tokens.map((token) => ilike(column, `%${token}%`)),
+  );
+};
 type UploadCategoryKey = "documents" | "photos";
 type NormalizedDocumentRecord = Exclude<
   ReturnType<typeof normalizeDocumentsForPersistence>,
@@ -294,6 +1414,323 @@ const formatBytes = (bytes: number) => {
   );
   const value = bytes / Math.pow(1024, idx);
   return `${value % 1 === 0 ? value : value.toFixed(1)} ${units[idx]}`;
+};
+
+const CLOSED_SERVICE_STATUSES = ['approved', 'rejected', 'withdrawn', 'archived'] as const;
+const CLOSED_SERVICE_STATUS_LIST = [...CLOSED_SERVICE_STATUSES];
+const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
+const MIN_ROOMS_AFTER_DELETE = 1;
+
+type RoomDeltaInput = {
+  single?: number;
+  double?: number;
+  family?: number;
+};
+
+type RoomAdjustmentResult = {
+  single: number;
+  double: number;
+  family: number;
+  total: number;
+  requestedRoomDelta?: number;
+  requestedDeletions?: Array<{ roomType: string; count: number }>;
+};
+
+const toRoomCount = (value?: number | null) => {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(value));
+};
+
+const extractRoomBreakdown = (application: HomestayApplication): RoomAdjustmentResult => {
+  const single = toRoomCount(application.singleBedRooms);
+  const double = toRoomCount(application.doubleBedRooms);
+  const family = toRoomCount(application.familySuites);
+  return {
+    single,
+    double,
+    family,
+    total: single + double + family,
+  };
+};
+
+const computeRoomAdjustment = (
+  application: HomestayApplication,
+  mode: 'add_rooms' | 'delete_rooms',
+  delta?: RoomDeltaInput,
+): RoomAdjustmentResult => {
+  if (!delta) {
+    throw new Error("Room adjustments are required for this service.");
+  }
+
+  const base = extractRoomBreakdown(application);
+  const deltaSingle = toRoomCount(delta.single);
+  const deltaDouble = toRoomCount(delta.double);
+  const deltaFamily = toRoomCount(delta.family);
+  const totalDelta = deltaSingle + deltaDouble + deltaFamily;
+
+  if (totalDelta === 0) {
+    throw new Error("Specify at least one room to add or delete.");
+  }
+
+  if (mode === "add_rooms") {
+    const targetSingle = base.single + deltaSingle;
+    const targetDouble = base.double + deltaDouble;
+    const targetFamily = base.family + deltaFamily;
+    const targetTotal = targetSingle + targetDouble + targetFamily;
+
+    if (targetTotal > MAX_ROOMS_ALLOWED) {
+      throw new Error(`HP Homestay Rules permit a maximum of ${MAX_ROOMS_ALLOWED} rooms. This request would result in ${targetTotal} rooms.`);
+    }
+
+    return {
+      single: targetSingle,
+      double: targetDouble,
+      family: targetFamily,
+      total: targetTotal,
+      requestedRoomDelta: totalDelta,
+    };
+  }
+
+  if (deltaSingle > base.single || deltaDouble > base.double || deltaFamily > base.family) {
+    throw new Error("Cannot delete more rooms than currently exist in that category.");
+  }
+
+  const targetSingle = base.single - deltaSingle;
+  const targetDouble = base.double - deltaDouble;
+  const targetFamily = base.family - deltaFamily;
+  const targetTotal = targetSingle + targetDouble + targetFamily;
+
+  if (targetTotal < MIN_ROOMS_AFTER_DELETE) {
+    throw new Error(`At least ${MIN_ROOMS_AFTER_DELETE} room must remain after deletion.`);
+  }
+
+  const requestedDeletions: Array<{ roomType: string; count: number }> = [];
+  if (deltaSingle) requestedDeletions.push({ roomType: "single", count: deltaSingle });
+  if (deltaDouble) requestedDeletions.push({ roomType: "double", count: deltaDouble });
+  if (deltaFamily) requestedDeletions.push({ roomType: "family", count: deltaFamily });
+
+  return {
+    single: targetSingle,
+    double: targetDouble,
+    family: targetFamily,
+    total: targetTotal,
+    requestedRoomDelta: -totalDelta,
+    requestedDeletions,
+  };
+};
+
+const buildRenewalWindow = (expiry: Date | null) => {
+  if (!expiry) {
+    return null;
+  }
+  const windowStart = new Date(expiry.getTime() - NINETY_DAYS_MS);
+  const now = Date.now();
+  return {
+    windowStart,
+    windowEnd: expiry,
+    inWindow: now >= windowStart.getTime() && now <= expiry.getTime(),
+  };
+};
+
+async function getActiveServiceRequest(parentApplicationId: string) {
+  if (!parentApplicationId) {
+    return null;
+  }
+
+  const [active] = await db
+    .select({
+      id: homestayApplications.id,
+      applicationNumber: homestayApplications.applicationNumber,
+      applicationKind: homestayApplications.applicationKind,
+      status: homestayApplications.status,
+      totalRooms: homestayApplications.totalRooms,
+      createdAt: homestayApplications.createdAt,
+      updatedAt: homestayApplications.updatedAt,
+    })
+    .from(homestayApplications)
+    .where(
+      and(
+        eq(homestayApplications.parentApplicationId, parentApplicationId),
+        notInArray(homestayApplications.status, CLOSED_SERVICE_STATUS_LIST),
+      ),
+    )
+    .orderBy(desc(homestayApplications.createdAt))
+    .limit(1);
+
+  return active ?? null;
+}
+
+async function buildServiceSummary(application: HomestayApplication) {
+  const breakdown = extractRoomBreakdown(application);
+  const expiry = application.certificateExpiryDate ? new Date(application.certificateExpiryDate) : null;
+  const window = buildRenewalWindow(expiry);
+  const activeRequest = await getActiveServiceRequest(application.id);
+
+  return {
+    id: application.id,
+    applicationNumber: application.applicationNumber,
+    propertyName: application.propertyName,
+    totalRooms: breakdown.total,
+    maxRoomsAllowed: MAX_ROOMS_ALLOWED,
+    certificateExpiryDate: expiry ? expiry.toISOString() : null,
+    renewalWindowStart: window ? window.windowStart.toISOString() : null,
+    renewalWindowEnd: window ? window.windowEnd.toISOString() : null,
+    canRenew: window ? window.inWindow : false,
+    canAddRooms: breakdown.total < MAX_ROOMS_ALLOWED,
+    canDeleteRooms: breakdown.total > MIN_ROOMS_AFTER_DELETE,
+    rooms: {
+      single: breakdown.single,
+      double: breakdown.double,
+      family: breakdown.family,
+    },
+    activeServiceRequest: activeRequest
+      ? {
+          id: activeRequest.id,
+          applicationNumber: activeRequest.applicationNumber,
+          applicationKind: activeRequest.applicationKind,
+          status: activeRequest.status,
+          totalRooms: activeRequest.totalRooms,
+          createdAt: activeRequest.createdAt,
+        }
+      : null,
+  };
+}
+
+const canViewInspectionReport = (user: User | null, application: HomestayApplication | null) => {
+  if (!user || !application) {
+    return false;
+  }
+
+  if (user.role === "property_owner") {
+    return user.id === application.userId;
+  }
+
+  // Other authenticated roles can view inspection reports
+  return true;
+};
+
+const roomDeltaSchema = z
+  .object({
+    single: z.number().int().min(0).max(MAX_ROOMS_ALLOWED).optional(),
+    double: z.number().int().min(0).max(MAX_ROOMS_ALLOWED).optional(),
+    family: z.number().int().min(0).max(MAX_ROOMS_ALLOWED).optional(),
+  })
+  .partial();
+
+const serviceRequestSchema = z.object({
+  baseApplicationId: z.string().uuid(),
+  serviceType: z.enum(['renewal', 'add_rooms', 'delete_rooms', 'cancel_certificate']),
+  note: z.string().max(1000).optional(),
+  roomDelta: roomDeltaSchema.optional(),
+});
+
+const uploadedFileSchema = z.object({
+  fileName: z.string().min(1),
+  filePath: z.string().min(1),
+  fileSize: z.number().int().nonnegative().optional(),
+  mimeType: z.string().min(3).optional(),
+});
+
+const existingOwnerIntakeSchema = z.object({
+  ownerName: z.string().min(3),
+  ownerMobile: z.string().min(6),
+  ownerEmail: z.string().email().optional().or(z.literal("")),
+  propertyName: z.string().min(3),
+  district: z.string().min(2),
+  tehsil: z.string().min(2),
+  address: z.string().min(5),
+  pincode: z.string().min(4),
+  locationType: z.enum(LEGACY_LOCATION_TYPES),
+  totalRooms: z.coerce.number().int().min(1).max(MAX_ROOMS_ALLOWED),
+  guardianName: z.string().min(3),
+  rcNumber: z.string().min(3),
+  rcIssueDate: z.string().min(4),
+  rcExpiryDate: z.string().min(4),
+  notes: z.string().optional(),
+  certificateDocuments: z.array(uploadedFileSchema).min(1),
+  identityProofDocuments: z.array(uploadedFileSchema).min(1),
+});
+
+const generateLegacyApplicationNumber = (district?: string | null) => {
+  const prefix = (district || "LEG")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "")
+    .slice(0, 3)
+    .padEnd(3, "X");
+  return `${LEGACY_RC_PREFIX}${prefix}-${Date.now().toString(36).toUpperCase()}`;
+};
+
+const CAPTCHA_SETTING_KEY = "auth_captcha_enabled";
+const CAPTCHA_CACHE_TTL = 5 * 60 * 1000;
+const CAPTCHA_FORCE_DISABLE = (() => {
+  const raw = typeof process.env.CAPTCHA_FORCE_DISABLE === "string"
+    ? process.env.CAPTCHA_FORCE_DISABLE.trim().toLowerCase()
+    : null;
+  if (raw === "true") {
+    return true;
+  }
+  if (raw === "false") {
+    return false;
+  }
+  // Auto-disable captcha when running on the RC3 port (4000) to avoid login blockers
+  return process.env.PORT === "4000";
+})();
+
+console.info(
+  "[captcha] configuration",
+  JSON.stringify({
+    port: process.env.PORT,
+    forcedFlag: process.env.CAPTCHA_FORCE_DISABLE,
+    computedForceDisable: CAPTCHA_FORCE_DISABLE,
+  }),
+);
+const shouldBypassCaptcha = (hostHeader?: string | null): boolean => {
+  if (CAPTCHA_FORCE_DISABLE) {
+    return true;
+  }
+  const normalizedHost = (hostHeader || "").toLowerCase();
+  return normalizedHost.includes("hptourism.osipl.dev");
+};
+const captchaSettingCache: { fetchedAt: number; enabled: boolean } = {
+  fetchedAt: 0,
+  enabled: true,
+};
+
+const updateCaptchaSettingCache = (enabled: boolean) => {
+  captchaSettingCache.enabled = enabled;
+  captchaSettingCache.fetchedAt = Date.now();
+};
+
+const getCaptchaSetting = async () => {
+  if (CAPTCHA_FORCE_DISABLE) {
+    const wasEnabled = captchaSettingCache.enabled !== false;
+    updateCaptchaSettingCache(false);
+    if (wasEnabled) {
+      console.info("[captcha] Force-disabled via configuration/port override");
+    }
+    return false;
+  }
+
+  const now = Date.now();
+  if (now - captchaSettingCache.fetchedAt < CAPTCHA_CACHE_TTL) {
+    return captchaSettingCache.enabled;
+  }
+
+  const [setting] = await db
+    .select()
+    .from(systemSettings)
+    .where(eq(systemSettings.settingKey, CAPTCHA_SETTING_KEY))
+    .limit(1);
+
+  const enabled =
+    setting && setting.settingValue
+      ? Boolean((setting.settingValue as { enabled?: boolean }).enabled)
+      : true;
+
+  updateCaptchaSettingCache(enabled);
+  return enabled;
 };
 
 const validateDocumentsAgainstPolicy = (
@@ -394,8 +1831,8 @@ const sanitizeDraftForPersistence = (
     urbanBodyOther: normalizeStringField(validatedData.urbanBodyOther),
     ward: normalizeStringField(validatedData.ward),
     address: normalizeStringField(validatedData.address),
-    pincode: normalizeStringField(validatedData.pincode),
-    telephone: normalizeStringField(validatedData.telephone),
+    pincode: normalizeStringField(validatedData.pincode, "", 10),
+    telephone: normalizeStringField(validatedData.telephone, "", 20),
     ownerName: normalizeStringField(
       validatedData.ownerName,
       fallbackOwnerName,
@@ -404,6 +1841,7 @@ const sanitizeDraftForPersistence = (
     ownerMobile: normalizeStringField(
       validatedData.ownerMobile,
       fallbackOwnerMobile,
+      15,
     ),
     ownerEmail: normalizeStringField(
       validatedData.ownerEmail,
@@ -412,6 +1850,7 @@ const sanitizeDraftForPersistence = (
     ownerAadhaar: normalizeStringField(
       validatedData.ownerAadhaar,
       "000000000000",
+      12,
     ),
     propertyOwnership:
       validatedData.propertyOwnership === "leased" ? "leased" : "owned",
@@ -430,7 +1869,7 @@ const sanitizeDraftForPersistence = (
     familySuiteSize: coerceNumberField(validatedData.familySuiteSize),
     familySuiteRate: coerceNumberField(validatedData.familySuiteRate),
     attachedWashrooms: coerceNumberField(validatedData.attachedWashrooms),
-    gstin: normalizeStringField(validatedData.gstin),
+    gstin: normalizeStringField(validatedData.gstin, "", 15),
     selectedCategory:
       validatedData.selectedCategory || validatedData.category || "silver",
     averageRoomRate: coerceNumberField(validatedData.averageRoomRate),
@@ -530,6 +1969,42 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("[category-enforcement] Failed to fetch setting, falling back to defaults:", error);
       return DEFAULT_CATEGORY_ENFORCEMENT;
+    }
+  };
+
+  const getRoomRateBandsSetting = async () => {
+    try {
+      const [setting] = await db
+        .select()
+        .from(systemSettings)
+        .where(eq(systemSettings.settingKey, ROOM_RATE_BANDS_SETTING_KEY))
+        .limit(1);
+
+      if (!setting) {
+        return DEFAULT_CATEGORY_RATE_BANDS;
+      }
+
+      return normalizeCategoryRateBands(setting.settingValue);
+    } catch (error) {
+      console.error("[room-rate-bands] Failed to fetch setting, falling back to defaults:", error);
+      return DEFAULT_CATEGORY_RATE_BANDS;
+    }
+  };
+
+  const getRoomCalcModeSetting = async () => {
+    try {
+      const [setting] = await db
+        .select()
+        .from(systemSettings)
+        .where(eq(systemSettings.settingKey, ROOM_CALC_MODE_SETTING_KEY))
+        .limit(1);
+      if (!setting) {
+        return DEFAULT_ROOM_CALC_MODE;
+      }
+      return normalizeRoomCalcModeSetting(setting.settingValue);
+    } catch (error) {
+      console.error("[room-calc-mode] Failed to fetch setting, falling back to defaults:", error);
+      return DEFAULT_ROOM_CALC_MODE;
     }
   };
 
@@ -712,37 +2187,447 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Captcha for public login
+  app.get("/api/auth/captcha", async (req, res) => {
+    try {
+      if (shouldBypassCaptcha(req.get("host"))) {
+        updateCaptchaSettingCache(false);
+        req.session.captchaAnswer = null;
+        req.session.captchaIssuedAt = null;
+        return res.json({ enabled: false });
+      }
+
+      const enabled = await getCaptchaSetting();
+      if (!enabled) {
+        req.session.captchaAnswer = null;
+        req.session.captchaIssuedAt = null;
+        return res.json({ enabled: false });
+      }
+      const { question, answer } = generateCaptcha();
+      req.session.captchaAnswer = answer;
+      req.session.captchaIssuedAt = Date.now();
+      res.json({ enabled: true, question, expiresInSeconds: 300 });
+    } catch (error) {
+      console.error("[auth] Failed to load captcha:", error);
+      res.status(500).json({ message: "Captcha unavailable" });
+    }
+  });
+
   // Login
+  const resolveNotificationChannelState = async (eventId: NotificationEventId) => {
+    const definition = notificationDefinitionMap.get(eventId);
+    if (!definition) {
+      return { smsEnabled: false, emailEnabled: false };
+    }
+    const record = await getSystemSettingRecord(NOTIFICATION_RULES_SETTING_KEY);
+    const value: NotificationSettingsValue | undefined =
+      (record?.settingValue as NotificationSettingsValue) ?? undefined;
+    const stored = value?.rules?.find((rule) => rule.id === eventId);
+    return {
+      smsEnabled: stored?.smsEnabled ?? definition.defaultSmsEnabled ?? false,
+      emailEnabled: stored?.emailEnabled ?? definition.defaultEmailEnabled ?? false,
+    };
+  };
+
+  type OtpChannelState = {
+    smsEnabled: boolean;
+    emailEnabled: boolean;
+    anyEnabled: boolean;
+  };
+
+  type OtpLoginAvailability = OtpChannelState & {
+    allowed: boolean;
+  };
+
+  const getOtpChannelState = async (): Promise<OtpChannelState> => {
+    const otpChannels = await resolveNotificationChannelState("otp");
+    const smsEnabled = Boolean(otpChannels.smsEnabled);
+    const emailEnabled = Boolean(otpChannels.emailEnabled);
+    return {
+      smsEnabled,
+      emailEnabled,
+      anyEnabled: smsEnabled || emailEnabled,
+    };
+  };
+
+  const getOtpLoginAvailabilityForUser = async (user: User): Promise<OtpLoginAvailability> => {
+    const channelState = await getOtpChannelState();
+    const allowed = user.role === "property_owner" && channelState.anyEnabled;
+    return {
+      ...channelState,
+      allowed,
+    };
+  };
+
+  app.get("/api/auth/login/options", async (_req, res) => {
+    try {
+      const otpChannels = await getOtpChannelState();
+      const otpRequired = otpChannels.anyEnabled ? await getLoginOtpSetting() : false;
+      const payload = {
+        otpEnabled: otpChannels.anyEnabled,
+        smsOtpEnabled: otpChannels.smsEnabled,
+        emailOtpEnabled: otpChannels.emailEnabled,
+        otpRequired,
+      };
+      console.info("[auth] login options", payload);
+      res.json(payload);
+    } catch (error) {
+      console.error("[auth] Failed to load login options", error);
+      res.status(500).json({ message: "Unable to load login options" });
+    }
+  });
+
   app.post("/api/auth/login", async (req, res) => {
     try {
-      const { mobile, password } = req.body;
-      
-      if (!mobile || !password) {
-        return res.status(400).json({ message: "Mobile and password required" });
+      const authModeRaw = typeof req.body?.authMode === "string" ? req.body.authMode.trim().toLowerCase() : "password";
+      const authMode: LoginAuthMode = authModeRaw === "otp" ? "otp" : "password";
+      const otpChannelRaw = typeof req.body?.otpChannel === "string" ? req.body.otpChannel.trim().toLowerCase() : "sms";
+      const otpChannel: PasswordResetChannel = otpChannelRaw === "email" ? "email" : "sms";
+      const password = typeof req.body?.password === "string" ? req.body.password : "";
+      const captchaAnswer = typeof req.body?.captchaAnswer === "string" ? req.body.captchaAnswer.trim() : "";
+      const rawIdentifier =
+        typeof req.body?.identifier === "string" && req.body.identifier.trim().length > 0
+          ? req.body.identifier.trim()
+          : typeof req.body?.mobile === "string"
+            ? req.body.mobile.trim()
+            : "";
+
+      if (!rawIdentifier) {
+        return res.status(400).json({ message: "Identifier required" });
       }
-      
-      const user = await storage.getUserByMobile(mobile);
-      if (!user || !user.password) {
+      if (authMode === "password" && !password) {
+        return res.status(400).json({ message: "Password is required" });
+      }
+
+      const captchaRequired = shouldBypassCaptcha(req.get("host"))
+        ? false
+        : await getCaptchaSetting();
+      if (captchaRequired) {
+        if (!captchaAnswer) {
+          return res.status(400).json({ message: "Captcha answer required" });
+        }
+
+        const expectedCaptchaAnswer = req.session.captchaAnswer;
+        const captchaIssuedAt = req.session.captchaIssuedAt ?? 0;
+        const captchaExpired = !captchaIssuedAt || Date.now() - captchaIssuedAt > 5 * 60 * 1000;
+        if (!expectedCaptchaAnswer || captchaExpired || captchaAnswer !== expectedCaptchaAnswer) {
+          req.session.captchaAnswer = null;
+          req.session.captchaIssuedAt = null;
+          const message = captchaExpired ? "Captcha expired. Please refresh and try again." : "Invalid captcha answer";
+          return res.status(400).json({ message });
+        }
+      }
+
+      const normalizedMobile = rawIdentifier.replace(/\s+/g, "");
+      const looksLikeMobile = /^[0-9]{8,15}$/.test(normalizedMobile);
+      const normalizedEmail = rawIdentifier.toLowerCase();
+      const looksLikeEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+      const manifestFromIdentifier = lookupStaffAccountByIdentifier(rawIdentifier);
+      const manifestFromMobile = looksLikeMobile ? lookupStaffAccountByMobile(normalizedMobile) : undefined;
+
+      let user =
+        looksLikeMobile
+          ? await storage.getUserByMobile(normalizedMobile)
+          : looksLikeEmail
+            ? await storage.getUserByEmail(normalizedEmail)
+            : undefined;
+
+      if (!user && manifestFromMobile && manifestFromMobile.mobile !== normalizedMobile) {
+        user = await storage.getUserByMobile(manifestFromMobile.mobile);
+      }
+
+      if (!user) {
+        user = await storage.getUserByUsername(rawIdentifier);
+      }
+
+      if (!user && manifestFromIdentifier) {
+        user = await storage.getUserByMobile(manifestFromIdentifier.mobile);
+      }
+
+      if (!user && looksLikeEmail) {
+        user = await storage.getUserByEmail(normalizedEmail);
+      }
+
+      // Backwards compatibility: if both identifier + mobile were sent but the identifier
+      // looked like a username, fall back to the explicit mobile flag before failing.
+      if (!user && typeof req.body?.mobile === "string") {
+        user = await storage.getUserByMobile(req.body.mobile.trim());
+      }
+
+      if (!user || (authMode === "password" && !user.password)) {
         return res.status(401).json({ message: "Invalid credentials" });
       }
-      
-      // Compare password with bcrypt hash
-      const bcrypt = await import('bcrypt');
-      const passwordMatch = await bcrypt.compare(password, user.password);
+
+      if (!user.isActive) {
+        return res.status(403).json({ message: "Account deactivated" });
+      }
+
+      if (authMode === "otp") {
+        const otpAvailability = await getOtpLoginAvailabilityForUser(user);
+        if (!otpAvailability.allowed) {
+          return res.status(400).json({ message: "OTP login is disabled" });
+        }
+        if (otpChannel === "sms") {
+          if (!otpAvailability.smsEnabled) {
+            return res.status(400).json({ message: "SMS OTP is disabled. Switch to email OTP." });
+          }
+          if (!user.mobile || user.mobile.trim().length < 6) {
+            return res.status(400).json({ message: "OTP login unavailable (missing mobile)" });
+          }
+        } else if (otpChannel === "email") {
+          if (!otpAvailability.emailEnabled) {
+            return res.status(400).json({ message: "Email OTP is disabled. Switch to SMS OTP." });
+          }
+          if (!user.email) {
+            return res.status(400).json({ message: "OTP login unavailable (missing email)" });
+          }
+        }
+        const challenge = await createLoginOtpChallenge(user, otpChannel);
+        req.session.captchaAnswer = null;
+        req.session.captchaIssuedAt = null;
+        return res.json({
+          otpRequired: true,
+          challengeId: challenge.id,
+          expiresAt: challenge.expiresAt.toISOString(),
+          maskedMobile: otpChannel === "sms" ? maskMobileNumber(user.mobile) : undefined,
+          maskedEmail: otpChannel === "email" ? maskEmailAddress(user.email) : undefined,
+          channel: otpChannel,
+        });
+      }
+
+      const comparePassword = async (candidate?: typeof user) => {
+        if (!candidate || !candidate.password) {
+          return false;
+        }
+        try {
+          return await bcrypt.compare(password, candidate.password);
+        } catch (error) {
+          console.warn("[auth] Failed to compare password hash", {
+            userId: candidate.id,
+            identifier: rawIdentifier,
+            error,
+          });
+          return false;
+        }
+      };
+
+      let passwordMatch = await comparePassword(user);
+
+      if (!passwordMatch && manifestFromIdentifier) {
+        try {
+          const manifestUser = await storage.getUserByMobile(manifestFromIdentifier.mobile);
+          if (
+            manifestUser &&
+            manifestUser.id !== user.id &&
+            manifestUser.password &&
+            (await comparePassword(manifestUser))
+          ) {
+            user = manifestUser;
+            passwordMatch = true;
+            console.info("[auth] Resolved staff login via manifest fallback", {
+              identifier: rawIdentifier,
+              mobile: manifestFromIdentifier.mobile,
+            });
+          }
+        } catch (fallbackError) {
+          console.error("[auth] Manifest fallback failed", fallbackError);
+        }
+      }
+
       if (!passwordMatch) {
         return res.status(401).json({ message: "Invalid credentials" });
       }
       
-      if (!user.isActive) {
-        return res.status(403).json({ message: "Account deactivated" });
+      const manifestAccount =
+        manifestFromIdentifier ??
+        manifestFromMobile ??
+        lookupStaffAccountByMobile(user.mobile);
+
+      if (
+        manifestAccount &&
+        manifestAccount.username &&
+        (!user.username ||
+          user.username.toLowerCase() !== manifestAccount.username.toLowerCase())
+      ) {
+        try {
+          const updated = await storage.updateUser(user.id, {
+            username: manifestAccount.username,
+          });
+          if (updated) {
+            user = updated;
+          }
+        } catch (updateError) {
+          console.warn("[auth] Failed to backfill staff username", updateError);
+        }
       }
-      
+
       req.session.userId = user.id;
+      req.session.captchaAnswer = null;
+      req.session.captchaIssuedAt = null;
       
-      const { password: _, ...userWithoutPassword } = user;
-      res.json({ user: userWithoutPassword });
+      const userResponse = formatUserForResponse(user);
+      res.json({ user: userResponse });
     } catch (error) {
       res.status(500).json({ message: "Login failed" });
+    }
+  });
+
+  app.post("/api/auth/login/verify-otp", async (req, res) => {
+    try {
+      const challengeId =
+        typeof req.body?.challengeId === "string" ? req.body.challengeId.trim() : "";
+      const otp = typeof req.body?.otp === "string" ? req.body.otp.trim() : "";
+
+      if (!challengeId || !otp) {
+        return res.status(400).json({ message: "OTP verification failed" });
+      }
+
+      const [challenge] = await db
+        .select()
+        .from(loginOtpChallenges)
+        .where(eq(loginOtpChallenges.id, challengeId))
+        .limit(1);
+
+      if (!challenge) {
+        return res.status(400).json({ message: "OTP expired. Please sign in again." });
+      }
+
+      if (challenge.consumedAt) {
+        return res.status(400).json({ message: "OTP already used. Please sign in again." });
+      }
+
+      const now = new Date();
+      if (challenge.expiresAt < now) {
+        await db.delete(loginOtpChallenges).where(eq(loginOtpChallenges.id, challengeId));
+        return res.status(400).json({ message: "OTP expired. Please sign in again." });
+      }
+
+      const user = await storage.getUser(challenge.userId);
+      if (!user || !user.isActive) {
+        return res.status(400).json({ message: "Account unavailable" });
+      }
+
+      const otpMatch = await bcrypt.compare(otp, challenge.otpHash);
+      if (!otpMatch) {
+        return res.status(400).json({ message: "Incorrect OTP" });
+      }
+
+      await db
+        .update(loginOtpChallenges)
+        .set({ consumedAt: new Date() })
+        .where(eq(loginOtpChallenges.id, challengeId));
+
+      req.session.userId = user.id;
+      req.session.captchaAnswer = null;
+      req.session.captchaIssuedAt = null;
+
+      const userResponse = formatUserForResponse(user);
+      res.json({ user: userResponse });
+    } catch (error) {
+      console.error("[auth] OTP verification failed", error);
+      res.status(500).json({ message: "OTP verification failed" });
+    }
+  });
+
+  const passwordResetRequestSchema = z.object({
+    identifier: z.string().min(3, "Enter your registered mobile number, email, or username"),
+    channel: z.enum(["sms", "email"]).optional(),
+  });
+
+  const passwordResetVerifySchema = z.object({
+    challengeId: z.string().min(1, "Challenge id missing"),
+    otp: z.string().min(4, "Enter the code sent to you"),
+    newPassword: z.string().min(6, "New password must be at least 6 characters"),
+  });
+
+  app.post("/api/auth/password-reset/request", async (req, res) => {
+    try {
+      const { identifier, channel: rawChannel } = passwordResetRequestSchema.parse(req.body ?? {});
+      const channel: PasswordResetChannel = rawChannel === "email" ? "email" : "sms";
+      const user = await findUserByIdentifier(identifier);
+      if (!user) {
+        return res.status(404).json({ message: "Account not found" });
+      }
+      if (!user.isActive) {
+        return res.status(403).json({ message: "Account disabled" });
+      }
+
+      if (channel === "sms") {
+        if (!user.mobile || user.mobile.trim().length < 6) {
+          return res.status(400).json({ message: "No mobile number linked to this account" });
+        }
+      } else if (channel === "email") {
+        if (!user.email) {
+          return res.status(400).json({ message: "No email linked to this account" });
+        }
+      }
+
+      const challenge = await createPasswordResetChallenge(user, channel);
+      res.json({
+        challengeId: challenge.id,
+        expiresAt: challenge.expiresAt.toISOString(),
+        channel,
+        maskedMobile: channel === "sms" ? maskMobileNumber(user.mobile) : undefined,
+        maskedEmail: channel === "email" ? maskEmailAddress(user.email) : undefined,
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0]?.message || "Invalid request" });
+      }
+      console.error("[auth] Password reset request failed", error);
+      res.status(500).json({ message: "Failed to issue reset code" });
+    }
+  });
+
+  app.post("/api/auth/password-reset/verify", async (req, res) => {
+    try {
+      const { challengeId, otp, newPassword } = passwordResetVerifySchema.parse(req.body ?? {});
+
+      await ensurePasswordResetTable();
+      const [challenge] = await db
+        .select()
+        .from(passwordResetChallenges)
+        .where(eq(passwordResetChallenges.id, challengeId))
+        .limit(1);
+
+      if (!challenge) {
+        return res.status(400).json({ message: "Reset code expired. Please start again." });
+      }
+
+      if (challenge.consumedAt) {
+        return res.status(400).json({ message: "Reset code already used. Please request a new one." });
+      }
+
+      const now = new Date();
+      if (challenge.expiresAt < now) {
+        await db.delete(passwordResetChallenges).where(eq(passwordResetChallenges.id, challengeId));
+        return res.status(400).json({ message: "Reset code expired. Please request a new one." });
+      }
+
+      const user = await storage.getUser(challenge.userId);
+      if (!user || !user.isActive) {
+        return res.status(404).json({ message: "Account unavailable" });
+      }
+
+      const otpMatch = await bcrypt.compare(otp, challenge.otpHash);
+      if (!otpMatch) {
+        return res.status(400).json({ message: "Incorrect reset code" });
+      }
+
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      await storage.updateUser(user.id, { password: hashedPassword });
+      await db
+        .update(passwordResetChallenges)
+        .set({ consumedAt: new Date() })
+        .where(eq(passwordResetChallenges.id, challengeId));
+
+      res.json({ message: "Password updated successfully" });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0]?.message || "Invalid reset request" });
+      }
+      console.error("[auth] Password reset verify failed", error);
+      res.status(500).json({ message: "Failed to update password" });
     }
   });
 
@@ -768,8 +2653,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.status(404).json({ message: "User not found" });
     }
     
-    const { password, ...userWithoutPassword } = user;
-    res.json({ user: userWithoutPassword });
+    const userResponse = formatUserForResponse(user);
+    res.json({ user: userResponse });
   });
 
   // User Profile Routes
@@ -833,6 +2718,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
           })
           .returning();
       }
+
+      const normalizedEmail =
+        typeof profileData.email === "string" && profileData.email.trim().length > 0
+          ? profileData.email.trim()
+          : null;
+      const normalizedAadhaar =
+        typeof profileData.aadhaarNumber === "string" && profileData.aadhaarNumber.trim().length > 0
+          ? profileData.aadhaarNumber.trim()
+          : null;
+
+      await db
+        .update(users)
+        .set({
+          fullName: profileData.fullName,
+          mobile: profileData.mobile,
+          email: normalizedEmail,
+          aadhaarNumber: normalizedAadhaar ?? null,
+          district: profileData.district || null,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, userId));
       
       res.json({ 
         profile, 
@@ -904,9 +2810,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const objectStorageService = new ObjectStorageService();
-      const uploadURL = await objectStorageService.getUploadURL(fileType);
-      const filePath = objectStorageService.normalizeObjectPath(uploadURL);
-      res.json({ uploadUrl: uploadURL, filePath });
+      const { uploadUrl, filePath } = await objectStorageService.prepareUpload(fileType);
+      res.json({ uploadUrl, filePath });
     } catch (error) {
       console.error("Error getting upload URL:", error);
       res.status(500).json({ message: "Failed to get upload URL" });
@@ -994,6 +2899,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("[category-enforcement] Failed to fetch setting:", error);
       res.status(500).json({ message: "Failed to fetch category enforcement setting" });
+    }
+  });
+
+  app.get("/api/settings/room-rate-bands", requireAuth, async (_req, res) => {
+    try {
+      const setting = await getRoomRateBandsSetting();
+      res.json(setting);
+    } catch (error) {
+      console.error("[room-rate-bands] Failed to fetch setting:", error);
+      res.status(500).json({ message: "Failed to fetch rate band setting" });
+    }
+  });
+
+  app.get("/api/settings/room-calc-mode", requireAuth, async (_req, res) => {
+    try {
+      const setting = await getRoomCalcModeSetting();
+      res.json(setting);
+    } catch (error) {
+      console.error("[room-calc-mode] Failed to fetch setting:", error);
+      res.status(500).json({ message: "Failed to fetch room configuration mode" });
     }
   });
   
@@ -1267,23 +3192,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
         propertyOwnership: z.enum(['owned', 'leased']).optional(),
         
         // Room & category details
-        proposedRoomRate: z.coerce.number(),
-        singleBedRoomRate: z.coerce.number().optional(),
-        doubleBedRoomRate: z.coerce.number().optional(),
-        familySuiteRate: z.coerce.number().optional(),
+        proposedRoomRate: z.coerce.number().min(0),
+        singleBedRoomRate: z.coerce.number().min(0).optional(),
+        doubleBedRoomRate: z.coerce.number().min(0).optional(),
+        familySuiteRate: z.coerce.number().min(0).optional(),
         projectType: z.enum(['new_rooms', 'new_project']),
-        propertyArea: z.coerce.number(),
-        singleBedRooms: z.coerce.number().optional(),
-        singleBedBeds: z.coerce.number().optional(),
-        singleBedRoomSize: z.coerce.number().optional(),
-        doubleBedRooms: z.coerce.number().optional(),
-        doubleBedBeds: z.coerce.number().optional(),
-        doubleBedRoomSize: z.coerce.number().optional(),
-        familySuites: z.coerce.number().optional(),
-        familySuiteBeds: z.coerce.number().optional(),
-        familySuiteSize: z.coerce.number().optional(),
-        attachedWashrooms: z.coerce.number(),
-        gstin: z.string().optional(),
+        propertyArea: z.coerce.number().min(0),
+        singleBedRooms: z.coerce.number().min(0).optional(),
+        singleBedBeds: z.coerce.number().min(0).optional(),
+        singleBedRoomSize: z.coerce.number().min(0).optional(),
+        doubleBedRooms: z.coerce.number().min(0).optional(),
+        doubleBedBeds: z.coerce.number().min(0).optional(),
+        doubleBedRoomSize: z.coerce.number().min(0).optional(),
+        familySuites: z.coerce.number().min(0).optional(),
+        familySuiteBeds: z.coerce.number().min(0).optional(),
+        familySuiteSize: z.coerce.number().min(0).optional(),
+        attachedWashrooms: z.coerce.number().min(0),
+        gstin: z
+          .string()
+          .regex(/^[0-9A-Z]{15}$/, "GSTIN must be 15 uppercase alphanumeric characters")
+          .optional(),
         
         // Distances (in km)
         distanceAirport: z.coerce.number().optional(),
@@ -1433,6 +3361,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if ((validatedData.familySuites || 0) > 0 && !validatedData.familySuiteRate) {
         return res.status(400).json({ 
           message: "Per-room-type rates are mandatory. Family suite rate is required (HP Homestay Rules 2025 - ANNEXURE-I Form-A Certificate Requirement)" 
+        });
+      }
+
+      const roomRateBands = await getRoomRateBandsSetting();
+      const highestRoomRate = Math.max(
+        validatedData.singleBedRoomRate || 0,
+        validatedData.doubleBedRoomRate || 0,
+        validatedData.familySuiteRate || 0,
+        validatedData.proposedRoomRate || 0,
+      );
+      const categoryValidation = validateCategorySelection(
+        validatedData.category as CategoryType,
+        totalRooms,
+        highestRoomRate,
+        roomRateBands,
+      );
+      if (!categoryValidation.isValid) {
+        return res.status(400).json({
+          message:
+            categoryValidation.errors[0] ||
+            "The selected category does not match the nightly tariffs. Update the rates or choose a higher category.",
         });
       }
 
@@ -1597,7 +3546,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
         }
       }
-      
+      const ownerForNotification = await storage.getUser(application.userId);
+      queueNotification("application_submitted", {
+        application,
+        owner: ownerForNotification ?? null,
+      });
+      await logApplicationAction({
+        applicationId: application.id,
+        actorId: userId,
+        action: "owner_submitted",
+        previousStatus: existingApp?.status ?? null,
+        newStatus: "submitted",
+        feedback: existingApp ? "Existing application finalized and submitted." : "New application submitted.",
+      });
+
       res.json({ application });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -1610,6 +3572,403 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Get user's applications
+  app.get("/api/service-center", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      if (!['property_owner', 'admin', 'super_admin'].includes(user.role)) {
+        return res.status(403).json({ message: "Service Center is currently available for property owners." });
+      }
+
+      const baseApplications =
+        user.role === 'property_owner'
+          ? (await storage.getApplicationsByUser(userId)).filter((app) => app.status === 'approved')
+          : (await storage.getAllApplications()).filter((app) => app.status === 'approved');
+
+      const summaries = await Promise.all(baseApplications.map((app) => buildServiceSummary(app)));
+      res.json({ applications: summaries });
+    } catch (error) {
+      console.error("[service-center] Failed to fetch eligibility list", error);
+      res.status(500).json({ message: "Failed to load service center data" });
+    }
+  });
+
+  app.post("/api/service-center", requireAuth, async (req, res) => {
+    try {
+      const parsed = serviceRequestSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid request", errors: parsed.error.flatten() });
+      }
+
+      const { baseApplicationId, serviceType, note, roomDelta } = parsed.data;
+      const userId = req.session.userId!;
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      if (user.role !== 'property_owner') {
+        return res.status(403).json({ message: "Only property owners can initiate service requests." });
+      }
+
+      const baseApplication = await storage.getApplication(baseApplicationId);
+      if (!baseApplication || baseApplication.userId !== userId) {
+        return res.status(404).json({ message: "Application not found." });
+      }
+
+      if (baseApplication.status !== 'approved') {
+        return res.status(400).json({ message: "Only approved applications can be renewed or amended." });
+      }
+
+      const activeService = await getActiveServiceRequest(baseApplication.id);
+      if (activeService) {
+        return res.status(409).json({
+          message: "Another service request is already in progress for this application.",
+          activeRequest: activeService,
+        });
+      }
+
+      const expiryDate = baseApplication.certificateExpiryDate ? new Date(baseApplication.certificateExpiryDate) : null;
+      const renewalWindow = buildRenewalWindow(expiryDate);
+
+      if (serviceType === 'renewal') {
+        if (!expiryDate) {
+          return res.status(400).json({ message: "This application does not have an active certificate yet." });
+        }
+        if (!renewalWindow?.inWindow) {
+          return res.status(400).json({
+            message: "Renewal is allowed only within 90 days of certificate expiry.",
+            windowStart: renewalWindow?.windowStart.toISOString(),
+            windowEnd: renewalWindow?.windowEnd.toISOString(),
+          });
+        }
+      }
+
+      let targetRooms = extractRoomBreakdown(baseApplication);
+      if (serviceType === 'add_rooms' || serviceType === 'delete_rooms') {
+        targetRooms = computeRoomAdjustment(baseApplication, serviceType, roomDelta);
+      }
+
+      const trimmedNote = typeof note === "string" ? note.trim() : undefined;
+      const serviceNotes = trimmedNote && trimmedNote.length > 0 ? trimmedNote : null;
+
+      const serviceContextRaw: ApplicationServiceContext = removeUndefined({
+        requestedRooms: {
+          single: targetRooms.single,
+          double: targetRooms.double,
+          family: targetRooms.family,
+          total: targetRooms.total,
+        },
+        requestedRoomDelta: targetRooms.requestedRoomDelta,
+        requestedDeletions: targetRooms.requestedDeletions,
+        renewalWindow: renewalWindow
+          ? {
+              start: renewalWindow.windowStart.toISOString(),
+              end: renewalWindow.windowEnd.toISOString(),
+            }
+          : undefined,
+        requiresPayment: !['delete_rooms', 'cancel_certificate'].includes(serviceType),
+        inheritsCertificateExpiry: expiryDate ? expiryDate.toISOString() : undefined,
+        note: serviceNotes ?? undefined,
+      }) as ApplicationServiceContext;
+
+      const serviceContext = Object.keys(serviceContextRaw).length > 0 ? serviceContextRaw : null;
+
+      const {
+        id: _ignoreId,
+        applicationNumber: _ignoreNumber,
+        createdAt: _ignoreCreated,
+        updatedAt: _ignoreUpdated,
+        parentApplicationId: _parentId,
+        parentApplicationNumber: _parentNumber,
+        parentCertificateNumber: _parentCert,
+        inheritedCertificateValidUpto: _inheritValid,
+        serviceContext: _previousContext,
+        serviceNotes: _previousNotes,
+        serviceRequestedAt: _previousRequested,
+        certificateNumber: _certificateNumber,
+        certificateIssuedDate: _certificateIssued,
+        certificateExpiryDate: _certificateExpiry,
+        submittedAt: _submitted,
+        approvedAt: _approved,
+        ...cloneSeed
+      } = baseApplication;
+
+      const baseClone = cloneSeed as unknown as InsertHomestayApplication;
+
+      const servicePayload: InsertHomestayApplication = {
+        ...baseClone,
+        userId: baseApplication.userId,
+        status: 'draft',
+        currentStage: null,
+        currentPage: 1,
+        districtOfficerId: null,
+        districtReviewDate: null,
+        districtNotes: null,
+        daId: null,
+        daReviewDate: null,
+        daForwardedDate: null,
+        stateOfficerId: null,
+        stateReviewDate: null,
+        stateNotes: null,
+        dtdoId: null,
+        dtdoReviewDate: null,
+        dtdoRemarks: null,
+        rejectionReason: null,
+        clarificationRequested: null,
+        siteInspectionScheduledDate: null,
+        siteInspectionCompletedDate: null,
+        siteInspectionOfficerId: null,
+        siteInspectionNotes: null,
+        siteInspectionOutcome: null,
+        siteInspectionFindings: null,
+        certificateNumber: null,
+        certificateIssuedDate: null,
+        certificateExpiryDate: null,
+        submittedAt: null,
+        approvedAt: null,
+        applicationKind: serviceType,
+        parentApplicationId: baseApplication.id,
+        parentApplicationNumber: baseApplication.applicationNumber ?? undefined,
+        parentCertificateNumber: baseApplication.certificateNumber ?? undefined,
+        inheritedCertificateValidUpto: baseApplication.certificateExpiryDate ?? undefined,
+        serviceRequestedAt: new Date(),
+        serviceNotes: serviceNotes ?? undefined,
+        serviceContext: serviceContext ?? undefined,
+        totalRooms: targetRooms.total,
+        singleBedRooms: targetRooms.single,
+        doubleBedRooms: targetRooms.double,
+        familySuites: targetRooms.family,
+        attachedWashrooms: Math.max(targetRooms.total, toRoomCount(baseApplication.attachedWashrooms)),
+      };
+
+      const created = await storage.createApplication(servicePayload);
+      const summary = await buildServiceSummary(baseApplication);
+
+      res.status(201).json({
+        message: "Service request created.",
+        serviceRequest: {
+          id: created.id,
+          applicationNumber: created.applicationNumber,
+          applicationKind: created.applicationKind,
+          status: created.status,
+        },
+        nextUrl: `/applications/new?draft=${created.id}`,
+        summary,
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid request", errors: error.flatten() });
+      }
+      if (error instanceof Error && error.message.toLowerCase().includes("room")) {
+        return res.status(400).json({ message: error.message });
+      }
+      console.error("[service-center] Failed to create request", error);
+      res.status(500).json({ message: "Failed to create service request" });
+    }
+  });
+
+  app.get("/api/existing-owners/settings", requireAuth, async (_req, res) => {
+    try {
+      const cutoff = await getExistingOwnerIntakeCutoff();
+      res.json({
+        minIssueDate: cutoff.toISOString(),
+      });
+    } catch (error) {
+      console.error("[existing-owners] Failed to load intake settings:", error);
+      res.status(500).json({ message: "Unable to load onboarding settings" });
+    }
+  });
+
+  app.get("/api/existing-owners/active", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const application = await findActiveExistingOwnerRequest(userId);
+      res.json({
+        application,
+      });
+    } catch (error) {
+      console.error("[existing-owners] Failed to load active onboarding request:", error);
+      res.status(500).json({ message: "Unable to load active onboarding request" });
+    }
+  });
+
+  app.post("/api/existing-owners", requireAuth, async (req, res) => {
+    try {
+      const payload = existingOwnerIntakeSchema.parse(req.body ?? {});
+      const userId = req.session.userId!;
+      const user = await storage.getUser(userId);
+
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      if (!user.aadhaarNumber) {
+        return res.status(400).json({
+          message: "Please add your Aadhaar number in profile before submitting existing owner intake.",
+        });
+      }
+
+      const existingActive = await findActiveExistingOwnerRequest(userId);
+      if (existingActive) {
+        return res.status(409).json({
+          message: "We already captured your existing license request. Please wait for the Admin-RC desk to verify.",
+          applicationId: existingActive.id,
+        });
+      }
+
+      const certificateIssuedDate = parseIsoDateOrNull(payload.rcIssueDate);
+      const certificateExpiryDate = parseIsoDateOrNull(payload.rcExpiryDate);
+
+      if (!certificateIssuedDate || !certificateExpiryDate) {
+        return res.status(400).json({ message: "Invalid certificate dates provided" });
+      }
+
+      const cutoffDate = await getExistingOwnerIntakeCutoff();
+      if (certificateIssuedDate < cutoffDate) {
+        return res.status(400).json({
+          message: `Certificates issued before ${cutoffDate.toISOString().slice(0, 10)} are not eligible for onboarding.`,
+        });
+      }
+      if (certificateExpiryDate <= certificateIssuedDate) {
+        return res.status(400).json({ message: "Certificate expiry must be after the issue date" });
+      }
+
+      const now = new Date();
+      const applicationNumber = generateLegacyApplicationNumber(payload.district);
+      const sanitizedGuardian = trimOptionalString(payload.guardianName);
+      const sanitizedNotes = trimOptionalString(payload.notes);
+      const derivedAreaSqm = Math.max(50, payload.totalRooms * 30);
+
+      const [application] = await db
+        .insert(homestayApplications)
+        .values({
+          userId,
+          applicationNumber,
+          applicationKind: 'renewal',
+          propertyName: trimRequiredString(payload.propertyName),
+          category: 'silver',
+          locationType: payload.locationType,
+          totalRooms: payload.totalRooms,
+          singleBedRooms: payload.totalRooms,
+          doubleBedRooms: 0,
+          familySuites: 0,
+          attachedWashrooms: payload.totalRooms,
+          district: trimRequiredString(payload.district),
+          tehsil: trimRequiredString(payload.tehsil),
+          block: null,
+          gramPanchayat: null,
+          address: trimRequiredString(payload.address),
+          pincode: trimRequiredString(payload.pincode),
+          ownerName: trimRequiredString(payload.ownerName),
+          ownerMobile: trimRequiredString(payload.ownerMobile || user.mobile || ""),
+          ownerEmail: trimOptionalString(payload.ownerEmail) ?? user.email ?? null,
+          ownerAadhaar: user.aadhaarNumber,
+          ownerGender: 'other',
+          propertyOwnership: 'owned',
+          projectType: 'existing_property',
+          propertyArea: String(derivedAreaSqm),
+          guardianName: sanitizedGuardian ?? null,
+          rooms: [
+            {
+              roomType: "Declared Rooms",
+              size: 0,
+              count: payload.totalRooms,
+            },
+          ],
+          status: 'legacy_rc_review',
+          currentStage: 'legacy_rc_review',
+          submittedAt: now,
+          createdAt: now,
+          updatedAt: now,
+          certificateNumber: trimRequiredString(payload.rcNumber),
+          certificateIssuedDate,
+          certificateExpiryDate,
+          parentCertificateNumber: trimRequiredString(payload.rcNumber),
+          parentApplicationNumber: trimRequiredString(payload.rcNumber),
+          serviceNotes:
+            sanitizedNotes ??
+            `Existing owner onboarding request captured on ${now.toLocaleDateString()} with RC #${payload.rcNumber}.`,
+          serviceContext: removeUndefined({
+            requestedRooms: {
+              total: payload.totalRooms,
+            },
+            legacyGuardianName: sanitizedGuardian ?? undefined,
+            inheritsCertificateExpiry: certificateExpiryDate.toISOString(),
+            requiresPayment: false,
+            note: sanitizedNotes ?? undefined,
+            legacyOnboarding: true,
+          }),
+        })
+        .returning();
+
+      if (!application) {
+        throw new Error("Failed to create legacy onboarding record");
+      }
+
+      const certificateDocuments = payload.certificateDocuments.map((file) => ({
+        applicationId: application.id,
+        documentType: "legacy_certificate",
+        fileName: file.fileName,
+        filePath: file.filePath,
+        fileSize: Math.max(1, Math.round(file.fileSize ?? 0)),
+        mimeType: file.mimeType || "application/pdf",
+      }));
+
+      const identityProofDocuments = payload.identityProofDocuments.map((file) => ({
+        applicationId: application.id,
+        documentType: "owner_identity_proof",
+        fileName: file.fileName,
+        filePath: file.filePath,
+        fileSize: Math.max(1, Math.round(file.fileSize ?? 0)),
+        mimeType: file.mimeType || "application/pdf",
+      }));
+
+      if (certificateDocuments.length > 0) {
+        await db.insert(documents).values(certificateDocuments);
+      }
+      if (identityProofDocuments.length > 0) {
+        await db.insert(documents).values(identityProofDocuments);
+      }
+
+      res.status(201).json({
+        message: "Existing owner submission received. An Admin-RC editor will verify the certificate shortly.",
+        application: {
+          id: application.id,
+          applicationNumber: application.applicationNumber,
+          status: application.status,
+        },
+      });
+    } catch (error) {
+      console.error("[existing-owners] Failed to capture onboarding request:", error);
+      if (isPgUniqueViolation(error, "homestay_applications_certificate_number_key")) {
+        const certificateNumber =
+          typeof req.body?.rcNumber === "string" ? req.body.rcNumber : undefined;
+        if (certificateNumber) {
+          const existing = await findApplicationByCertificateNumber(certificateNumber);
+          if (existing) {
+            return res.status(409).json({
+              message:
+                "This RC / certificate number is already registered in the system. Please open the captured request instead of submitting a new one.",
+              applicationId: existing.id,
+            });
+          }
+        }
+        return res.status(409).json({
+          message: "This RC / certificate number already exists in the system.",
+        });
+      }
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid input", errors: error.flatten() });
+      }
+      res.status(500).json({ message: "Failed to submit onboarding request" });
+    }
+  });
+
   app.get("/api/applications", requireAuth, async (req, res) => {
     try {
       const userId = req.session.userId!;
@@ -1623,8 +3982,49 @@ export async function registerRoutes(app: Express): Promise<Server> {
       } else if (user?.role === 'state_officer' || user?.role === 'admin') {
         applications = await storage.getApplicationsByStatus('state_review');
       }
+
+      let latestCorrectionMap: Map<
+        string,
+        { createdAt: Date | null; feedback: string | null }
+      > | null = null;
+
+      if (applications.length > 0) {
+        const applicationIds = applications.map((app) => app.id);
+        const correctionRows = await db
+          .select({
+            applicationId: applicationActions.applicationId,
+            createdAt: applicationActions.createdAt,
+            feedback: applicationActions.feedback,
+          })
+          .from(applicationActions)
+          .where(
+            and(
+              inArray(applicationActions.applicationId, applicationIds),
+              eq(applicationActions.action, "correction_resubmitted"),
+            ),
+          )
+          .orderBy(desc(applicationActions.createdAt));
+
+        latestCorrectionMap = new Map();
+        for (const row of correctionRows) {
+          if (!latestCorrectionMap.has(row.applicationId)) {
+            latestCorrectionMap.set(row.applicationId, {
+              createdAt: row.createdAt ?? null,
+              feedback: row.feedback ?? null,
+            });
+          }
+        }
+      }
+
+      const enrichedApplications =
+        latestCorrectionMap && latestCorrectionMap.size > 0
+          ? applications.map((application) => ({
+              ...application,
+              latestCorrection: latestCorrectionMap?.get(application.id) ?? null,
+            }))
+          : applications;
       
-      res.json({ applications });
+      res.json({ applications: enrichedApplications });
     } catch (error) {
       res.status(500).json({ message: "Failed to fetch applications" });
     }
@@ -1675,6 +4075,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         year,
         fromDate,
         toDate,
+        status,
+        recentLimit,
       } = (req.body ?? {}) as Record<string, string | undefined>;
 
       const userId = req.session.userId!;
@@ -1682,6 +4084,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (!user) {
         return res.status(401).json({ message: "User not found" });
+      }
+
+      const QUICK_VIEW_LIMITS = new Set([10, 20, 50]);
+      let recentLimitValue: number | undefined;
+      if (typeof recentLimit === "string" && recentLimit.trim()) {
+        const parsed = Number(recentLimit);
+        if (Number.isFinite(parsed) && QUICK_VIEW_LIMITS.has(parsed)) {
+          recentLimitValue = parsed;
+        }
       }
 
       const searchConditions: any[] = [];
@@ -1696,6 +4107,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       if (typeof ownerAadhaar === "string" && ownerAadhaar.trim()) {
         searchConditions.push(eq(homestayApplications.ownerAadhaar, ownerAadhaar.trim()));
+      }
+
+      if (typeof status === "string" && status.trim() && status.trim().toLowerCase() !== "all") {
+        searchConditions.push(eq(homestayApplications.status, status.trim()));
       }
 
       let rangeStart: Date | undefined;
@@ -1736,9 +4151,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         searchConditions.push(lte(homestayApplications.createdAt, rangeEnd));
       }
 
-      if (searchConditions.length === 0) {
+      if (searchConditions.length === 0 && !recentLimitValue) {
         return res.status(400).json({
-          message: "Provide at least one search filter (application number, phone, Aadhaar, or date range).",
+          message: "Provide at least one search filter (application number, phone, Aadhaar, date range, or quick view limit).",
         });
       }
 
@@ -1752,7 +4167,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (!user.district) {
           return res.status(400).json({ message: "Your profile is missing district information." });
         }
-        filters.push(eq(homestayApplications.district, user.district));
+        const districtCondition = buildDistrictWhereClause(homestayApplications.district, user.district);
+        filters.push(districtCondition);
       }
 
       const whereClause =
@@ -1763,7 +4179,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .from(homestayApplications)
         .where(whereClause)
         .orderBy(desc(homestayApplications.createdAt))
-        .limit(200);
+        .limit(recentLimitValue ?? 200);
 
       res.json({ results });
     } catch (error) {
@@ -1813,8 +4229,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(403).json({ message: "Access denied" });
       }
       
-      // Can only update if sent back for corrections or reverted to applicant by DA or DTDO
-      if (application.status !== 'sent_back_for_corrections' && application.status !== 'reverted_to_applicant' && application.status !== 'reverted_by_dtdo') {
+      // Can only update if sent back for corrections or reverted to applicant by DA/DTDO or objections raised post-inspection
+      if (
+        application.status !== 'sent_back_for_corrections' &&
+        application.status !== 'reverted_to_applicant' &&
+        application.status !== 'reverted_by_dtdo' &&
+        application.status !== 'objection_raised'
+      ) {
         return res.status(400).json({ message: "Application can only be updated when sent back for corrections" });
       }
       
@@ -1857,21 +4278,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         
         // Room & Category Details
         projectType: z.enum(['new_rooms', 'new_project']).optional(),
-        propertyArea: z.coerce.number().min(1, "Property area must be at least 1 sq meter").optional(),
+        propertyArea: z.coerce.number().min(0, "Property area cannot be negative").optional(),
         
         // Per Room Type Details (2025 Rules)
         singleBedRooms: z.coerce.number().int().min(0).optional(),
         singleBedBeds: z.coerce.number().int().min(0).optional(),
         singleBedRoomSize: z.coerce.number().min(0).optional(),
-        singleBedRoomRate: z.coerce.number().min(100, "Rate must be at least ₹100").optional(),
+        singleBedRoomRate: z.coerce.number().min(0, "Rate cannot be negative").optional(),
         doubleBedRooms: z.coerce.number().int().min(0).optional(),
         doubleBedBeds: z.coerce.number().int().min(0).optional(),
         doubleBedRoomSize: z.coerce.number().min(0).optional(),
-        doubleBedRoomRate: z.coerce.number().min(100, "Rate must be at least ₹100").optional(),
+        doubleBedRoomRate: z.coerce.number().min(0, "Rate cannot be negative").optional(),
         familySuites: z.coerce.number().int().min(0).max(3).optional(),
         familySuiteBeds: z.coerce.number().int().min(0).optional(),
         familySuiteSize: z.coerce.number().min(0).optional(),
-        familySuiteRate: z.coerce.number().min(100, "Rate must be at least ₹100").optional(),
+        familySuiteRate: z.coerce.number().min(0, "Rate cannot be negative").optional(),
         
         attachedWashrooms: z.coerce.number().int().min(0).optional(),
         gstin: z.string().optional().or(z.literal('')),
@@ -1998,6 +4419,50 @@ export async function registerRoutes(app: Express): Promise<Server> {
       ] as const;
 
       const normalizedUpdate: Record<string, unknown> = { ...validatedData };
+      if (normalizedUpdate.pincode !== undefined) {
+        normalizedUpdate.pincode = normalizeStringField(normalizedUpdate.pincode, application.pincode ?? "", 10);
+      }
+      if (normalizedUpdate.telephone !== undefined) {
+        normalizedUpdate.telephone = normalizeStringField(normalizedUpdate.telephone, application.telephone ?? "", 20);
+      }
+      if (normalizedUpdate.ownerMobile !== undefined) {
+        normalizedUpdate.ownerMobile = normalizeStringField(normalizedUpdate.ownerMobile, application.ownerMobile ?? "", 15);
+      }
+      if (normalizedUpdate.ownerAadhaar !== undefined) {
+        normalizedUpdate.ownerAadhaar = normalizeStringField(normalizedUpdate.ownerAadhaar, application.ownerAadhaar ?? "000000000000", 12);
+      }
+      if (normalizedUpdate.gstin !== undefined) {
+        normalizedUpdate.gstin = normalizeStringField(normalizedUpdate.gstin, application.gstin ?? "", 15);
+      }
+
+      const resolveFinalNumber = (incoming: unknown, fallback: unknown) => {
+        if (incoming === undefined) {
+          const fallbackNumber = toNumberFromUnknown(fallback);
+          return typeof fallbackNumber === "number" ? fallbackNumber : 0;
+        }
+        if (typeof incoming === "number") {
+          return incoming;
+        }
+        const coerced = toNumberFromUnknown(incoming);
+        return typeof coerced === "number" ? coerced : 0;
+      };
+
+      const finalSingleRooms = resolveFinalNumber(normalizedUpdate.singleBedRooms, application.singleBedRooms);
+      const finalDoubleRooms = resolveFinalNumber(normalizedUpdate.doubleBedRooms, application.doubleBedRooms);
+      const finalSuiteRooms = resolveFinalNumber(normalizedUpdate.familySuites, application.familySuites);
+      const finalSingleRate = resolveFinalNumber(normalizedUpdate.singleBedRoomRate, application.singleBedRoomRate);
+      const finalDoubleRate = resolveFinalNumber(normalizedUpdate.doubleBedRoomRate, application.doubleBedRoomRate);
+      const finalSuiteRate = resolveFinalNumber(normalizedUpdate.familySuiteRate, application.familySuiteRate);
+
+      if (finalSingleRooms > 0 && finalSingleRate < 100) {
+        return res.status(400).json({ message: "Single bed room rate must be at least ₹100 when single rooms are configured." });
+      }
+      if (finalDoubleRooms > 0 && finalDoubleRate < 100) {
+        return res.status(400).json({ message: "Double bed room rate must be at least ₹100 when double rooms are configured." });
+      }
+      if (finalSuiteRooms > 0 && finalSuiteRate < 100) {
+        return res.status(400).json({ message: "Family suite rate must be at least ₹100 when suites are configured." });
+      }
       const normalizedDocuments = normalizeDocumentsForPersistence(validatedData.documents);
       const updatePolicy = await getUploadPolicy();
       const updateDocsError = validateDocumentsAgainstPolicy(
@@ -2083,13 +4548,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       normalizedUpdate.totalRooms = totalRooms;
 
+      const nextCorrectionCount = (application.correctionSubmissionCount ?? 0) + 1;
+
       const updatedApplication = await storage.updateApplication(id, {
         ...normalizedUpdate,
         status: 'submitted',
         submittedAt: new Date(),
         clarificationRequested: null, // Clear DA feedback after resubmission
         dtdoRemarks: null, // Clear DTDO feedback after resubmission
+        districtNotes: null,
+        correctionSubmissionCount: nextCorrectionCount,
       } as Partial<HomestayApplication>);
+
+      await logApplicationAction({
+        applicationId: id,
+        actorId: userId,
+        action: "correction_resubmitted",
+        previousStatus: application.status,
+        newStatus: "submitted",
+        feedback: `${CORRECTION_CONSENT_TEXT} (cycle ${nextCorrectionCount})`,
+      });
 
       if (normalizedDocuments) {
         await storage.deleteDocumentsByApplication(id);
@@ -2141,7 +4619,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // District officers can only review applications in their district
-      if (user.role === "district_officer" && application.district !== user.district) {
+      if (user.role === "district_officer" && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only review applications in your district" });
       }
 
@@ -2252,6 +4730,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
         siteInspectionOfficerId: user.id,
         siteInspectionNotes: notes,
       });
+      await logApplicationAction({
+        applicationId: id,
+        actorId: user.id,
+        action: "inspection_scheduled",
+        previousStatus: application.status,
+        newStatus: "site_inspection_scheduled",
+        feedback: notes || undefined,
+      });
+
+      const inspectionOwner = await storage.getUser(application.userId);
+      const inspectionDate = scheduledDate
+        ? format(new Date(scheduledDate), "dd MMM yyyy")
+        : updated?.siteInspectionScheduledDate
+          ? format(new Date(updated.siteInspectionScheduledDate), "dd MMM yyyy")
+          : "";
+      queueNotification("inspection_scheduled", {
+        application: updated,
+        owner: inspectionOwner ?? null,
+        extras: {
+          INSPECTION_DATE: inspectionDate,
+        },
+      });
 
       res.json({ application: updated, message: "Site inspection scheduled" });
     } catch (error) {
@@ -2325,6 +4825,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const updated = await storage.updateApplication(id, updateData);
+      await logApplicationAction({
+        applicationId: id,
+        actorId: user.id,
+        action: "inspection_completed",
+        previousStatus: application.status,
+        newStatus: newStatus,
+        feedback: notes || clarificationRequested || null,
+      });
 
       res.json({ application: updated, message: "Inspection completed successfully" });
     } catch (error) {
@@ -2333,51 +4841,242 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get Application Action History (disabled - table doesn't exist yet)
-  // app.get("/api/applications/:id/actions", requireRole('district_officer', 'state_officer', 'property_owner'), async (req, res) => {
-  //   try {
-  //     const actions = await storage.getApplicationActions(req.params.id);
-  //     res.json({ actions });
-  //   } catch (error) {
-  //     res.status(500).json({ message: "Failed to fetch application history" });
-  //   }
-  // });
+  app.get("/api/applications/:id/timeline", requireAuth, async (req, res) => {
+    try {
+      const application = await storage.getApplication(req.params.id);
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      const viewer = await storage.getUser(req.session.userId!);
+      if (!canViewApplicationTimeline(viewer ?? null, application)) {
+        return res.status(403).json({ message: "You are not allowed to view this timeline" });
+      }
+
+      const actions = await storage.getApplicationActions(req.params.id);
+      const actorIds = Array.from(
+        new Set(
+          actions
+            .map((action) => action.officerId)
+            .filter((value): value is string => Boolean(value)),
+        ),
+      );
+
+      const actorMap = new Map<string, ReturnType<typeof summarizeTimelineActor>>();
+      await Promise.all(
+        actorIds.map(async (actorId) => {
+          const actor = await storage.getUser(actorId);
+          if (actor) {
+            actorMap.set(actorId, summarizeTimelineActor(actor));
+          }
+        }),
+      );
+
+      const timeline = actions.map((action) => ({
+        id: action.id,
+        action: action.action,
+        previousStatus: action.previousStatus ?? null,
+        newStatus: action.newStatus ?? null,
+        feedback: action.feedback ?? null,
+        createdAt: action.createdAt,
+        actor: action.officerId ? actorMap.get(action.officerId) ?? null : null,
+      }));
+
+      res.json({ timeline });
+    } catch (error) {
+      console.error("[timeline] Failed to fetch timeline:", error);
+      res.status(500).json({ message: "Failed to fetch timeline" });
+    }
+  });
+
+  app.get("/api/dtdo/applications/:id/timeline", requireAuth, async (req, res) => {
+    const viewer = await storage.getUser(req.session.userId!);
+    if (!viewer || (viewer.role !== 'district_tourism_officer' && viewer.role !== 'district_officer')) {
+      return res.status(403).json({ message: "You are not allowed to view this timeline" });
+    }
+    try {
+      const application = await storage.getApplication(req.params.id);
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      const actions = await storage.getApplicationActions(req.params.id);
+      const actorIds = Array.from(
+        new Set(
+          actions
+            .map((action) => action.officerId)
+            .filter((value): value is string => Boolean(value)),
+        ),
+      );
+      const actorMap = new Map<string, ReturnType<typeof summarizeTimelineActor>>();
+      await Promise.all(
+        actorIds.map(async (actorId) => {
+          const actor = await storage.getUser(actorId);
+          if (actor) {
+            actorMap.set(actorId, summarizeTimelineActor(actor));
+          }
+        }),
+      );
+
+      const timeline = actions.map((action) => ({
+        id: action.id,
+        action: action.action,
+        previousStatus: action.previousStatus ?? null,
+        newStatus: action.newStatus ?? null,
+        feedback: action.feedback ?? null,
+        createdAt: action.createdAt,
+        actor: action.officerId ? actorMap.get(action.officerId) ?? null : null,
+      }));
+
+      res.json({ timeline });
+    } catch (error) {
+      console.error("[dtdo timeline] Failed to fetch timeline:", error);
+      res.status(500).json({ message: "Failed to fetch timeline" });
+    }
+  });
+
+  app.get("/api/applications/:id/inspection-report", requireAuth, async (req, res) => {
+    try {
+      const application = await storage.getApplication(req.params.id);
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      const viewer = await storage.getUser(req.session.userId!);
+      if (!canViewInspectionReport(viewer ?? null, application)) {
+        return res.status(403).json({ message: "You are not allowed to view this inspection report" });
+      }
+
+      const [report] = await db
+        .select()
+        .from(inspectionReports)
+        .where(eq(inspectionReports.applicationId, application.id))
+        .orderBy(desc(inspectionReports.submittedDate))
+        .limit(1);
+
+      if (!report) {
+        return res.status(404).json({ message: "Inspection report not available yet" });
+      }
+
+      const [order] = await db
+        .select()
+        .from(inspectionOrders)
+        .where(eq(inspectionOrders.id, report.inspectionOrderId))
+        .limit(1);
+
+      const owner = await storage.getUser(application.userId);
+      const da = await storage.getUser(report.submittedBy);
+      const dtdo = order?.scheduledBy ? await storage.getUser(order.scheduledBy) : application.dtdoId ? await storage.getUser(application.dtdoId) : null;
+
+      res.json({
+        report,
+        inspectionOrder: order ?? null,
+        application: {
+          id: application.id,
+          applicationNumber: application.applicationNumber,
+          propertyName: application.propertyName,
+          district: application.district,
+          tehsil: application.tehsil,
+          address: application.address,
+          category: application.category,
+          status: application.status,
+          siteInspectionOutcome: application.siteInspectionOutcome ?? null,
+          siteInspectionNotes: application.siteInspectionNotes ?? null,
+          siteInspectionCompletedDate: application.siteInspectionCompletedDate ?? null,
+        },
+        owner: owner
+          ? {
+              id: owner.id,
+              fullName: owner.fullName,
+              mobile: owner.mobile,
+              email: owner.email ?? null,
+            }
+          : null,
+        da: da
+          ? {
+              id: da.id,
+              fullName: da.fullName,
+              mobile: da.mobile,
+              district: da.district ?? null,
+            }
+          : null,
+        dtdo: dtdo
+          ? {
+              id: dtdo.id,
+              fullName: dtdo.fullName,
+              mobile: dtdo.mobile,
+              district: dtdo.district ?? null,
+            }
+          : null,
+      });
+    } catch (error) {
+      console.error("[inspection] Failed to fetch inspection report:", error);
+      res.status(500).json({ message: "Failed to fetch inspection report" });
+    }
+  });
 
   // ========================================
   // DEALING ASSISTANT (DA) ROUTES
   // ========================================
 
-  // Update DA profile
-  app.patch("/api/da/profile", requireRole('dealing_assistant'), async (req, res) => {
+  const handleStaffProfileUpdate = async (req: Request, res: Response) => {
     try {
       const userId = req.session.userId!;
-      const { fullName, email, mobile } = req.body;
+      const payload = staffProfileSchema.parse(req.body);
 
-      // Validate input
-      if (!fullName || fullName.trim().length < 3) {
-        return res.status(400).json({ message: "Full name must be at least 3 characters" });
+      const userRecord = await storage.getUser(userId);
+      if (!userRecord) {
+        return res.status(404).json({ message: "User not found" });
       }
 
-      if (mobile && !/^[6-9]\d{9}$/.test(mobile)) {
-        return res.status(400).json({ message: "Invalid mobile number" });
+      const normalizedMobile = normalizeStringField(payload.mobile, "", 15);
+      if (!normalizedMobile) {
+        return res.status(400).json({ message: "Mobile number is required" });
       }
 
-      // Update user
-      const updated = await storage.updateUser(userId, {
-        fullName: fullName.trim(),
-        email: email?.trim() || null,
-        mobile: mobile ? mobile.trim() : undefined,
+      if (normalizedMobile !== userRecord.mobile) {
+        const existingUser = await storage.getUserByMobile(normalizedMobile);
+        if (existingUser && existingUser.id !== userRecord.id) {
+          return res.status(400).json({ message: "Another account already uses this mobile number" });
+        }
+      }
+
+      const updates: Partial<User> = {
+        fullName: normalizeStringField(payload.fullName, userRecord.fullName, 255),
+        firstName: toNullableString(payload.firstName, 100),
+        lastName: toNullableString(payload.lastName, 100),
+        mobile: normalizedMobile,
+        email: toNullableString(payload.email, 255),
+        alternatePhone: toNullableString(payload.alternatePhone, 15),
+        designation: toNullableString(payload.designation, 120),
+        department: toNullableString(payload.department, 120),
+        employeeId: toNullableString(payload.employeeId, 50),
+        officeAddress: toNullableString(payload.officeAddress, 500),
+        officePhone: toNullableString(payload.officePhone, 20),
+      };
+
+      const updatedUser = await storage.updateUser(userId, updates);
+      if (!updatedUser) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      res.json({
+        user: formatUserForResponse(updatedUser),
+        message: "Profile updated successfully",
       });
-
-      res.json({ user: updated, message: "Profile updated successfully" });
     } catch (error) {
-      console.error("[da] Failed to update profile:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({
+          message: error.errors[0].message,
+          errors: error.errors,
+        });
+      }
+      console.error("[staff-profile] Failed to update profile:", error);
       res.status(500).json({ message: "Failed to update profile" });
     }
-  });
+  };
 
-  // Change DA password
-  app.post("/api/da/change-password", requireRole('dealing_assistant'), async (req, res) => {
+  const handleStaffPasswordChange = async (req: Request, res: Response) => {
     try {
       const userId = req.session.userId!;
       const { currentPassword, newPassword } = req.body;
@@ -2386,34 +5085,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Current and new password are required" });
       }
 
-      if (newPassword.length < 6) {
+      if (typeof newPassword !== "string" || newPassword.length < 6) {
         return res.status(400).json({ message: "New password must be at least 6 characters" });
       }
 
-      // Get user
-      const user = await storage.getUser(userId);
-      if (!user) {
+      const userRecord = await storage.getUser(userId);
+      if (!userRecord) {
         return res.status(404).json({ message: "User not found" });
       }
 
-      // Verify current password
-      const isValid = await bcrypt.compare(currentPassword, user.password || "");
+      const isValid = await bcrypt.compare(currentPassword, userRecord.password || "");
       if (!isValid) {
         return res.status(401).json({ message: "Current password is incorrect" });
       }
 
-      // Hash new password
       const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-      // Update password
       await storage.updateUser(userId, { password: hashedPassword });
 
       res.json({ message: "Password changed successfully" });
     } catch (error) {
-      console.error("[da] Failed to change password:", error);
+      console.error("[staff-profile] Failed to change password:", error);
       res.status(500).json({ message: "Failed to change password" });
     }
-  });
+  };
+
+  app.patch("/api/staff/profile", requireRole(...STAFF_PROFILE_ROLES), handleStaffProfileUpdate);
+  app.patch("/api/da/profile", requireRole('dealing_assistant'), handleStaffProfileUpdate);
+  app.patch("/api/dtdo/profile", requireRole('district_tourism_officer', 'district_officer'), handleStaffProfileUpdate);
+
+  app.post("/api/staff/change-password", requireRole(...STAFF_PROFILE_ROLES), handleStaffPasswordChange);
+  app.post("/api/da/change-password", requireRole('dealing_assistant'), handleStaffPasswordChange);
+  app.post("/api/dtdo/change-password", requireRole('district_tourism_officer', 'district_officer'), handleStaffPasswordChange);
+  app.post("/api/owner/change-password", requireRole('property_owner'), handleStaffPasswordChange);
 
   // Get applications for DA (district-specific)
   app.get("/api/da/applications", requireRole('dealing_assistant'), async (req, res) => {
@@ -2425,21 +5128,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "DA must be assigned to a district" });
       }
 
+      const districtCondition = buildDistrictWhereClause(homestayApplications.district, user.district);
+
       // Get all applications from this DA's district ordered by most recent
       const allApplications = await db
         .select()
         .from(homestayApplications)
-        .where(eq(homestayApplications.district, user.district))
+        .where(districtCondition)
         .orderBy(desc(homestayApplications.createdAt));
 
       // Enrich with owner information
       const applicationsWithOwner = await Promise.all(
         allApplications.map(async (app) => {
           const owner = await storage.getUser(app.userId);
+          const [latestCorrection] = await db
+            .select({
+              createdAt: applicationActions.createdAt,
+              feedback: applicationActions.feedback,
+            })
+            .from(applicationActions)
+            .where(
+              and(
+                eq(applicationActions.applicationId, app.id),
+                eq(applicationActions.action, 'correction_resubmitted'),
+              ),
+            )
+            .orderBy(desc(applicationActions.createdAt))
+            .limit(1);
           return {
             ...app,
             ownerName: owner?.fullName || 'Unknown',
             ownerMobile: owner?.mobile || 'N/A',
+            latestCorrection,
           };
         })
       );
@@ -2462,11 +5182,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const documents = await storage.getDocumentsByApplication(req.params.id);
+      const [sendBackSetting] = await db
+        .select()
+        .from(systemSettings)
+        .where(eq(systemSettings.settingKey, DA_SEND_BACK_SETTING_KEY))
+        .limit(1);
+      const sendBackEnabled = normalizeBooleanSetting(
+        sendBackSetting?.settingValue,
+        false,
+      );
+      const legacyForwardEnabled = await getLegacyForwardEnabled();
+
+      const correctionHistory = await db
+        .select({
+          id: applicationActions.id,
+          createdAt: applicationActions.createdAt,
+          feedback: applicationActions.feedback,
+        })
+        .from(applicationActions)
+        .where(
+          and(
+            eq(applicationActions.applicationId, req.params.id),
+            eq(applicationActions.action, 'correction_resubmitted'),
+          ),
+        )
+        .orderBy(desc(applicationActions.createdAt));
 
       res.json({
         application: detail.application,
         owner: detail.owner,
         documents,
+        sendBackEnabled,
+        legacyForwardEnabled,
+        correctionHistory,
       });
     } catch (error) {
       console.error("[da] Failed to fetch application details:", error);
@@ -2477,6 +5225,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Start scrutiny (change status to under_scrutiny)
   app.post("/api/da/applications/:id/start-scrutiny", requireRole('dealing_assistant'), async (req, res) => {
     try {
+      const userId = req.session.userId!;
       const application = await storage.getApplication(req.params.id);
       if (!application) {
         return res.status(404).json({ message: "Application not found" });
@@ -2487,6 +5236,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       await storage.updateApplication(req.params.id, { status: 'under_scrutiny' });
+      await logApplicationAction({
+        applicationId: req.params.id,
+        actorId: userId,
+        action: "start_scrutiny",
+        previousStatus: application.status,
+        newStatus: "under_scrutiny",
+      });
       
       res.json({ message: "Application is now under scrutiny" });
     } catch (error) {
@@ -2503,6 +5259,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       if (!verifications || !Array.isArray(verifications)) {
         return res.status(400).json({ message: "Invalid verification data" });
+      }
+
+      const targetApplication = await storage.getApplication(req.params.id);
+      if (!targetApplication) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+      if (targetApplication.status !== 'under_scrutiny' && targetApplication.status !== 'legacy_rc_review') {
+        return res.status(400).json({ message: "Document updates are locked once the application leaves scrutiny" });
       }
 
       // Update each document's verification status
@@ -2529,17 +5293,62 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/da/applications/:id/forward-to-dtdo", requireRole('dealing_assistant'), async (req, res) => {
     try {
       const { remarks } = req.body;
+      const userId = req.session.userId!;
+      const trimmedRemarks = typeof remarks === "string" ? remarks.trim() : "";
+      if (!trimmedRemarks) {
+        return res.status(400).json({ message: "Scrutiny remarks are required before forwarding." });
+      }
       const application = await storage.getApplication(req.params.id);
       
       if (!application) {
         return res.status(404).json({ message: "Application not found" });
       }
 
-      if (application.status !== 'under_scrutiny') {
+      if (application.status !== 'under_scrutiny' && application.status !== 'legacy_rc_review') {
         return res.status(400).json({ message: "Only applications under scrutiny can be forwarded" });
       }
 
-      await storage.updateApplication(req.params.id, { status: 'forwarded_to_dtdo' } as Partial<HomestayApplication>);
+      const legacyForwardEnabled = await getLegacyForwardEnabled();
+      if (isLegacyApplicationRecord(application) && !legacyForwardEnabled) {
+        return res.status(400).json({
+          message: "Legacy RC onboarding cases must be completed by the DA. DTDO escalation is currently disabled.",
+        });
+      }
+
+      const docs = await storage.getDocumentsByApplication(req.params.id);
+      if (docs.length === 0) {
+        return res.status(400).json({ message: "Upload and verify required documents before forwarding" });
+      }
+
+      const pendingDoc = docs.find((doc) => !doc.verificationStatus || doc.verificationStatus === 'pending');
+      if (pendingDoc) {
+        return res.status(400).json({ message: "Verify every document (mark Verified / Needs correction / Rejected) before forwarding" });
+      }
+
+      await storage.updateApplication(req.params.id, {
+        status: 'forwarded_to_dtdo',
+        daId: userId,
+        daReviewDate: new Date(),
+        daForwardedDate: new Date(),
+        daRemarks: trimmedRemarks || null,
+      } as Partial<HomestayApplication>);
+      await logApplicationAction({
+        applicationId: req.params.id,
+        actorId: userId,
+        action: "forwarded_to_dtdo",
+        previousStatus: application.status,
+        newStatus: "forwarded_to_dtdo",
+        feedback: trimmedRemarks || null,
+      });
+      const daOwner = await storage.getUser(application.userId);
+      const forwardedApplication = {
+        ...application,
+        status: 'forwarded_to_dtdo',
+      } as HomestayApplication;
+      queueNotification("forwarded_to_dtdo", {
+        application: forwardedApplication,
+        owner: daOwner ?? null,
+      });
       
       // TODO: Add timeline entry with remarks when timeline system is implemented
       
@@ -2564,14 +5373,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "Application not found" });
       }
 
-      if (application.status !== 'under_scrutiny') {
+      if (application.status !== 'under_scrutiny' && application.status !== 'legacy_rc_review') {
         return res.status(400).json({ message: "Only applications under scrutiny can be sent back" });
       }
 
-      await storage.updateApplication(req.params.id, { status: 'reverted_to_applicant' } as Partial<HomestayApplication>);
-      
-      // TODO: Add timeline entry with reason when timeline system is implemented
-      // TODO: Send notification to applicant
+      const sanitizedReason = reason.trim();
+      const updatedByDa = await storage.updateApplication(req.params.id, { status: 'reverted_to_applicant' } as Partial<HomestayApplication>);
+      await logApplicationAction({
+        applicationId: req.params.id,
+        actorId: req.session.userId!,
+        action: "reverted_by_da",
+        previousStatus: application.status,
+        newStatus: "reverted_to_applicant",
+        feedback: sanitizedReason,
+      });
+      const owner = await storage.getUser(application.userId);
+      queueNotification("da_send_back", {
+        application: updatedByDa ?? { ...application, status: "reverted_to_applicant" },
+        owner: owner ?? null,
+        extras: { REMARKS: sanitizedReason },
+      });
       
       res.json({ message: "Application sent back to applicant successfully" });
     } catch (error) {
@@ -2579,6 +5400,113 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.status(500).json({ message: "Failed to send back application" });
     }
   });
+
+  const LEGACY_VERIFY_ALLOWED_STATUSES = new Set([
+    "legacy_rc_review",
+    "submitted",
+    "under_scrutiny",
+    "forwarded_to_dtdo",
+    "dtdo_review",
+  ]);
+
+  app.post(
+    "/api/applications/:id/legacy-verify",
+    requireRole("dealing_assistant", "district_tourism_officer", "district_officer"),
+    async (req, res) => {
+      try {
+        const { remarks } = req.body ?? {};
+        const trimmedRemarks = typeof remarks === "string" ? remarks.trim() : "";
+        const actorId = req.session.userId!;
+        const actor = await storage.getUser(actorId);
+        const application = await storage.getApplication(req.params.id);
+
+        if (!application) {
+          return res.status(404).json({ message: "Application not found" });
+        }
+
+        if (!isServiceApplicationKind(application.applicationKind)) {
+          return res
+            .status(400)
+            .json({ message: "Legacy verification is only available for service requests." });
+        }
+
+        if (!application.status || !LEGACY_VERIFY_ALLOWED_STATUSES.has(application.status)) {
+          return res.status(400).json({
+            message: "Application is not in a state that allows legacy verification.",
+          });
+        }
+
+        if (actor?.district && !districtsMatch(actor.district, application.district)) {
+          return res
+            .status(403)
+            .json({ message: "You can only process applications from your district." });
+        }
+
+        const now = new Date();
+        const updates: Partial<HomestayApplication> = {
+          status: "approved",
+          currentStage: "final",
+          approvedAt: now,
+        };
+
+        if (!application.certificateIssuedDate) {
+          updates.certificateIssuedDate = now;
+        }
+
+        if (
+          actor?.role === "district_tourism_officer" ||
+          actor?.role === "district_officer"
+        ) {
+          updates.dtdoId = actorId;
+          updates.dtdoReviewDate = now;
+          updates.dtdoRemarks = trimmedRemarks || application.dtdoRemarks || null;
+        } else if (actor?.role === "dealing_assistant") {
+          updates.daId = actorId;
+          updates.daReviewDate = now;
+          updates.daRemarks = trimmedRemarks || application.daRemarks || null;
+        }
+
+        const updated = await storage.updateApplication(req.params.id, updates);
+        await logApplicationAction({
+          applicationId: req.params.id,
+          actorId,
+          action: "legacy_rc_verified",
+          previousStatus: application.status,
+          newStatus: "approved",
+          feedback: trimmedRemarks || undefined,
+        });
+
+        res.json({
+          message: "Legacy RC verified successfully.",
+          application: updated ?? { ...application, ...updates },
+        });
+      } catch (error) {
+        console.error("[legacy] Failed to verify application:", error);
+        res.status(500).json({ message: "Failed to verify legacy request" });
+      }
+    },
+  );
+
+  app.get(
+    "/api/legacy/settings",
+    requireRole(
+      "dealing_assistant",
+      "district_tourism_officer",
+      "district_officer",
+      "admin",
+      "super_admin",
+      "admin_rc",
+    ),
+    async (_req, res) => {
+      try {
+        const forwardEnabled = await getLegacyForwardEnabled();
+        res.json({ forwardEnabled });
+      } catch (error) {
+        console.error("[legacy] Failed to load settings", error);
+        res.status(500).json({ message: "Failed to load legacy settings" });
+      }
+    },
+  );
 
   // ========================================
   // DTDO (District Tourism Development Officer) ROUTES
@@ -2594,12 +5522,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "DTDO must be assigned to a district" });
       }
 
+      const districtCondition = buildDistrictWhereClause(homestayApplications.district, user.district);
+
       // Get all applications from this DTDO's district ordered by most recent
       const allApplications = await db
         .select()
         .from(homestayApplications)
-        .where(eq(homestayApplications.district, user.district))
+        .where(districtCondition)
         .orderBy(desc(homestayApplications.createdAt));
+
+      let latestCorrectionMap: Map<
+        string,
+        { createdAt: Date | null; feedback: string | null }
+      > | null = null;
+      if (allApplications.length > 0) {
+        const applicationIds = allApplications.map((app) => app.id);
+        const correctionRows = await db
+          .select({
+            applicationId: applicationActions.applicationId,
+            createdAt: applicationActions.createdAt,
+            feedback: applicationActions.feedback,
+          })
+          .from(applicationActions)
+          .where(
+            and(
+              inArray(applicationActions.applicationId, applicationIds),
+              eq(applicationActions.action, "correction_resubmitted"),
+            ),
+          )
+          .orderBy(desc(applicationActions.createdAt));
+        latestCorrectionMap = new Map();
+        for (const row of correctionRows) {
+          if (!latestCorrectionMap.has(row.applicationId)) {
+            latestCorrectionMap.set(row.applicationId, {
+              createdAt: row.createdAt ?? null,
+              feedback: row.feedback ?? null,
+            });
+          }
+        }
+      }
 
       // Enrich with owner and DA information
       const applicationsWithDetails = await Promise.all(
@@ -2619,6 +5580,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ownerName: owner?.fullName || 'Unknown',
             ownerMobile: owner?.mobile || 'N/A',
             daName,
+            latestCorrection: latestCorrectionMap?.get(app.id) ?? null,
           };
         })
       );
@@ -2641,8 +5603,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "Application not found" });
       }
 
-      // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      // Verify application is from DTDO's district (handles labels like "Hamirpur (serving Una)")
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only access applications from your district" });
       }
 
@@ -2659,6 +5621,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
         daInfo = da ? { fullName: da.fullName, mobile: da.mobile } : null;
       }
 
+      const correctionHistory = await db
+        .select({
+          id: applicationActions.id,
+          createdAt: applicationActions.createdAt,
+          feedback: applicationActions.feedback,
+        })
+        .from(applicationActions)
+        .where(
+          and(
+            eq(applicationActions.applicationId, req.params.id),
+            eq(applicationActions.action, 'correction_resubmitted'),
+          ),
+        )
+        .orderBy(desc(applicationActions.createdAt));
+
       res.json({
         application,
         owner: owner ? {
@@ -2668,6 +5645,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         } : null,
         documents,
         daInfo,
+        correctionHistory,
       });
     } catch (error) {
       console.error("[dtdo] Failed to fetch application details:", error);
@@ -2692,7 +5670,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
@@ -2708,6 +5686,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         dtdoRemarks: trimmedRemarks,
         dtdoId: userId,
         dtdoReviewDate: new Date(),
+      });
+      await logApplicationAction({
+        applicationId: req.params.id,
+        actorId: userId,
+        action: "dtdo_accept",
+        previousStatus: application.status,
+        newStatus: "dtdo_review",
+        feedback: trimmedRemarks,
       });
 
       res.json({ message: "Application accepted. Proceed to schedule inspection.", applicationId: req.params.id });
@@ -2735,7 +5721,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
@@ -2773,16 +5759,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
+      const trimmedRemarks = remarks.trim();
       // Update application status to reverted_by_dtdo
-      await storage.updateApplication(req.params.id, {
+      const revertedApplication = await storage.updateApplication(req.params.id, {
         status: 'reverted_by_dtdo',
-        dtdoRemarks: remarks,
+        dtdoRemarks: trimmedRemarks,
         dtdoId: userId,
         dtdoReviewDate: new Date(),
+      });
+      await logApplicationAction({
+        applicationId: req.params.id,
+        actorId: userId,
+        action: "dtdo_revert",
+        previousStatus: application.status,
+        newStatus: "reverted_by_dtdo",
+        feedback: trimmedRemarks,
+      });
+      const owner = await storage.getUser(application.userId);
+      queueNotification("dtdo_revert", {
+        application: revertedApplication ?? { ...application, status: "reverted_by_dtdo" },
+        owner: owner ?? null,
+        extras: { REMARKS: trimmedRemarks },
       });
 
       res.json({ message: "Application reverted to applicant successfully" });
@@ -2802,19 +5803,52 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "DTDO must be assigned to a district" });
       }
 
-      // Get all DAs from the same district
-      const allUsers = await db
+      const districtCondition = buildDistrictWhereClause(users.district, user.district);
+      const potentialUsers = await db
         .select()
         .from(users)
-        .where(eq(users.district, user.district));
+        .where(districtCondition);
 
-      const das = allUsers
-        .filter(u => u.role === 'dealing_assistant')
-        .map(da => ({
-          id: da.id,
-          fullName: da.fullName,
-          mobile: da.mobile,
-        }));
+      const manifestEntries = getDistrictStaffManifest().filter((entry) =>
+        districtsMatch(entry.districtLabel, user.district),
+      );
+      const canonicalUsernameTokens = new Set(
+        manifestEntries.map((entry) => entry.da.username.trim().toLowerCase()),
+      );
+      const canonicalMobiles = new Set(manifestEntries.map((entry) => entry.da.mobile.trim()));
+
+      let filteredUsers = potentialUsers.filter(
+        (u) =>
+          u.role === 'dealing_assistant' &&
+          districtsMatch(user.district, u.district ?? user.district),
+      );
+
+      if (manifestEntries.length > 0) {
+        const manifestOnly = filteredUsers.filter((u) => {
+          const normalizedUsername = (u.username || "").trim().toLowerCase();
+          const normalizedMobile = (u.mobile || "").trim();
+          return (
+            (normalizedUsername && canonicalUsernameTokens.has(normalizedUsername)) ||
+            (normalizedMobile && canonicalMobiles.has(normalizedMobile))
+          );
+        });
+        if (manifestOnly.length > 0) {
+          filteredUsers = manifestOnly;
+        }
+      }
+
+      const das = filteredUsers.map((da) => ({
+        id: da.id,
+        fullName: da.fullName,
+        mobile: da.mobile,
+      }));
+
+      console.log("[dtdo] available-das", {
+        officer: user.username,
+        district: user.district,
+        manifestMatches: manifestEntries.map((entry) => entry.da.username),
+        options: das.map((da) => ({ id: da.id, fullName: da.fullName, mobile: da.mobile })),
+      });
 
       res.json({ das });
     } catch (error) {
@@ -2828,9 +5862,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const { applicationId, inspectionDate, assignedTo, specialInstructions } = req.body;
       const userId = req.session.userId!;
+      const user = await storage.getUser(userId);
 
       if (!applicationId || !inspectionDate || !assignedTo) {
         return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      if (!user || !user.district) {
+        return res.status(400).json({ message: "DTDO must be assigned to a district" });
       }
 
       const application = await storage.getApplication(applicationId);
@@ -2838,9 +5877,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "Application not found" });
       }
 
+      if (!districtsMatch(user.district, application.district)) {
+        return res.status(403).json({ message: "You can only process applications from your district" });
+      }
+
       // Verify application status - should be in dtdo_review after acceptance
       if (application.status !== 'dtdo_review') {
         return res.status(400).json({ message: "Application must be accepted by DTDO before scheduling inspection" });
+      }
+
+      const assignedDaUser = await storage.getUser(assignedTo);
+      if (
+        !assignedDaUser ||
+        assignedDaUser.role !== 'dealing_assistant' ||
+        !districtsMatch(user.district, assignedDaUser.district)
+      ) {
+        return res.status(400).json({ message: "Selected DA is not available for your district" });
       }
 
       // Create inspection order
@@ -2858,16 +5910,201 @@ export async function registerRoutes(app: Express): Promise<Server> {
           status: 'scheduled',
         })
         .returning();
+      console.log("[dtdo] inspection scheduled", {
+        applicationId,
+        applicationNumber: application.applicationNumber,
+        assignedDa: assignedDaUser.username,
+        assignedDaId: assignedDaUser.id,
+        assignedDaMobile: assignedDaUser.mobile,
+        district: assignedDaUser.district,
+      });
 
       // Only NOW update the application status to inspection_scheduled
       await storage.updateApplication(applicationId, {
         status: 'inspection_scheduled',
+        daId: assignedDaUser.id,
       });
+
+      const ownerUser = await storage.getUser(application.userId);
+
+      const scheduleDisplay = format(new Date(inspectionDate), "dd MMM yyyy, hh:mm a");
+      const notificationsToSend: Promise<void>[] = [];
+
+      if (assignedDaUser) {
+        notificationsToSend.push(
+          createInAppNotification({
+            userId: assignedDaUser.id,
+            applicationId,
+            type: "inspection_schedule",
+            title: "New Inspection Assigned",
+            message: `You have been assigned to inspect ${application.propertyName} on ${scheduleDisplay}.`,
+          }),
+        );
+      }
+
+      if (ownerUser) {
+        const ownerMessageParts = [
+          `Your site inspection has been scheduled for ${scheduleDisplay}.`,
+          specialInstructions ? `Instructions: ${specialInstructions}` : null,
+        ].filter(Boolean);
+
+        notificationsToSend.push(
+          createInAppNotification({
+            userId: ownerUser.id,
+            applicationId,
+            type: "inspection_schedule_owner",
+            title: "Inspection Scheduled",
+            message: ownerMessageParts.join(" "),
+          }),
+        );
+      }
+
+      if (notificationsToSend.length > 0) {
+        await Promise.allSettled(notificationsToSend);
+      }
 
       res.json({ message: "Inspection scheduled successfully", inspectionOrder: newInspectionOrder[0] });
     } catch (error) {
       console.error("[dtdo] Failed to schedule inspection:", error);
       res.status(500).json({ message: "Failed to schedule inspection" });
+    }
+  });
+
+  app.get("/api/applications/:id/inspection-schedule", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const application = await storage.getApplication(id);
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+
+      const userId = req.session.userId!;
+      const requester = await storage.getUser(userId);
+      const isOwner = application.userId === userId;
+      const officerRoles = new Set([
+        'district_tourism_officer',
+        'district_officer',
+        'dealing_assistant',
+        'state_officer',
+        'admin',
+        'super_admin',
+      ]);
+
+      if (!isOwner && (!requester || !officerRoles.has(requester.role))) {
+        return res.status(403).json({ message: "You are not authorized to view this inspection schedule" });
+      }
+
+      const orderResult = await db
+        .select()
+        .from(inspectionOrders)
+        .where(eq(inspectionOrders.applicationId, id))
+        .orderBy(desc(inspectionOrders.createdAt))
+        .limit(1);
+
+      if (orderResult.length === 0) {
+        return res.status(404).json({ message: "Inspection order not found" });
+      }
+
+      const order = orderResult[0];
+      const assignedDa = await storage.getUser(order.assignedTo);
+
+      const ackAction = await db
+        .select()
+        .from(applicationActions)
+        .where(
+          and(
+            eq(applicationActions.applicationId, id),
+            eq(applicationActions.action, 'inspection_acknowledged'),
+          ),
+        )
+        .orderBy(desc(applicationActions.createdAt))
+        .limit(1);
+
+      res.json({
+        order: {
+          id: order.id,
+          status: order.status,
+          inspectionDate: order.inspectionDate,
+          specialInstructions: order.specialInstructions,
+          assignedTo: assignedDa
+            ? { id: assignedDa.id, fullName: assignedDa.fullName, mobile: assignedDa.mobile }
+            : null,
+        },
+        acknowledgedAt: ackAction.length ? ackAction[0].createdAt : null,
+      });
+    } catch (error) {
+      console.error("[owner] Failed to fetch inspection schedule:", error);
+      res.status(500).json({ message: "Failed to fetch inspection schedule" });
+    }
+  });
+
+  app.post("/api/applications/:id/inspection-schedule/acknowledge", requireAuth, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userId = req.session.userId!;
+      const application = await storage.getApplication(id);
+      if (!application) {
+        return res.status(404).json({ message: "Application not found" });
+      }
+      if (application.userId !== userId) {
+        return res.status(403).json({ message: "Only the application owner can acknowledge the inspection schedule" });
+      }
+
+      const orderResult = await db
+        .select()
+        .from(inspectionOrders)
+        .where(eq(inspectionOrders.applicationId, id))
+        .orderBy(desc(inspectionOrders.createdAt))
+        .limit(1);
+
+      if (orderResult.length === 0) {
+        return res.status(400).json({ message: "Inspection has not been scheduled yet" });
+      }
+
+      const order = orderResult[0];
+      if (order.status === 'completed') {
+        return res.status(400).json({ message: "Inspection already completed" });
+      }
+
+      const existingAck = await db
+        .select()
+        .from(applicationActions)
+        .where(
+          and(
+            eq(applicationActions.applicationId, id),
+            eq(applicationActions.action, 'inspection_acknowledged'),
+          ),
+        )
+        .orderBy(desc(applicationActions.createdAt))
+        .limit(1);
+
+      if (existingAck.length > 0) {
+        return res.json({
+          message: "Inspection schedule already acknowledged",
+          acknowledgedAt: existingAck[0].createdAt,
+        });
+      }
+
+      await db.update(inspectionOrders)
+        .set({ status: 'acknowledged', updatedAt: new Date() })
+        .where(eq(inspectionOrders.id, order.id));
+
+      const [ackRecord] = await db.insert(applicationActions).values({
+        applicationId: id,
+        officerId: userId,
+        action: 'inspection_acknowledged',
+        previousStatus: application.status,
+        newStatus: application.status,
+        feedback: "Owner acknowledged inspection schedule.",
+      }).returning();
+
+      res.json({
+        message: "Inspection schedule acknowledged",
+        acknowledgedAt: ackRecord?.createdAt ?? new Date(),
+      });
+    } catch (error) {
+      console.error("[owner] Failed to acknowledge inspection schedule:", error);
+      res.status(500).json({ message: "Failed to acknowledge inspection schedule" });
     }
   });
 
@@ -2885,7 +6122,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only review applications from your district" });
       }
 
@@ -2952,7 +6189,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
@@ -2964,11 +6201,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Update application status to verified_for_payment
-      await storage.updateApplication(applicationId, {
+      const verifiedApplication = await storage.updateApplication(applicationId, {
         status: 'verified_for_payment',
         districtNotes: remarks || 'Inspection report approved. Property meets all requirements.',
         districtOfficerId: userId,
         districtReviewDate: new Date(),
+      });
+      await logApplicationAction({
+        applicationId,
+        actorId: userId,
+        action: "verified_for_payment",
+        previousStatus: application.status,
+        newStatus: "verified_for_payment",
+        feedback: remarks || 'Inspection report approved. Property meets all requirements.',
+      });
+
+      const paymentOwner = await storage.getUser(application.userId);
+      queueNotification("verified_for_payment", {
+        application: verifiedApplication ?? {
+          ...application,
+          status: 'verified_for_payment',
+        },
+        owner: paymentOwner ?? null,
       });
 
       res.json({ message: "Inspection report approved successfully" });
@@ -2997,7 +6251,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
@@ -3015,6 +6269,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         districtNotes: remarks,
         districtOfficerId: userId,
         districtReviewDate: new Date(),
+      });
+      await logApplicationAction({
+        applicationId,
+        actorId: userId,
+        action: "dtdo_reject",
+        previousStatus: application.status,
+        newStatus: "rejected",
+        feedback: remarks,
       });
 
       res.json({ message: "Application rejected successfully" });
@@ -3043,7 +6305,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Verify application is from DTDO's district
-      if (user?.district && application.district !== user.district) {
+      if (user?.district && !districtsMatch(user.district, application.district)) {
         return res.status(403).json({ message: "You can only process applications from your district" });
       }
 
@@ -3055,12 +6317,27 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       // Update application status to objection_raised
+      const trimmedRemarks = remarks.trim();
       await storage.updateApplication(applicationId, {
         status: 'objection_raised',
-        clarificationRequested: remarks,
-        districtNotes: remarks,
+        clarificationRequested: trimmedRemarks,
+        districtNotes: trimmedRemarks,
         districtOfficerId: userId,
         districtReviewDate: new Date(),
+      });
+      await logApplicationAction({
+        applicationId,
+        actorId: userId,
+        action: "objection_raised",
+        previousStatus: application.status,
+        newStatus: "objection_raised",
+        feedback: trimmedRemarks,
+      });
+      const owner = await storage.getUser(application.userId);
+      queueNotification("dtdo_objection", {
+        application: { ...application, status: "objection_raised" },
+        owner: owner ?? null,
+        extras: { REMARKS: trimmedRemarks },
       });
 
       res.json({ message: "Objections raised successfully. Application will require re-inspection." });
@@ -3090,6 +6367,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .from(inspectionOrders)
         .where(eq(inspectionOrders.assignedTo, userId))
         .orderBy(desc(inspectionOrders.createdAt));
+      console.log("[da] inspections query", {
+        userId,
+        username: user?.username,
+        count: inspectionOrdersData.length,
+        orderIds: inspectionOrdersData.map((order) => order.id),
+      });
 
       // Enrich with application and property details
       const enrichedOrders = await Promise.all(
@@ -3106,13 +6389,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           return {
             ...order,
-            application: application ? {
-              id: application.id,
-              applicationNumber: application.applicationNumber,
-              propertyName: application.propertyName,
-              category: application.category,
-              status: application.status,
-            } : null,
+            application: application
+              ? {
+                  id: application.id,
+                  applicationNumber: application.applicationNumber,
+                  propertyName: application.propertyName,
+                  category: application.category,
+                  status: application.status,
+                  dtdoRemarks: application.dtdoRemarks ?? null,
+                }
+              : null,
             owner: owner ? {
               fullName: owner.fullName,
               mobile: owner.mobile,
@@ -3218,14 +6504,70 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Inspection report already submitted for this order" });
       }
 
+      // Validate actual inspection date
+      const scheduledDate = new Date(order[0].inspectionDate);
+      const actualInspectionDateInput = req.body.actualInspectionDate
+        ? new Date(req.body.actualInspectionDate)
+        : null;
+
+      if (!actualInspectionDateInput || Number.isNaN(actualInspectionDateInput.getTime())) {
+        return res.status(400).json({ message: "Actual inspection date is required" });
+      }
+
+      const normalizedScheduledDate = toDateOnly(scheduledDate);
+      const normalizedActualDate = toDateOnly(actualInspectionDateInput);
+      const normalizedToday = toDateOnly(new Date());
+      const earliestOverrideDate = toDateOnly(subDays(normalizedScheduledDate, EARLY_INSPECTION_OVERRIDE_WINDOW_DAYS));
+      const earlyOverrideEnabled = Boolean(req.body.earlyInspectionOverride);
+      const earlyOverrideReason = typeof req.body.earlyInspectionReason === "string"
+        ? req.body.earlyInspectionReason.trim()
+        : "";
+      const actualBeforeSchedule = normalizedActualDate < normalizedScheduledDate;
+
+      if (actualBeforeSchedule) {
+        if (!earlyOverrideEnabled) {
+          return res.status(400).json({
+            message: `Actual inspection date cannot be before the scheduled date (${format(normalizedScheduledDate, "PPP")}). Enable the early inspection override and record a justification.`,
+          });
+        }
+        if (normalizedActualDate < earliestOverrideDate) {
+          return res.status(400).json({
+            message: `Early inspections can only be logged up to ${EARLY_INSPECTION_OVERRIDE_WINDOW_DAYS} days before the scheduled date.`,
+          });
+        }
+        if (!earlyOverrideReason || earlyOverrideReason.length < 15) {
+          return res.status(400).json({
+            message: "Please provide a justification of at least 15 characters for the early inspection.",
+          });
+        }
+      }
+
+      if (normalizedActualDate > normalizedToday) {
+        return res.status(400).json({ message: "Actual inspection date cannot be in the future" });
+      }
+
       // Validate and prepare report data
+      const daysEarly = actualBeforeSchedule
+        ? differenceInCalendarDays(normalizedScheduledDate, normalizedActualDate)
+        : 0;
+      const earlyOverrideNote =
+        actualBeforeSchedule && earlyOverrideEnabled
+          ? `Early inspection override: Conducted ${daysEarly} day${daysEarly === 1 ? '' : 's'} before the scheduled date (${format(normalizedScheduledDate, "PPP")}). Reason: ${earlyOverrideReason}`
+          : null;
+      const mergedMandatoryRemarks = (() => {
+        const baseRemarks = req.body.mandatoryRemarks?.trim();
+        if (!earlyOverrideNote) {
+          return baseRemarks || null;
+        }
+        return baseRemarks ? `${baseRemarks}\n\n${earlyOverrideNote}` : earlyOverrideNote;
+      })();
+
       const reportData = {
         inspectionOrderId: orderId,
         applicationId: order[0].applicationId,
         submittedBy: userId,
         submittedDate: new Date(),
-        // Convert date string to Date object
-        actualInspectionDate: req.body.actualInspectionDate ? new Date(req.body.actualInspectionDate) : new Date(),
+        actualInspectionDate: normalizedActualDate,
         // Basic verification fields
         roomCountVerified: req.body.roomCountVerified ?? false,
         actualRoomCount: req.body.actualRoomCount || null,
@@ -3233,7 +6575,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         recommendedCategory: req.body.recommendedCategory || null,
         // ANNEXURE-III Checklists
         mandatoryChecklist: req.body.mandatoryChecklist || null,
-        mandatoryRemarks: req.body.mandatoryRemarks || null,
+        mandatoryRemarks: mergedMandatoryRemarks,
         desirableChecklist: req.body.desirableChecklist || null,
         desirableRemarks: req.body.desirableRemarks || null,
         // Legacy compatibility fields
@@ -3252,6 +6594,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         reportDocumentUrl: req.body.reportDocumentUrl || null,
       };
 
+      // Load application to capture previous status for logging
+      const currentApplication = await storage.getApplication(order[0].applicationId);
+
       // Insert inspection report
       const [newReport] = await db.insert(inspectionReports).values(reportData).returning();
 
@@ -3260,14 +6605,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .set({ status: 'completed', updatedAt: new Date() })
         .where(eq(inspectionOrders.id, orderId));
 
-      // Update application status to inspection_under_review for DTDO to review
-      // According to PRD_2.0.md workflow: inspection_completed → inspection_under_review → DTDO decision
+      const normalizedRecommendation = (reportData.recommendation || "").toLowerCase();
+      const siteInspectionOutcome =
+        normalizedRecommendation === "raise_objections"
+          ? "objection"
+          : normalizedRecommendation === "approve"
+            ? "recommended"
+            : "completed";
+
       await storage.updateApplication(order[0].applicationId, {
-        status: 'inspection_under_review',
-        currentStage: 'inspection_completed',
+        status: "inspection_under_review",
+        currentStage: "inspection_completed",
+        siteInspectionNotes: reportData.detailedFindings || null,
+        siteInspectionOutcome,
+        siteInspectionCompletedDate: new Date(),
+        inspectionReportId: newReport.id,
+        clarificationRequested: null,
+        rejectionReason: null,
       });
 
-      res.json({ report: newReport, message: "Inspection report submitted successfully" });
+      await logApplicationAction({
+        applicationId: order[0].applicationId,
+        actorId: userId,
+        action: "inspection_completed",
+        previousStatus: currentApplication?.status ?? null,
+        newStatus: "inspection_under_review",
+        feedback: reportData.detailedFindings || null,
+      });
+
+      res.json({
+        report: newReport,
+        message: "Inspection report submitted successfully",
+      });
     } catch (error) {
       console.error("[da] Failed to submit inspection report:", error);
       res.status(500).json({ message: "Failed to submit inspection report" });
@@ -3325,6 +6694,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Confirm payment (Officer only)
   app.post("/api/payments/:id/confirm", requireRole("district_officer", "state_officer"), async (req, res) => {
     try {
+      const userId = req.session.userId!;
       const payment = await storage.getPaymentById(req.params.id);
       if (!payment) {
         return res.status(404).json({ message: "Payment not found" });
@@ -3350,6 +6720,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
         certificateIssuedDate: new Date(),
         certificateExpiryDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year from now
         approvedAt: new Date(),
+      });
+      await logApplicationAction({
+        applicationId: payment.applicationId,
+        actorId: userId,
+        action: "payment_confirmed",
+        previousStatus: application.status,
+        newStatus: "approved",
+        feedback: "Payment confirmed manually by officer.",
+      });
+      await logApplicationAction({
+        applicationId: payment.applicationId,
+        actorId: userId,
+        action: "certificate_issued",
+        previousStatus: "approved",
+        newStatus: "approved",
+        feedback: `Certificate number ${certificateNumber} issued.`,
       });
 
       res.json({ 
@@ -4384,6 +7770,263 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // ============================================
+  // Admin RC - Legacy Queue Management
+  // ============================================
+  const legacySelection = {
+    application: homestayApplications,
+    owner: {
+      id: users.id,
+      fullName: users.fullName,
+      mobile: users.mobile,
+      email: users.email,
+      district: users.district,
+    },
+  };
+
+  const legacyApplicationUpdateSchema = z.object({
+    propertyName: z.string().min(3),
+    category: z.enum(LEGACY_CATEGORY_OPTIONS),
+    locationType: z.enum(LEGACY_LOCATION_TYPES),
+    status: z.enum(LEGACY_STATUS_OPTIONS),
+    projectType: z.string().min(2),
+    propertyOwnership: z.enum(LEGACY_PROPERTY_OWNERSHIP),
+    address: z.string().min(3),
+    district: z.string().min(3),
+    tehsil: z.string().min(3),
+    block: z.string().nullable().optional(),
+    gramPanchayat: z.string().nullable().optional(),
+    pincode: z.string().min(4),
+    ownerName: z.string().min(3),
+    ownerMobile: z.string().min(6),
+    ownerEmail: z.string().email().nullable().optional(),
+    ownerAadhaar: z.string().min(6),
+    ownerGender: z.enum(LEGACY_OWNER_GENDERS),
+    propertyArea: z.number().positive(),
+    singleBedRooms: z.number().int().min(0).nullable().optional(),
+    singleBedRoomRate: z.number().min(0).nullable().optional(),
+    doubleBedRooms: z.number().int().min(0).nullable().optional(),
+    doubleBedRoomRate: z.number().min(0).nullable().optional(),
+    familySuites: z.number().int().min(0).nullable().optional(),
+    familySuiteRate: z.number().min(0).nullable().optional(),
+    attachedWashrooms: z.number().int().min(0).nullable().optional(),
+    distanceAirport: z.number().min(0).nullable().optional(),
+    distanceRailway: z.number().min(0).nullable().optional(),
+    distanceCityCenter: z.number().min(0).nullable().optional(),
+    distanceShopping: z.number().min(0).nullable().optional(),
+    distanceBusStand: z.number().min(0).nullable().optional(),
+    certificateNumber: z.string().max(100).nullable().optional(),
+    certificateIssuedDate: z.string().datetime().nullable().optional(),
+    certificateExpiryDate: z.string().datetime().nullable().optional(),
+    serviceNotes: z.string().nullable().optional(),
+    guardianName: z.string().nullable().optional(),
+  });
+
+  const legacyOrderBy = sql`COALESCE(${homestayApplications.updatedAt}, ${homestayApplications.createdAt}, NOW())`;
+
+  app.get("/api/admin-rc/applications", requireRole(...ADMIN_RC_ALLOWED_ROLES), async (_req, res) => {
+    try {
+      const rows = await db
+        .select(legacySelection)
+        .from(homestayApplications)
+        .leftJoin(users, eq(users.id, homestayApplications.userId))
+        .where(like(homestayApplications.applicationNumber, `${LEGACY_RC_PREFIX}%`))
+        .orderBy(desc(legacyOrderBy));
+
+      const applications = rows.map((row) => ({
+        application: row.application,
+        owner: row.owner?.id ? row.owner : null,
+      }));
+
+      res.json({ applications });
+    } catch (error) {
+      console.error("[admin-rc] Failed to fetch legacy applications:", error);
+      res.status(500).json({ message: "Failed to load legacy applications" });
+    }
+  });
+
+  app.get("/api/admin-rc/applications/:id", requireRole(...ADMIN_RC_ALLOWED_ROLES), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const [record] = await db
+        .select(legacySelection)
+        .from(homestayApplications)
+        .leftJoin(users, eq(users.id, homestayApplications.userId))
+        .where(
+          and(
+            eq(homestayApplications.id, id),
+            like(homestayApplications.applicationNumber, `${LEGACY_RC_PREFIX}%`)
+          )
+        )
+        .limit(1);
+
+      if (!record) {
+        return res.status(404).json({ message: "Legacy application not found" });
+      }
+
+      const docList = await db
+        .select()
+        .from(documents)
+        .where(eq(documents.applicationId, id));
+
+      res.json({
+        application: record.application,
+        owner: record.owner?.id ? record.owner : null,
+        documents: docList,
+      });
+    } catch (error) {
+      console.error("[admin-rc] Failed to fetch application:", error);
+      res.status(500).json({ message: "Failed to load application" });
+    }
+  });
+
+  app.patch("/api/admin-rc/applications/:id", requireRole(...ADMIN_RC_ALLOWED_ROLES), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const [existing] = await db
+        .select(legacySelection)
+        .from(homestayApplications)
+        .leftJoin(users, eq(users.id, homestayApplications.userId))
+        .where(
+          and(
+            eq(homestayApplications.id, id),
+            like(homestayApplications.applicationNumber, `${LEGACY_RC_PREFIX}%`)
+          )
+        )
+        .limit(1);
+
+      if (!existing) {
+        return res.status(404).json({ message: "Legacy application not found" });
+      }
+
+      const payload = legacyApplicationUpdateSchema.parse(req.body ?? {});
+
+      const resolveNumeric = (
+        incoming: number | null | undefined,
+        fallback: number | null | undefined,
+        { allowNull = true }: { allowNull?: boolean } = {}
+      ): number | null | undefined => {
+        const normalized = numberOrNull(incoming);
+        if (normalized !== undefined) {
+          if (normalized === null && !allowNull) {
+            return typeof fallback === "number" ? fallback : toNumberFromUnknown(fallback) ?? null;
+          }
+          return normalized;
+        }
+        if (typeof fallback === "number") {
+          return fallback;
+        }
+        return toNumberFromUnknown(fallback);
+      };
+
+      const resolvedPropertyArea =
+        resolveNumeric(payload.propertyArea, toNumberFromUnknown(existing.application.propertyArea), { allowNull: false }) ?? 0;
+
+      const resolvedSingleRooms = resolveNumeric(payload.singleBedRooms, existing.application.singleBedRooms);
+      const resolvedDoubleRooms = resolveNumeric(payload.doubleBedRooms, existing.application.doubleBedRooms);
+      const resolvedFamilySuites = resolveNumeric(payload.familySuites, existing.application.familySuites);
+      const totalRooms =
+        (resolvedSingleRooms ?? 0) + (resolvedDoubleRooms ?? 0) + (resolvedFamilySuites ?? 0);
+
+      const updatePayload: Record<string, unknown> = {
+        propertyName: trimRequiredString(payload.propertyName),
+        category: payload.category,
+        locationType: payload.locationType,
+        status: payload.status,
+        projectType: payload.projectType,
+        propertyOwnership: payload.propertyOwnership,
+        address: trimRequiredString(payload.address),
+        district: trimRequiredString(payload.district),
+        tehsil: trimRequiredString(payload.tehsil),
+        block: trimOptionalString(payload.block) ?? null,
+        gramPanchayat: trimOptionalString(payload.gramPanchayat) ?? null,
+        pincode: trimRequiredString(payload.pincode),
+        ownerName: trimRequiredString(payload.ownerName),
+        ownerMobile: trimRequiredString(payload.ownerMobile),
+        ownerEmail: trimOptionalString(payload.ownerEmail) ?? null,
+        guardianName: trimOptionalString(payload.guardianName) ?? null,
+        ownerAadhaar: trimRequiredString(payload.ownerAadhaar),
+        ownerGender: payload.ownerGender,
+        propertyArea: resolvedPropertyArea,
+        singleBedRooms: resolvedSingleRooms ?? 0,
+        doubleBedRooms: resolvedDoubleRooms ?? 0,
+        familySuites: resolvedFamilySuites ?? 0,
+        singleBedRoomRate: resolveNumeric(payload.singleBedRoomRate, toNumberFromUnknown(existing.application.singleBedRoomRate)),
+        doubleBedRoomRate: resolveNumeric(payload.doubleBedRoomRate, toNumberFromUnknown(existing.application.doubleBedRoomRate)),
+        familySuiteRate: resolveNumeric(payload.familySuiteRate, toNumberFromUnknown(existing.application.familySuiteRate)),
+        attachedWashrooms: resolveNumeric(payload.attachedWashrooms, existing.application.attachedWashrooms),
+        distanceAirport: resolveNumeric(payload.distanceAirport, toNumberFromUnknown(existing.application.distanceAirport)),
+        distanceRailway: resolveNumeric(payload.distanceRailway, toNumberFromUnknown(existing.application.distanceRailway)),
+        distanceCityCenter: resolveNumeric(payload.distanceCityCenter, toNumberFromUnknown(existing.application.distanceCityCenter)),
+        distanceShopping: resolveNumeric(payload.distanceShopping, toNumberFromUnknown(existing.application.distanceShopping)),
+        distanceBusStand: resolveNumeric(payload.distanceBusStand, toNumberFromUnknown(existing.application.distanceBusStand)),
+        certificateNumber: trimOptionalString(payload.certificateNumber) ?? null,
+        certificateIssuedDate: parseIsoDateOrNull(payload.certificateIssuedDate),
+        certificateExpiryDate: parseIsoDateOrNull(payload.certificateExpiryDate),
+        serviceNotes: trimOptionalString(payload.serviceNotes) ?? null,
+        totalRooms,
+        updatedAt: new Date(),
+      };
+
+      const currentServiceContext =
+        (existing.application.serviceContext && typeof existing.application.serviceContext === "object"
+          ? { ...existing.application.serviceContext }
+          : {}) as Record<string, unknown>;
+
+      if (payload.guardianName !== undefined) {
+        currentServiceContext.legacyGuardianName = trimOptionalString(payload.guardianName) ?? null;
+      }
+
+      updatePayload.serviceContext = currentServiceContext;
+
+      await db
+        .update(homestayApplications)
+        .set(updatePayload)
+        .where(eq(homestayApplications.id, id));
+
+      if (existing.owner?.id) {
+        const ownerUpdates: Record<string, unknown> = {};
+        if (payload.ownerName) {
+          ownerUpdates.fullName = trimRequiredString(payload.ownerName);
+        }
+        if (payload.ownerMobile) {
+          ownerUpdates.mobile = trimRequiredString(payload.ownerMobile);
+        }
+        if (payload.ownerEmail !== undefined) {
+          ownerUpdates.email = trimOptionalString(payload.ownerEmail) ?? null;
+        }
+        if (payload.district) {
+          ownerUpdates.district = trimRequiredString(payload.district);
+        }
+        if (Object.keys(ownerUpdates).length > 0) {
+          ownerUpdates.updatedAt = new Date();
+          await db.update(users).set(ownerUpdates).where(eq(users.id, existing.owner.id));
+        }
+      }
+
+      const [updated] = await db
+        .select(legacySelection)
+        .from(homestayApplications)
+        .leftJoin(users, eq(users.id, homestayApplications.userId))
+        .where(eq(homestayApplications.id, id))
+        .limit(1);
+
+      const docList = await db
+        .select()
+        .from(documents)
+        .where(eq(documents.applicationId, id));
+
+      res.json({
+        application: updated?.application,
+        owner: updated?.owner?.id ? updated.owner : null,
+        documents: docList,
+      });
+    } catch (error) {
+      console.error("[admin-rc] Failed to update legacy application:", error);
+      res.status(500).json({ message: "Failed to update legacy application" });
+    }
+  });
+
   // RESET DATABASE - Clear all test data (admin only)
   app.post("/api/admin/reset-db", requireRole('admin'), async (req, res) => {
     try {
@@ -4490,7 +8133,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       // 16. Build list of roles to preserve
-      const rolesToPreserve: string[] = ['admin', 'super_admin']; // Always preserve admins
+      const rolesToPreserve: string[] = ['admin', 'super_admin', 'admin_rc']; // Always preserve console admins
       
       if (preservePropertyOwners) {
         rolesToPreserve.push('property_owner');
@@ -4965,6 +8608,465 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("[admin] Failed to toggle test payment mode:", error);
       res.status(500).json({ message: "Failed to toggle test payment mode" });
+    }
+  });
+
+  // Captcha settings
+  app.get("/api/admin/settings/auth/captcha", requireRole('admin'), async (_req, res) => {
+    try {
+      const enabled = await getCaptchaSetting();
+      res.json({ enabled });
+    } catch (error) {
+      console.error("[admin] Failed to fetch captcha setting:", error);
+      res.status(500).json({ message: "Failed to fetch captcha setting" });
+    }
+  });
+
+  app.post("/api/admin/settings/auth/captcha/toggle", requireRole('admin'), async (req, res) => {
+    try {
+      const { enabled } = req.body;
+      if (typeof enabled !== "boolean") {
+        return res.status(400).json({ message: "enabled must be a boolean" });
+      }
+
+      const userId = req.session.userId || null;
+      const [existingSetting] = await db
+        .select()
+        .from(systemSettings)
+        .where(eq(systemSettings.settingKey, CAPTCHA_SETTING_KEY))
+        .limit(1);
+
+      if (existingSetting) {
+        await db
+          .update(systemSettings)
+          .set({
+            settingValue: { enabled },
+            updatedBy: userId,
+            updatedAt: new Date(),
+          })
+          .where(eq(systemSettings.settingKey, CAPTCHA_SETTING_KEY));
+      } else {
+        await db.insert(systemSettings).values({
+          settingKey: CAPTCHA_SETTING_KEY,
+          settingValue: { enabled },
+          description: "Toggle login captcha requirement for testing",
+          category: "security",
+          updatedBy: userId,
+        });
+      }
+
+      updateCaptchaSettingCache(enabled);
+      console.log(`[admin] Captcha requirement ${enabled ? "enabled" : "disabled"}`);
+      res.json({ enabled });
+    } catch (error) {
+      console.error("[admin] Failed to toggle captcha setting:", error);
+      res.status(500).json({ message: "Failed to update captcha setting" });
+    }
+  });
+
+  // Communications settings
+  app.get("/api/admin/communications", requireRole('admin', 'super_admin'), async (_req, res) => {
+    try {
+      const emailRecord = await getSystemSettingRecord(EMAIL_GATEWAY_SETTING_KEY);
+      const smsRecord = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
+      const emailSettings = formatGatewaySetting(emailRecord, sanitizeEmailGateway);
+      const smsSettings = formatGatewaySetting(smsRecord, sanitizeSmsGateway);
+      console.log("[comm-settings] sms provider:", smsSettings?.provider, {
+        nic: smsSettings?.nic ? { passwordSet: smsSettings.nic.passwordSet } : null,
+        twilio: smsSettings?.twilio ? { authTokenSet: smsSettings.twilio.authTokenSet } : null,
+      });
+      res.json({
+        email: emailSettings,
+        sms: smsSettings,
+      });
+    } catch (error) {
+      console.error("[admin] Failed to fetch communications settings:", error);
+      res.status(500).json({ message: "Failed to fetch communications settings" });
+    }
+  });
+
+  app.put("/api/admin/communications/email", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const providerInput: EmailGatewayProvider = emailProviders.includes(req.body?.provider)
+        ? req.body.provider
+        : "custom";
+      const userId = req.session.userId || null;
+      const existing = await getSystemSettingRecord(EMAIL_GATEWAY_SETTING_KEY);
+      const existingValue: EmailGatewaySettingValue =
+        (existing?.settingValue as EmailGatewaySettingValue) ?? {};
+      const legacyProfile = extractLegacyEmailProfile(existingValue);
+
+      const buildProfile = (
+        payload: any,
+        fallback?: EmailGatewaySecretSettings,
+      ): EmailGatewaySecretSettings | undefined => {
+        if (!payload) {
+          return fallback;
+        }
+        const host = trimOptionalString(payload.host) ?? fallback?.host ?? undefined;
+        const fromEmail = trimOptionalString(payload.fromEmail) ?? fallback?.fromEmail ?? undefined;
+        const username = trimOptionalString(payload.username) ?? fallback?.username ?? undefined;
+        const passwordInput = trimOptionalString(payload.password);
+        const port =
+          payload.port !== undefined && payload.port !== null
+            ? Number(payload.port) || 25
+            : fallback?.port ?? 25;
+
+        const next: EmailGatewaySecretSettings = {
+          host,
+          port,
+          username,
+          fromEmail,
+          password: passwordInput ? passwordInput : fallback?.password,
+        };
+
+        if (!next.host && !next.fromEmail && !next.username && !next.password) {
+          return undefined;
+        }
+        return next;
+      };
+
+      const nextValue: EmailGatewaySettingValue = {
+        provider: providerInput,
+        custom: buildProfile(req.body?.custom ?? req.body, existingValue.custom ?? legacyProfile),
+        nic: buildProfile(req.body?.nic, existingValue.nic),
+        sendgrid: buildProfile(req.body?.sendgrid, existingValue.sendgrid),
+      };
+
+      const activeProfile = getEmailProfileFromValue(
+        { ...existingValue, ...nextValue },
+        providerInput,
+      );
+
+      if (!activeProfile?.host || !activeProfile?.fromEmail) {
+        return res.status(400).json({ message: "SMTP host and from email are required" });
+      }
+
+      if (!activeProfile.password) {
+        return res.status(400).json({ message: "SMTP password is required" });
+      }
+
+      if (existing) {
+        await db
+          .update(systemSettings)
+          .set({
+            settingValue: nextValue,
+            updatedAt: new Date(),
+            updatedBy: userId,
+            description: "SMTP gateway configuration",
+            category: "communications",
+          })
+          .where(eq(systemSettings.settingKey, EMAIL_GATEWAY_SETTING_KEY));
+      } else {
+        await db.insert(systemSettings).values({
+          settingKey: EMAIL_GATEWAY_SETTING_KEY,
+          settingValue: nextValue,
+          description: "SMTP gateway configuration",
+          category: "communications",
+          updatedBy: userId,
+        });
+      }
+
+      console.log("[admin] Updated SMTP gateway settings");
+      res.json({ success: true });
+    } catch (error) {
+      console.error("[admin] Failed to update SMTP config:", error);
+      res.status(500).json({ message: "Failed to update SMTP settings" });
+    }
+  });
+
+  app.put("/api/admin/communications/sms", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const providerInput = req.body?.provider === "twilio" ? "twilio" : "nic";
+      const userId = req.session.userId || null;
+      const existing = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
+      const existingValue: SmsGatewaySettingValue = (existing?.settingValue as SmsGatewaySettingValue) ?? {};
+
+      const nicPayload = req.body?.nic ?? req.body;
+      const twilioPayload = req.body?.twilio ?? req.body;
+
+      const nextValue: SmsGatewaySettingValue = {
+        provider: providerInput,
+        nic: existingValue.nic,
+        twilio: existingValue.twilio,
+      };
+
+      if (providerInput === "nic") {
+        const username = trimOptionalString(nicPayload?.username) ?? undefined;
+        const senderId = trimOptionalString(nicPayload?.senderId) ?? undefined;
+        const departmentKey = trimOptionalString(nicPayload?.departmentKey) ?? undefined;
+        const templateId = trimOptionalString(nicPayload?.templateId) ?? undefined;
+        const postUrl = trimOptionalString(nicPayload?.postUrl) ?? undefined;
+        const passwordInput = trimOptionalString(nicPayload?.password) ?? undefined;
+
+        if (!username || !senderId || !departmentKey || !templateId || !postUrl) {
+          return res.status(400).json({ message: "All NIC SMS fields are required" });
+        }
+
+        const resolvedNicPassword = passwordInput || existingValue.nic?.password;
+
+        if (!resolvedNicPassword) {
+          return res.status(400).json({ message: "SMS password is required" });
+        }
+
+        const nicConfig: NicSmsGatewaySettings = {
+          username: username!,
+          senderId: senderId!,
+          departmentKey: departmentKey!,
+          templateId: templateId!,
+          postUrl: postUrl!,
+          password: resolvedNicPassword,
+        };
+
+        nextValue.nic = nicConfig;
+      } else {
+        const accountSid = trimOptionalString(twilioPayload?.accountSid) ?? undefined;
+        const fromNumber = trimOptionalString(twilioPayload?.fromNumber) ?? undefined;
+        const messagingServiceSid = trimOptionalString(twilioPayload?.messagingServiceSid) ?? undefined;
+        const authTokenInput = trimOptionalString(twilioPayload?.authToken) ?? undefined;
+
+        if (!accountSid) {
+          return res.status(400).json({ message: "Twilio Account SID is required" });
+        }
+        if (!fromNumber && !messagingServiceSid) {
+          return res.status(400).json({ message: "Provide a From Number or Messaging Service SID" });
+        }
+
+        const resolvedAuthToken = authTokenInput || existingValue.twilio?.authToken;
+
+        if (!resolvedAuthToken) {
+          return res.status(400).json({ message: "Twilio auth token is required" });
+        }
+
+        const twilioConfig: TwilioSmsGatewaySettings = {
+          accountSid: accountSid!,
+          fromNumber: fromNumber || undefined,
+          messagingServiceSid: messagingServiceSid || undefined,
+          authToken: resolvedAuthToken,
+        };
+
+        nextValue.twilio = twilioConfig;
+      }
+
+      if (existing) {
+        await db
+          .update(systemSettings)
+          .set({
+            settingValue: nextValue,
+            updatedAt: new Date(),
+            updatedBy: userId,
+            description: "SMS gateway configuration",
+            category: "communications",
+          })
+          .where(eq(systemSettings.settingKey, SMS_GATEWAY_SETTING_KEY));
+      } else {
+        await db.insert(systemSettings).values({
+          settingKey: SMS_GATEWAY_SETTING_KEY,
+          settingValue: nextValue,
+          description: "SMS gateway configuration",
+          category: "communications",
+          updatedBy: userId,
+        });
+      }
+
+      console.log("[admin] Updated SMS gateway settings");
+      res.json({ success: true });
+    } catch (error) {
+      console.error("[admin] Failed to update SMS config:", error);
+      res.status(500).json({ message: "Failed to update SMS settings" });
+    }
+  });
+
+  app.post("/api/admin/communications/email/test", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const record = await getSystemSettingRecord(EMAIL_GATEWAY_SETTING_KEY);
+      if (!record) {
+        return res.status(400).json({ message: "SMTP settings not configured" });
+      }
+
+      const config = (record.settingValue as EmailGatewaySettingValue) ?? {};
+      const provider: EmailGatewayProvider = config.provider ?? "custom";
+      const profile = getEmailProfileFromValue(config, provider) ?? extractLegacyEmailProfile(config);
+      if (!profile?.host || !profile?.fromEmail || !profile?.password) {
+        return res.status(400).json({ message: "SMTP settings incomplete" });
+      }
+
+      const to = trimOptionalString(req.body?.to) ?? profile.fromEmail;
+      const subject = trimOptionalString(req.body?.subject) ?? DEFAULT_EMAIL_SUBJECT;
+      const body = trimOptionalString(req.body?.body) ?? DEFAULT_EMAIL_BODY;
+
+      const result = await sendTestEmail(
+        {
+          host: profile.host,
+          port: Number(profile.port) || 25,
+          username: profile.username,
+          password: profile.password,
+          fromEmail: profile.fromEmail,
+        },
+        {
+          to,
+          subject,
+          body,
+        },
+      );
+
+      res.json({ success: true, log: result.log });
+    } catch (error: any) {
+      console.error("[admin] SMTP test failed:", error);
+      res.status(500).json({ message: error?.message || "Failed to send test email" });
+    }
+  });
+
+  app.post("/api/admin/communications/sms/test", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const record = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
+      if (!record) {
+        return res.status(400).json({ message: "SMS settings not configured" });
+      }
+
+      const config = record.settingValue as SmsGatewaySettingValue;
+      const provider: SmsGatewayProvider = config.provider ?? "nic";
+      console.log("[sms-test] provider:", provider);
+
+      const mobile = trimOptionalString(req.body?.mobile);
+      const message =
+        trimOptionalString(req.body?.message) ?? DEFAULT_SMS_BODY.replace("{{OTP}}", "123456");
+      if (!mobile) {
+        return res.status(400).json({ message: "Mobile number is required" });
+      }
+
+      if (provider === "twilio") {
+        const twilioConfig =
+          config.twilio ??
+          ({
+            accountSid: (config as any).accountSid,
+            authToken: (config as any).authToken,
+            fromNumber: (config as any).fromNumber,
+            messagingServiceSid: (config as any).messagingServiceSid,
+          } as TwilioSmsGatewaySettings);
+
+        if (
+          !twilioConfig ||
+          !twilioConfig.accountSid ||
+          !twilioConfig.authToken ||
+          (!twilioConfig.fromNumber && !twilioConfig.messagingServiceSid)
+        ) {
+          return res.status(400).json({ message: "Twilio settings incomplete" });
+        }
+
+        const result = await sendTwilioSms(
+          {
+            accountSid: twilioConfig.accountSid,
+            authToken: twilioConfig.authToken,
+            fromNumber: twilioConfig.fromNumber,
+            messagingServiceSid: twilioConfig.messagingServiceSid,
+          },
+          { mobile, message },
+        );
+
+        return res.json({ success: result.ok, response: result.body, status: result.status });
+      }
+
+      const nicConfig =
+        config.nic ??
+        ({
+          username: (config as any).username,
+          password: (config as any).password,
+          senderId: (config as any).senderId,
+          departmentKey: (config as any).departmentKey,
+          templateId: (config as any).templateId,
+          postUrl: (config as any).postUrl,
+        } as NicSmsGatewaySettings);
+
+      if (!nicConfig || !nicConfig.password) {
+        return res.status(400).json({ message: "SMS password missing in settings" });
+      }
+
+      const result = await sendTestSms(
+        {
+          username: nicConfig.username,
+          password: nicConfig.password,
+          senderId: nicConfig.senderId,
+          departmentKey: nicConfig.departmentKey,
+          templateId: nicConfig.templateId,
+          postUrl: nicConfig.postUrl,
+        },
+        { mobile, message },
+      );
+
+      res.json({ success: result.ok, response: result.body, status: result.status });
+    } catch (error: any) {
+      console.error("[admin] SMS test failed:", error);
+      res.status(500).json({ message: error?.message || "Failed to send test SMS" });
+    }
+  });
+
+  app.get("/api/admin/notifications", requireRole('admin', 'super_admin'), async (_req, res) => {
+    try {
+      const record = await getSystemSettingRecord(NOTIFICATION_RULES_SETTING_KEY);
+      const payload = buildNotificationResponse(record);
+      res.json(payload);
+    } catch (error) {
+      console.error("[admin] Failed to load notification rules:", error);
+      res.status(500).json({ message: "Failed to load notification settings" });
+    }
+  });
+
+  app.put("/api/admin/notifications", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const eventsInput = Array.isArray(req.body?.events) ? req.body.events : [];
+      const ruleMap = new Map<NotificationEventId, NotificationRuleValue>();
+      for (const event of eventsInput) {
+        if (!event?.id) continue;
+        const definition = notificationDefinitionMap.get(event.id as NotificationEventId);
+        if (!definition) continue;
+        const smsTemplate =
+          trimOptionalString(event.smsTemplate) ?? definition.defaultSmsTemplate;
+        const emailSubject =
+          trimOptionalString(event.emailSubject) ?? definition.defaultEmailSubject;
+        const emailBody =
+          trimOptionalString(event.emailBody) ?? definition.defaultEmailBody;
+        ruleMap.set(definition.id, {
+          id: definition.id,
+          smsEnabled: Boolean(event.smsEnabled),
+          smsTemplate,
+          emailEnabled: Boolean(event.emailEnabled),
+          emailSubject,
+          emailBody,
+        });
+      }
+
+      const nextValue: NotificationSettingsValue = {
+        rules: Array.from(ruleMap.values()),
+      };
+      const userId = req.session.userId || null;
+      const existing = await getSystemSettingRecord(NOTIFICATION_RULES_SETTING_KEY);
+
+      if (existing) {
+        await db
+          .update(systemSettings)
+          .set({
+            settingValue: nextValue,
+            updatedAt: new Date(),
+            updatedBy: userId,
+            description: "Workflow notification templates",
+            category: "notification",
+          })
+          .where(eq(systemSettings.settingKey, NOTIFICATION_RULES_SETTING_KEY));
+      } else {
+        await db.insert(systemSettings).values({
+          settingKey: NOTIFICATION_RULES_SETTING_KEY,
+          settingValue: nextValue,
+          description: "Workflow notification templates",
+          category: "notification",
+          updatedBy: userId,
+        });
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error("[admin] Failed to save notification rules:", error);
+      res.status(500).json({ message: "Failed to save notification settings" });
     }
   });
 

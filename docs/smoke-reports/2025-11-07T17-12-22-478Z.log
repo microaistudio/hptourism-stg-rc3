@@ -1,0 +1,16 @@
+[2025-11-07T17:12:22.479Z] Smoke test 2025-11-07T17-12-22-478Z triggered from admin console.
+[2025-11-07T17:12:22Z] Starting smoke test run 2025-11-07T17-12-22-478Z...
+
+> rest-express@1.0.0 smoke
+> tsx scripts/smoke-test.ts
+
+🔐 Logging in as owner/DA/DTDO…
+✅ Sessions acquired.
+❌ Gold MC New failed: Failed to submit application for Gold MC New: Conflict
+❌ Diamond TCP New failed: Failed to submit application for Diamond TCP New: Conflict
+❌ Silver GP Add Rooms failed: Failed to submit application for Silver GP Add Rooms: Conflict
+❌ Gold MC Delete Rooms failed: Failed to submit application for Gold MC Delete Rooms: Conflict
+❌ Silver GP Renewal failed: Failed to submit application for Silver GP Renewal: Conflict
+📄 Smoke report written to docs/smoke-reports/2025-11-07T17-12-23-164Z/report.json
+❌ Smoke-test detected failures. See report for details.
+[2025-11-07T17:12:23.525Z] Smoke test 2025-11-07T17-12-22-478Z finished with exit code 1

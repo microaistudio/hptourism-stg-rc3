@@ -1,80 +1,61 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { isThisMonth } from "date-fns";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   FileText,
-  Clock,
   CheckCircle,
   AlertCircle,
   Search,
-  Filter,
-  ArrowRight,
   Loader2,
   RefreshCw,
+  BellRing,
+  type LucideIcon,
 } from "lucide-react";
-import { Link } from "wouter";
-import { format } from "date-fns";
-import type { HomestayApplication } from "@shared/schema";
+import { useLocation } from "wouter";
+import type { HomestayApplication, ApplicationKind } from "@shared/schema";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { isCorrectionRequiredStatus } from "@/constants/workflow";
+import { cn } from "@/lib/utils";
+import {
+  ApplicationPipelineRow,
+  type PipelineApplication,
+} from "@/components/application/application-pipeline-row";
+import { isServiceApplication } from "@/components/application/application-kind-badge";
 
-const CATEGORY_VARIANTS: Record<string, { color: string; bg: string }> = {
-  diamond: { color: "text-blue-600 dark:text-blue-400", bg: "bg-blue-50 dark:bg-blue-950/20" },
-  gold: { color: "text-yellow-600 dark:text-yellow-400", bg: "bg-yellow-50 dark:bg-yellow-950/20" },
-  silver: { color: "text-gray-600 dark:text-gray-400", bg: "bg-gray-50 dark:bg-gray-950/20" },
+const isInCurrentMonth = (value?: string | null) => {
+  if (!value) return false;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return false;
+  return isThisMonth(date);
+};
+type ApplicationWithOwner = PipelineApplication;
+
+type InspectionSummary = {
+  id: string;
+  reportSubmitted: boolean;
+  status: string;
+  inspectionDate?: string | null;
+  updatedAt?: string | null;
 };
 
-const STATUS_VARIANTS: Record<string, { label: string; bg: string }> = {
-  submitted: { label: "Submitted", bg: "bg-blue-50 dark:bg-blue-950/20" },
-  under_scrutiny: { label: "Under Scrutiny", bg: "bg-orange-50 dark:bg-orange-950/20" },
-  forwarded_to_dtdo: { label: "Forwarded to DTDO", bg: "bg-green-50 dark:bg-green-950/20" },
-  reverted_to_applicant: { label: "Sent Back", bg: "bg-red-50 dark:bg-red-950/20" },
-  dtdo_review: { label: "DTDO Review", bg: "bg-purple-50 dark:bg-purple-950/20" },
-  inspection_scheduled: { label: "Inspection Scheduled", bg: "bg-indigo-50 dark:bg-indigo-950/20" },
-  inspection_under_review: { label: "Inspection Review", bg: "bg-yellow-50 dark:bg-yellow-950/20" },
-  approved: { label: "Approved", bg: "bg-emerald-50 dark:bg-emerald-950/20" },
-  rejected: { label: "Rejected", bg: "bg-rose-50 dark:bg-rose-950/20" },
-  draft: { label: "Draft", bg: "bg-slate-50 dark:bg-slate-900/40" },
-};
-
-const renderCategoryBadge = (category?: string) => {
-  const key = (category || "silver").toLowerCase();
-  const variant = CATEGORY_VARIANTS[key] || CATEGORY_VARIANTS.silver;
-  return (
-    <Badge variant="outline" className={`${variant.bg} capitalize`}>
-      {category || "silver"}
-    </Badge>
-  );
-};
-
-const renderStatusBadge = (status?: string) => {
-  if (!status) {
-    return <Badge variant="outline">Pending</Badge>;
-  }
-  const config = STATUS_VARIANTS[status] || {
-    label: status.replace(/_/g, " "),
-    bg: "bg-muted/40",
-  };
-  return (
-    <Badge variant="outline" className={config.bg}>
-      {config.label}
-    </Badge>
-  );
-};
-
-interface ApplicationWithOwner extends HomestayApplication {
-  ownerName: string;
-  ownerMobile: string;
-}
+type SortOrder = "newest" | "oldest";
 
 export default function DADashboard() {
-  const [activeTab, setActiveTab] = useState("new");
+  const [activeStage, setActiveStage] = useState("new-queue");
+  const [activePill, setActivePill] = useState("new-queue-new");
+  const [sortOrder, setSortOrder] = useState<SortOrder>("newest");
   const queryClient = useQueryClient();
+  const [, setLocation] = useLocation();
   const handleRefresh = () => {
     queryClient.invalidateQueries({ queryKey: ["/api/da/applications"] });
     queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/da/inspections"] });
   };
+  const navigateToInspections = useCallback(() => {
+    setLocation("/da/inspections");
+  }, [setLocation]);
   
   const { data: applications, isLoading } = useQuery<ApplicationWithOwner[]>({
     queryKey: ["/api/da/applications"],
@@ -82,15 +63,310 @@ export default function DADashboard() {
 
   const allApplications = applications ?? [];
 
+  const getSortTimestamp = useCallback((app: ApplicationWithOwner) => {
+    const candidate = app.updatedAt ?? app.submittedAt ?? app.createdAt;
+    return candidate ? new Date(candidate).getTime() : 0;
+  }, []);
+
+  const sortApplications = useCallback(
+    (apps: ApplicationWithOwner[]) =>
+      [...apps].sort((a, b) => {
+        const diff = getSortTimestamp(a) - getSortTimestamp(b);
+        return sortOrder === "newest" ? -diff : diff;
+      }),
+    [getSortTimestamp, sortOrder],
+  );
+
   const { data: user } = useQuery<{ user: { id: string; fullName: string; role: string; district?: string } }>({
     queryKey: ["/api/auth/me"],
   });
+  const { data: inspections } = useQuery<InspectionSummary[]>({
+    queryKey: ["/api/da/inspections"],
+  });
 
   // Group applications by status
-  const newApplications = allApplications.filter(app => app.status === 'submitted');
-  const underScrutiny = allApplications.filter(app => app.status === 'under_scrutiny');
-  const forwarded = allApplications.filter(app => app.status === 'forwarded_to_dtdo');
-  const reverted = allApplications.filter(app => app.status === 'reverted_to_applicant');
+  const submittedApplications = useMemo(
+    () => allApplications.filter((app) => app.status === "submitted"),
+    [allApplications],
+  );
+  const underScrutiny = useMemo(
+    () => allApplications.filter((app) => app.status === "under_scrutiny"),
+    [allApplications],
+  );
+  const forwarded = useMemo(
+    () => allApplications.filter((app) => app.status === "forwarded_to_dtdo"),
+    [allApplications],
+  );
+  const reverted = useMemo(
+    () => allApplications.filter((app) => isCorrectionRequiredStatus(app.status)),
+    [allApplications],
+  );
+  const awaitingOwner = useMemo(
+    () => reverted.filter((app) => !app.latestCorrection?.createdAt),
+    [reverted],
+  );
+  const ownerResubmitted = useMemo(
+    () => reverted.filter((app) => Boolean(app.latestCorrection?.createdAt)),
+    [reverted],
+  );
+  const serviceRegistrationQueue = useMemo(
+    () =>
+      submittedApplications.filter((app) =>
+        isServiceApplication(app.applicationKind as ApplicationKind | undefined),
+      ),
+    [submittedApplications],
+  );
+  const newRegistrationQueue = useMemo(
+    () =>
+      submittedApplications.filter(
+        (app) => !isServiceApplication(app.applicationKind as ApplicationKind | undefined),
+      ),
+    [submittedApplications],
+  );
+  const sortedServiceRegistrationQueue = useMemo(
+    () => sortApplications(serviceRegistrationQueue),
+    [serviceRegistrationQueue, sortApplications],
+  );
+  const sortedNewRegistrationQueue = useMemo(
+    () => sortApplications(newRegistrationQueue),
+    [newRegistrationQueue, sortApplications],
+  );
+  const sortedUnderScrutiny = useMemo(
+    () => sortApplications(underScrutiny),
+    [underScrutiny, sortApplications],
+  );
+  const sortedForwarded = useMemo(() => sortApplications(forwarded), [forwarded, sortApplications]);
+  const sortedAwaitingOwners = useMemo(() => sortApplications(awaitingOwner), [awaitingOwner, sortApplications]);
+  const sortedResubmitted = useMemo(
+    () => sortApplications(ownerResubmitted),
+    [ownerResubmitted, sortApplications],
+  );
+  const scheduledInspections = useMemo(
+    () => (inspections ?? []).filter((order) => !order.reportSubmitted),
+    [inspections],
+  );
+  const completedInspections = useMemo(
+    () => (inspections ?? []).filter((order) => order.reportSubmitted),
+    [inspections],
+  );
+  const completedInspectionsThisMonth = useMemo(
+    () =>
+      completedInspections.filter((order) =>
+        isInCurrentMonth(order.updatedAt || order.inspectionDate || null),
+      ),
+    [completedInspections],
+  );
+  const approvedThisMonth = useMemo(
+    () =>
+      allApplications.filter(
+        (app) => app.status === "approved" && isInCurrentMonth(app.approvedAt ?? app.updatedAt),
+      ),
+    [allApplications],
+  );
+  const rejectedThisMonth = useMemo(
+    () =>
+      allApplications.filter((app) => app.status === "rejected" && isInCurrentMonth(app.updatedAt)),
+    [allApplications],
+  );
+  const sortedApprovedThisMonth = useMemo(
+    () => sortApplications(approvedThisMonth),
+    [approvedThisMonth, sortApplications],
+  );
+  const sortedRejectedThisMonth = useMemo(
+    () => sortApplications(rejectedThisMonth),
+    [rejectedThisMonth, sortApplications],
+  );
+  const stageConfigs = useMemo<StageConfig[]>(
+    () => [
+      {
+        key: "new-queue",
+        title: "New Queue (DA)",
+        description: "Fresh submissions waiting for you to start scrutiny.",
+        icon: FileText,
+        pills: [
+          {
+            value: "new-queue-new",
+            label: "New Registration",
+            count: sortedNewRegistrationQueue.length,
+            description: "Brand-new properties seeking recognition.",
+            applications: sortedNewRegistrationQueue,
+            actionLabel: "Start scrutiny",
+            emptyTitle: "No new registrations",
+            emptyDescription: "Every new application has been triaged.",
+          },
+          {
+            value: "new-queue-service",
+            label: "Current License Holders",
+            count: sortedServiceRegistrationQueue.length,
+            description: "Renewals or service requests from existing licensees.",
+            applications: sortedServiceRegistrationQueue,
+            actionLabel: "Review request",
+            emptyTitle: "No service requests",
+            emptyDescription: "No existing licensee is waiting to be reviewed.",
+          },
+        ],
+      },
+      {
+        key: "screening",
+        title: "Screening Process",
+        description: "Files currently going through your scrutiny flow.",
+        icon: Search,
+        pills: [
+          {
+            value: "screening-under",
+            label: "Under Scrutiny",
+            count: sortedUnderScrutiny.length,
+            description: "Applications you're actively reviewing.",
+            applications: sortedUnderScrutiny,
+            actionLabel: "Resume review",
+            emptyTitle: "No files in scrutiny",
+            emptyDescription: "Pick any pending application to keep the queue moving.",
+          },
+          {
+            value: "screening-forwarded",
+            label: "Forwarded to DTDO",
+            count: sortedForwarded.length,
+            description: "Cases awaiting DTDO action. Keep an eye on responses.",
+            applications: sortedForwarded,
+            actionLabel: "View summary",
+            emptyTitle: "Nothing forwarded yet",
+            emptyDescription: "Forward files once all DA checks are complete.",
+          },
+        ],
+      },
+      {
+        key: "corrections",
+        title: "Pending / Corrections",
+        description: "Owner clarifications and resubmissions that need follow-up.",
+        icon: AlertCircle,
+        pills: [
+          {
+            value: "corrections-waiting",
+            label: "Waiting on Owner",
+            count: sortedAwaitingOwners.length,
+            description: "Corrections requested and awaiting owner response.",
+            applications: sortedAwaitingOwners,
+            actionLabel: "Review notes",
+            emptyTitle: "No pending owners",
+            emptyDescription: "All requested corrections have been acknowledged.",
+          },
+          {
+            value: "corrections-resubmitted",
+            label: "Resubmitted",
+            count: sortedResubmitted.length,
+            description: "Owners have shared updates and await your confirmation.",
+            applications: sortedResubmitted,
+            actionLabel: "Review update",
+            emptyTitle: "No new resubmissions",
+            emptyDescription: "You'll be notified when an owner sends corrections.",
+          },
+        ],
+      },
+      {
+        key: "inspections",
+        title: "Inspections",
+        description: "Status of field inspections assigned to you.",
+        icon: BellRing,
+        totalCount: scheduledInspections.length,
+        pills: [
+          {
+            value: "inspections-scheduled",
+            label: "Scheduled",
+            count: scheduledInspections.length,
+            description: "Visits assigned but awaiting field report uploads.",
+            applications: [],
+            emptyTitle: "All inspections cleared",
+            emptyDescription: "You don't have any pending field visits.",
+            render: () => (
+              <InspectionSummaryCard
+                count={scheduledInspections.length}
+                variant="pending"
+                onNavigate={navigateToInspections}
+              />
+            ),
+          },
+          {
+            value: "inspections-completed",
+            label: "Completed This Month",
+            count: completedInspectionsThisMonth.length,
+            description: "Reports submitted in the current month.",
+            applications: [],
+            emptyTitle: "No recent inspections",
+            emptyDescription: "Completed inspections will appear here.",
+            render: () => (
+              <InspectionSummaryCard
+                count={completedInspectionsThisMonth.length}
+                variant="completed"
+                onNavigate={navigateToInspections}
+                subtitle="Reports filed in the current month."
+              />
+            ),
+          },
+        ],
+      },
+      {
+        key: "closures",
+        title: "Closed This Month",
+        description: "Decisions recorded in the current month.",
+        icon: CheckCircle,
+        pills: [
+          {
+            value: "closures-approved",
+            label: "Approved",
+            count: sortedApprovedThisMonth.length,
+            description: "Applications that cleared all checks this month.",
+            applications: sortedApprovedThisMonth,
+            actionLabel: "View certificate",
+            emptyTitle: "No approvals yet",
+            emptyDescription: "Complete scrutiny + inspection to unlock approvals.",
+          },
+          {
+            value: "closures-rejected",
+            label: "Rejected",
+            count: sortedRejectedThisMonth.length,
+            description: "Applications declined during this month.",
+            applications: sortedRejectedThisMonth,
+            actionLabel: "Review decision",
+            emptyTitle: "No rejections",
+            emptyDescription: "Declined files in the current month will appear here.",
+          },
+        ],
+      },
+    ],
+    [
+      sortedNewRegistrationQueue,
+      sortedServiceRegistrationQueue,
+      sortedUnderScrutiny,
+      sortedForwarded,
+      sortedAwaitingOwners,
+      sortedResubmitted,
+      scheduledInspections,
+      completedInspectionsThisMonth,
+      sortedApprovedThisMonth,
+      sortedRejectedThisMonth,
+      navigateToInspections,
+    ],
+  );
+  useEffect(() => {
+    if (!stageConfigs.length) return;
+    const resolvedStage = stageConfigs.find((stage) => stage.key === activeStage) ?? stageConfigs[0];
+    if (resolvedStage.key !== activeStage) {
+      setActiveStage(resolvedStage.key);
+      setActivePill(resolvedStage.pills[0]?.value ?? "");
+      return;
+    }
+    if (!resolvedStage.pills.length) return;
+    const resolvedPill =
+      resolvedStage.pills.find((pill) => pill.value === activePill) ?? resolvedStage.pills[0];
+    if (resolvedPill.value !== activePill) {
+      setActivePill(resolvedPill.value);
+    }
+  }, [stageConfigs, activeStage, activePill]);
+  const activeStageConfig =
+    stageConfigs.find((stage) => stage.key === activeStage) ?? stageConfigs[0];
+  const activePillConfig =
+    activeStageConfig?.pills.find((pill) => pill.value === activePill) ??
+    activeStageConfig?.pills[0];
 
   if (isLoading) {
     return (
@@ -101,45 +377,6 @@ export default function DADashboard() {
       </div>
     );
   }
-
-  const stats = [
-    {
-      title: "New Applications",
-      value: newApplications.length,
-      description: "Awaiting scrutiny",
-      icon: FileText,
-      color: "text-blue-600 dark:text-blue-400",
-      bgColor: "bg-blue-50 dark:bg-blue-950/20",
-      tabValue: "new",
-    },
-    {
-      title: "Under Scrutiny",
-      value: underScrutiny.length,
-      description: "Being reviewed",
-      icon: Search,
-      color: "text-orange-600 dark:text-orange-400",
-      bgColor: "bg-orange-50 dark:bg-orange-950/20",
-      tabValue: "scrutiny",
-    },
-    {
-      title: "Forwarded to DTDO",
-      value: forwarded.length,
-      description: "Sent to officer",
-      icon: CheckCircle,
-      color: "text-green-600 dark:text-green-400",
-      bgColor: "bg-green-50 dark:bg-green-950/20",
-      tabValue: "forwarded",
-    },
-    {
-      title: "Sent Back",
-      value: reverted.length,
-      description: "Reverted to applicant",
-      icon: AlertCircle,
-      color: "text-red-600 dark:text-red-400",
-      bgColor: "bg-red-50 dark:bg-red-950/20",
-      tabValue: "reverted",
-    },
-  ];
 
   return (
     <div className="container mx-auto p-6 max-w-7xl">
@@ -162,311 +399,202 @@ export default function DADashboard() {
         </Button>
       </div>
 
-      {/* Quick Stats */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4 mb-6">
-        {stats.map((stat) => {
-          const Icon = stat.icon;
+      {/* Stage Overview */}
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5 mb-6">
+        {stageConfigs.map((stage) => {
+          const Icon = stage.icon;
+          const totalCount = stage.totalCount ?? stage.pills.reduce((sum, pill) => sum + pill.count, 0);
+          const isActiveStage = stage.key === activeStageConfig?.key;
           return (
-            <Card 
-              key={stat.title}
-              className="cursor-pointer transition-all hover-elevate active-elevate-2"
-              onClick={() => setActiveTab(stat.tabValue)}
-              data-testid={`card-${stat.tabValue}`}
+            <Card
+              key={stage.key}
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                if (stage.key !== activeStage) {
+                  setActiveStage(stage.key);
+                  setActivePill(stage.pills[0]?.value ?? "");
+                }
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  if (stage.key !== activeStage) {
+                    setActiveStage(stage.key);
+                    setActivePill(stage.pills[0]?.value ?? "");
+                  }
+                }
+              }}
+              className={cn(
+                "p-5 flex flex-col gap-3 cursor-pointer transition-all border border-border hover-elevate focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-2xl",
+                isActiveStage ? "ring-2 ring-primary" : "",
+              )}
             >
-              <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium">{stat.title}</CardTitle>
-                <div className={`p-2 rounded-lg ${stat.bgColor}`}>
-                  <Icon className={`w-4 h-4 ${stat.color}`} />
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">{stage.title}</p>
+                  <p className="text-3xl font-semibold mt-1">{totalCount}</p>
                 </div>
-              </CardHeader>
-              <CardContent>
-                <div className="text-2xl font-bold">{stat.value}</div>
-                <p className="text-xs text-muted-foreground mt-1">{stat.description}</p>
-              </CardContent>
+                <div className="p-2 rounded-full bg-muted/40">
+                  <Icon className="w-5 h-5 text-primary" />
+                </div>
+              </div>
+              <p className="text-sm text-muted-foreground mt-1">{stage.description}</p>
             </Card>
           );
         })}
       </div>
 
-      {/* Application Queue Tabs */}
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-        <TabsList>
-          <TabsTrigger value="all" data-testid="tab-all">
-            All ({allApplications.length})
-          </TabsTrigger>
-          <TabsTrigger value="new" data-testid="tab-new">
-            New ({newApplications.length})
-          </TabsTrigger>
-          <TabsTrigger value="scrutiny" data-testid="tab-scrutiny">
-            Under Scrutiny ({underScrutiny.length})
-          </TabsTrigger>
-          <TabsTrigger value="forwarded" data-testid="tab-forwarded">
-            Forwarded ({forwarded.length})
-          </TabsTrigger>
-          <TabsTrigger value="reverted" data-testid="tab-reverted">
-            Sent Back ({reverted.length})
-          </TabsTrigger>
-        </TabsList>
-
-        {/* All Applications Tab */}
-        <TabsContent value="all">
-          <Card>
-            <CardHeader>
-              <CardTitle>All District Applications</CardTitle>
-              <CardDescription>
-                Every homestay application in your district across all stages
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <AllApplicationsTable applications={allApplications} />
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        {/* New Applications Tab */}
-        <TabsContent value="new">
-          <Card>
-            <CardHeader>
-              <CardTitle>New Applications Awaiting Scrutiny</CardTitle>
-              <CardDescription>
-                Applications submitted by property owners requiring initial review
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {newApplications.length === 0 ? (
-                <div className="text-center py-12 text-muted-foreground">
-                  <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                  <p>No new applications at this time</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {newApplications.map((app) => (
-                    <ApplicationRow 
-                      key={app.id} 
-                      application={app} 
-                      actionLabel="Start Scrutiny"
-                      applicationIds={newApplications.map(a => a.id)}
-                    />
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        {/* Under Scrutiny Tab */}
-        <TabsContent value="scrutiny">
-          <Card>
-            <CardHeader>
-              <CardTitle>Applications Under Scrutiny</CardTitle>
-              <CardDescription>
-                Applications currently being reviewed by you
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {underScrutiny.length === 0 ? (
-                <div className="text-center py-12 text-muted-foreground">
-                  <Search className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                  <p>No applications under scrutiny</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {underScrutiny.map((app) => (
-                    <ApplicationRow 
-                      key={app.id} 
-                      application={app} 
-                      actionLabel="Continue Review"
-                      applicationIds={underScrutiny.map(a => a.id)}
-                    />
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        {/* Forwarded Tab */}
-        <TabsContent value="forwarded">
-          <Card>
-            <CardHeader>
-              <CardTitle>Forwarded to DTDO</CardTitle>
-              <CardDescription>
-                Applications you've approved and sent to District Officer
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {forwarded.length === 0 ? (
-                <div className="text-center py-12 text-muted-foreground">
-                  <CheckCircle className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                  <p>No forwarded applications</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {forwarded.map((app) => (
-                    <ApplicationRow 
-                      key={app.id} 
-                      application={app} 
-                      actionLabel="View Details"
-                      applicationIds={forwarded.map(a => a.id)}
-                    />
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        {/* Reverted Tab */}
-        <TabsContent value="reverted">
-          <Card>
-            <CardHeader>
-              <CardTitle>Sent Back to Applicant</CardTitle>
-              <CardDescription>
-                Applications returned to property owners for corrections
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {reverted.length === 0 ? (
-                <div className="text-center py-12 text-muted-foreground">
-                  <AlertCircle className="w-12 h-12 mx-auto mb-4 opacity-50" />
-                  <p>No reverted applications</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {reverted.map((app) => (
-                    <ApplicationRow 
-                      key={app.id} 
-                      application={app} 
-                      actionLabel="View Details"
-                      applicationIds={reverted.map(a => a.id)}
-                    />
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
-
-interface ApplicationRowProps {
-  application: ApplicationWithOwner;
-  actionLabel: string;
-  applicationIds: string[];
-}
-
-function ApplicationRow({ application, actionLabel, applicationIds }: ApplicationRowProps) {
-  return (
-    <div className="flex items-center justify-between p-4 border rounded-lg hover-elevate">
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-3 mb-2">
-          <h3 className="font-semibold truncate">{application.propertyName}</h3>
-          {renderCategoryBadge(application.category)}
-          {renderStatusBadge(application.status)}
+      {activeStageConfig && (
+        <div className="flex flex-wrap gap-2 bg-muted/30 p-3 rounded-3xl mb-6">
+          {activeStageConfig.pills.map((pill) => {
+            const isActivePill = pill.value === activePillConfig?.value;
+            const isAttentionPill =
+              (pill.value === "corrections-waiting" || pill.value === "corrections-resubmitted") && pill.count > 0;
+            return (
+              <button
+                key={pill.value}
+                type="button"
+                className={cn(
+                  "px-4 py-1.5 rounded-full border text-sm font-semibold flex items-center gap-2 transition-colors",
+                  isActivePill
+                    ? "bg-primary text-primary-foreground border-primary shadow-sm"
+                    : "bg-white text-foreground border-border hover:bg-muted"
+                )}
+                onClick={() => {
+                  setActiveStage(activeStageConfig.key);
+                  setActivePill(pill.value);
+                }}
+              >
+                <span>{pill.label}</span>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold">
+                  {pill.count}
+                </span>
+                {isAttentionPill && !isActivePill && <span className="h-2 w-2 rounded-full bg-amber-500" />}
+              </button>
+            );
+          })}
         </div>
-        <div className="grid grid-cols-2 gap-3 text-sm text-muted-foreground">
+      )}
+
+      {scheduledInspections.length > 0 && (
+        <div className="mb-8 rounded-xl border border-amber-200 bg-amber-50 p-4 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <span className="font-medium">Owner:</span> {application.ownerName}
+            <p className="text-sm font-semibold text-amber-800">Inspections need attention</p>
+            <p className="text-sm text-amber-900/80">
+              {scheduledInspections.length} inspection{scheduledInspections.length === 1 ? "" : "s"} are awaiting field
+              reports.
+            </p>
           </div>
-          <div>
-            <span className="font-medium">Mobile:</span> {application.ownerMobile}
-          </div>
-          <div>
-            <span className="font-medium">District:</span> {application.district}
-          </div>
-          <div>
-            <span className="font-medium">Submitted:</span>{' '}
-            {application.submittedAt ? format(new Date(application.submittedAt), 'MMM dd, yyyy') : 'N/A'}
-          </div>
-        </div>
-      </div>
-      <div className="ml-4">
-        <Link 
-          href={`/da/applications/${application.id}?queue=${encodeURIComponent(applicationIds.join(','))}`}
-        >
-          <Button data-testid={`button-review-${application.id}`}>
-            {actionLabel}
-            <ArrowRight className="w-4 h-4 ml-2" />
+          <Button
+            variant="outline"
+            className="border-amber-300 text-amber-900 hover:bg-amber-100"
+            onClick={navigateToInspections}
+          >
+            <BellRing className="w-4 h-4 mr-2" />
+            View inspection queue
           </Button>
-        </Link>
-      </div>
+        </div>
+      )}
+
+      {activeStageConfig && activePillConfig && (
+        <Card data-testid={`stage-${activeStageConfig.key}-${activePillConfig.value}`}>
+          <CardHeader className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <CardTitle>{activePillConfig.label}</CardTitle>
+              <CardDescription>{activePillConfig.description}</CardDescription>
+            </div>
+            {!activePillConfig.render && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span>Sort</span>
+                <Select value={sortOrder} onValueChange={(value: SortOrder) => setSortOrder(value)}>
+                  <SelectTrigger className="w-[140px]">
+                    <SelectValue placeholder="Sort order" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="newest">Newest first</SelectItem>
+                    <SelectItem value="oldest">Oldest first</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </CardHeader>
+          <CardContent>
+            {activePillConfig.render ? (
+              activePillConfig.render(activePillConfig.applications)
+            ) : activePillConfig.applications.length === 0 ? (
+              <div className="text-center py-12 text-muted-foreground border rounded-lg">
+                <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p className="font-medium">{activePillConfig.emptyTitle}</p>
+                <p className="text-sm mt-1">{activePillConfig.emptyDescription}</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {activePillConfig.applications.map((application) => (
+                  <ApplicationPipelineRow
+                    key={application.id}
+                    application={application}
+                    actionLabel={activePillConfig.actionLabel ?? "Open application"}
+                    applicationIds={activePillConfig.applications.map((a) => a.id)}
+                  />
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
 
-function AllApplicationsTable({ applications }: { applications: ApplicationWithOwner[] }) {
-  if (applications.length === 0) {
-    return (
-      <div className="text-center py-12 text-muted-foreground border rounded-lg">
-        <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
-        <p>No applications have been created in this district yet.</p>
-      </div>
-    );
-  }
+interface StageConfig {
+  key: string;
+  title: string;
+  description: string;
+  icon: LucideIcon;
+  totalCount?: number;
+  pills: StagePillConfig[];
+}
+
+interface StagePillConfig {
+  value: string;
+  label: string;
+  count: number;
+  description: string;
+  applications: ApplicationWithOwner[];
+  actionLabel?: string;
+  emptyTitle: string;
+  emptyDescription: string;
+  render?: (applications: ApplicationWithOwner[]) => JSX.Element;
+}
+
+interface InspectionSummaryCardProps {
+  count: number;
+  variant: "pending" | "completed";
+  onNavigate: () => void;
+  subtitle?: string;
+}
+
+function InspectionSummaryCard({ count, variant, onNavigate, subtitle }: InspectionSummaryCardProps) {
+  const isPending = variant === "pending";
+  const title = isPending ? "Scheduled inspections" : "Completed inspections";
+  const description = subtitle
+    ? subtitle
+    : isPending
+      ? "Field visits are scheduled and waiting for updates."
+      : "These inspections already include submitted reports.";
+  const buttonLabel = isPending ? "Capture inspection updates" : "View inspection history";
 
   return (
-    <div className="border rounded-lg">
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50">
-            <tr className="border-b">
-              <th className="text-left p-4 font-medium">Application #</th>
-              <th className="text-left p-4 font-medium">Property</th>
-              <th className="text-left p-4 font-medium">Owner</th>
-              <th className="text-left p-4 font-medium">Location</th>
-              <th className="text-left p-4 font-medium">Status</th>
-              <th className="text-left p-4 font-medium">Submitted</th>
-              <th className="text-left p-4 font-medium">Updated</th>
-              <th className="text-right p-4 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {applications.map((app) => {
-              const submittedAtDate = app.submittedAt ? new Date(app.submittedAt) : null;
-              const updatedAtDate = app.updatedAt ? new Date(app.updatedAt) : null;
-              return (
-                <tr key={app.id} className="border-b hover-elevate">
-                  <td className="p-4">
-                    <div className="font-medium">{app.applicationNumber || "N/A"}</div>
-                    <div className="text-xs text-muted-foreground">{app.projectType?.replace(/_/g, " ") || ""}</div>
-                  </td>
-                  <td className="p-4">
-                    <div className="font-medium flex items-center gap-2">
-                      {app.propertyName}
-                      {renderCategoryBadge(app.category)}
-                    </div>
-                    <div className="text-xs text-muted-foreground">{app.totalRooms} rooms</div>
-                  </td>
-                  <td className="p-4">
-                    <div>{app.ownerName}</div>
-                    <div className="text-xs text-muted-foreground">{app.ownerMobile}</div>
-                  </td>
-                  <td className="p-4">
-                    <div>{app.tehsil || app.block || "Not Provided"}</div>
-                    <div className="text-xs text-muted-foreground">{app.district}</div>
-                  </td>
-                  <td className="p-4">{renderStatusBadge(app.status)}</td>
-                  <td className="p-4">
-                    {submittedAtDate ? format(submittedAtDate, "MMM dd, yyyy") : "N/A"}
-                  </td>
-                  <td className="p-4">
-                    {updatedAtDate ? format(updatedAtDate, "MMM dd, yyyy") : "N/A"}
-                  </td>
-                  <td className="p-4 text-right">
-                    <Link href={`/da/applications/${app.id}`}>
-                      <Button size="sm" variant="ghost">
-                        View <ArrowRight className="ml-2 h-4 w-4" />
-                      </Button>
-                    </Link>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+    <div className="text-center py-8 space-y-4">
+      <div className="space-y-1">
+        <p className="text-sm uppercase tracking-wide text-muted-foreground">{title}</p>
+        <p className="text-4xl font-semibold">{count}</p>
+        <p className="text-muted-foreground">{description}</p>
       </div>
+      <Button onClick={onNavigate} variant={isPending ? "default" : "outline"} className="gap-2">
+        {buttonLabel}
+      </Button>
     </div>
   );
 }

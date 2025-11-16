@@ -14,13 +14,48 @@ import { Users, UserCheck, Shield, Building2, MapPin, Search, UserPlus, Edit } f
 import { useState } from "react";
 import type { User } from "@shared/schema";
 
+type NewUserFormState = {
+  mobile: string;
+  fullName: string;
+  firstName: string;
+  lastName: string;
+  username: string;
+  email: string;
+  alternatePhone: string;
+  designation: string;
+  department: string;
+  employeeId: string;
+  officeAddress: string;
+  officePhone: string;
+  role: string;
+  district: string;
+  password: string;
+  confirmPassword: string;
+};
+
+type EditUserFormState = {
+  firstName: string;
+  lastName: string;
+  username: string;
+  email: string;
+  alternatePhone: string;
+  designation: string;
+  department: string;
+  employeeId: string;
+  district: string;
+  officeAddress: string;
+  officePhone: string;
+  password: string;
+  confirmPassword: string;
+};
+
 export default function AdminUsers() {
   const { toast } = useToast();
   const [searchTerm, setSearchTerm] = useState("");
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
-  const [newUserData, setNewUserData] = useState({
+  const [newUserData, setNewUserData] = useState<NewUserFormState>({
     mobile: "",
     fullName: "",
     firstName: "",
@@ -36,8 +71,9 @@ export default function AdminUsers() {
     role: "property_owner",
     district: "",
     password: "",
+    confirmPassword: "",
   });
-  const [editUserData, setEditUserData] = useState({
+  const [editUserData, setEditUserData] = useState<EditUserFormState>({
     firstName: "",
     lastName: "",
     username: "",
@@ -50,6 +86,7 @@ export default function AdminUsers() {
     officeAddress: "",
     officePhone: "",
     password: "",
+    confirmPassword: "",
   });
 
   const { data: usersData, isLoading } = useQuery<{ users: User[] }>({
@@ -103,7 +140,7 @@ export default function AdminUsers() {
   });
 
   const createUserMutation = useMutation({
-    mutationFn: async (data: typeof newUserData) => {
+    mutationFn: async (data: Omit<NewUserFormState, "confirmPassword">) => {
       return await apiRequest("POST", "/api/admin/users", data);
     },
     onSuccess: () => {
@@ -125,6 +162,7 @@ export default function AdminUsers() {
         role: "property_owner",
         district: "",
         password: "",
+        confirmPassword: "",
       });
       toast({
         title: "User Created",
@@ -141,7 +179,7 @@ export default function AdminUsers() {
   });
 
   const editUserMutation = useMutation({
-    mutationFn: async (data: { userId: string; updates: typeof editUserData }) => {
+    mutationFn: async (data: { userId: string; updates: Omit<EditUserFormState, "confirmPassword"> }) => {
       return await apiRequest("PATCH", `/api/admin/users/${data.userId}`, data.updates);
     },
     onSuccess: () => {
@@ -161,6 +199,7 @@ export default function AdminUsers() {
         officeAddress: "",
         officePhone: "",
         password: "",
+        confirmPassword: "",
       });
       toast({
         title: "User Updated",
@@ -180,24 +219,33 @@ export default function AdminUsers() {
     // Validate based on role type
     if (newUserData.role !== 'property_owner') {
       // Staff users require firstName, lastName, mobile, and password
-      if (!newUserData.firstName || !newUserData.lastName || !newUserData.mobile || !newUserData.password) {
+      if (!newUserData.firstName || !newUserData.lastName || !newUserData.mobile || !newUserData.password || !newUserData.confirmPassword) {
         toast({
           title: "Validation Error",
-          description: "Please fill in first name, last name, mobile, and password",
+          description: "Please fill in first name, last name, mobile, and password (with confirmation)",
           variant: "destructive",
         });
         return;
       }
     } else {
       // Property owners require fullName, mobile, and password
-      if (!newUserData.mobile || !newUserData.fullName || !newUserData.password) {
+      if (!newUserData.mobile || !newUserData.fullName || !newUserData.password || !newUserData.confirmPassword) {
         toast({
           title: "Validation Error",
-          description: "Please fill in all required fields",
+          description: "Please fill in all required fields (including confirm password)",
           variant: "destructive",
         });
         return;
       }
+    }
+
+    if (newUserData.password !== newUserData.confirmPassword) {
+      toast({
+        title: "Password mismatch",
+        description: "New password and confirm password must match.",
+        variant: "destructive",
+      });
+      return;
     }
 
     // For staff users, auto-generate fullName from firstName + lastName if not set
@@ -206,7 +254,8 @@ export default function AdminUsers() {
       userData.fullName = `${newUserData.firstName} ${newUserData.lastName}`;
     }
 
-    createUserMutation.mutate(userData);
+    const { confirmPassword, ...payload } = userData;
+    createUserMutation.mutate(payload);
   };
 
   const handleEditUser = (user: User) => {
@@ -224,6 +273,7 @@ export default function AdminUsers() {
       officeAddress: user.officeAddress || "",
       officePhone: user.officePhone || "",
       password: "",
+      confirmPassword: "",
     });
     setEditDialogOpen(true);
   };
@@ -243,7 +293,26 @@ export default function AdminUsers() {
       }
     }
 
-    const updates: any = {
+    if (editUserData.password) {
+      if (!editUserData.confirmPassword) {
+        toast({
+          title: "Validation Error",
+          description: "Please confirm the new password.",
+          variant: "destructive",
+        });
+        return;
+      }
+      if (editUserData.password !== editUserData.confirmPassword) {
+        toast({
+          title: "Password mismatch",
+          description: "New password and confirm password must match.",
+          variant: "destructive",
+        });
+        return;
+      }
+    }
+
+    const updatesBase: any = {
       ...editUserData,
       email: editUserData.email || null,
       district: editUserData.district || null,
@@ -254,6 +323,7 @@ export default function AdminUsers() {
       officeAddress: editUserData.officeAddress || null,
       officePhone: editUserData.officePhone || null,
     };
+    const { confirmPassword, ...updates } = updatesBase;
 
     // Keep staff display name consistent across dashboards
     if (
@@ -390,6 +460,7 @@ export default function AdminUsers() {
                       <SelectItem value="district_officer">District Officer</SelectItem>
                       <SelectItem value="state_officer">State Officer</SelectItem>
                       <SelectItem value="admin">Admin</SelectItem>
+                      <SelectItem value="admin_rc">Admin RC</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -402,28 +473,32 @@ export default function AdminUsers() {
                       <h3 className="text-sm font-semibold text-foreground">Personal Information</h3>
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-2">
-                          <Label htmlFor="create-firstName">First Name *</Label>
-                          <Input
-                            id="create-firstName"
-                            placeholder="First name"
-                            value={newUserData.firstName}
-                            onChange={(e) => setNewUserData({ ...newUserData, firstName: e.target.value })}
-                            data-testid="input-create-firstname"
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label htmlFor="create-lastName">Last Name *</Label>
-                          <Input
-                            id="create-lastName"
-                            placeholder="Last name"
-                            value={newUserData.lastName}
-                            onChange={(e) => setNewUserData({ ...newUserData, lastName: e.target.value })}
-                            data-testid="input-create-lastname"
-                          />
+                        <Label htmlFor="create-firstName">First Name *</Label>
+                        <Input
+                          id="create-firstName"
+                          placeholder="First name"
+                          value={newUserData.firstName}
+                          onChange={(e) => setNewUserData({ ...newUserData, firstName: e.target.value })}
+                          data-testid="input-create-firstname"
+                          characterRestriction="alpha-space"
+                          maxLength={60}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="create-lastName">Last Name *</Label>
+                        <Input
+                          id="create-lastName"
+                          placeholder="Last name"
+                          value={newUserData.lastName}
+                          onChange={(e) => setNewUserData({ ...newUserData, lastName: e.target.value })}
+                          data-testid="input-create-lastname"
+                          characterRestriction="alpha-space"
+                          maxLength={60}
+                        />
                         </div>
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="create-username">Username</Label>
+                        <Label htmlFor="create-username">Username *</Label>
                         <Input
                           id="create-username"
                           placeholder="e.g., rajesh.kumar"
@@ -445,6 +520,8 @@ export default function AdminUsers() {
                           value={newUserData.mobile}
                           onChange={(e) => setNewUserData({ ...newUserData, mobile: e.target.value })}
                           data-testid="input-create-mobile"
+                          characterRestriction="numeric"
+                          maxLength={10}
                         />
                       </div>
                       <div className="space-y-2">
@@ -466,6 +543,8 @@ export default function AdminUsers() {
                           value={newUserData.alternatePhone}
                           onChange={(e) => setNewUserData({ ...newUserData, alternatePhone: e.target.value })}
                           data-testid="input-create-alternate-phone"
+                          characterRestriction="numeric"
+                          maxLength={10}
                         />
                       </div>
                     </div>
@@ -537,6 +616,8 @@ export default function AdminUsers() {
                           value={newUserData.officePhone}
                           onChange={(e) => setNewUserData({ ...newUserData, officePhone: e.target.value })}
                           data-testid="input-create-office-phone"
+                          characterRestriction="numeric"
+                          maxLength={10}
                         />
                       </div>
                     </div>
@@ -552,6 +633,8 @@ export default function AdminUsers() {
                         value={newUserData.mobile}
                         onChange={(e) => setNewUserData({ ...newUserData, mobile: e.target.value })}
                         data-testid="input-create-mobile"
+                        characterRestriction="numeric"
+                        maxLength={10}
                       />
                     </div>
                     <div className="space-y-2">
@@ -562,6 +645,8 @@ export default function AdminUsers() {
                         value={newUserData.fullName}
                         onChange={(e) => setNewUserData({ ...newUserData, fullName: e.target.value })}
                         data-testid="input-create-fullname"
+                        characterRestriction="alpha-space"
+                        maxLength={120}
                       />
                     </div>
                   </>
@@ -579,6 +664,17 @@ export default function AdminUsers() {
                       value={newUserData.password}
                       onChange={(e) => setNewUserData({ ...newUserData, password: e.target.value })}
                       data-testid="input-create-password"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="create-confirm-password">Confirm Password *</Label>
+                    <Input
+                      id="create-confirm-password"
+                      type="password"
+                      placeholder="Re-enter password"
+                      value={newUserData.confirmPassword}
+                      onChange={(e) => setNewUserData({ ...newUserData, confirmPassword: e.target.value })}
+                      data-testid="input-create-confirm-password"
                     />
                   </div>
                 </div>
@@ -875,6 +971,8 @@ export default function AdminUsers() {
                     value={editUserData.firstName}
                     onChange={(e) => setEditUserData({ ...editUserData, firstName: e.target.value })}
                     data-testid="input-edit-firstname"
+                    characterRestriction="alpha-space"
+                    maxLength={60}
                   />
                 </div>
                 <div className="space-y-2">
@@ -885,10 +983,12 @@ export default function AdminUsers() {
                     value={editUserData.lastName}
                     onChange={(e) => setEditUserData({ ...editUserData, lastName: e.target.value })}
                     data-testid="input-edit-lastname"
+                    characterRestriction="alpha-space"
+                    maxLength={60}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="edit-username">Username</Label>
+                  <Label htmlFor="edit-username">Username (staff only)</Label>
                   <Input
                     id="edit-username"
                     placeholder="Enter username"
@@ -932,6 +1032,8 @@ export default function AdminUsers() {
                     value={editUserData.alternatePhone}
                     onChange={(e) => setEditUserData({ ...editUserData, alternatePhone: e.target.value })}
                     data-testid="input-edit-alternatephone"
+                    characterRestriction="numeric"
+                    maxLength={10}
                   />
                 </div>
               </div>
@@ -999,6 +1101,8 @@ export default function AdminUsers() {
                     value={editUserData.officePhone}
                     onChange={(e) => setEditUserData({ ...editUserData, officePhone: e.target.value })}
                     data-testid="input-edit-officephone"
+                    characterRestriction="numeric"
+                    maxLength={10}
                   />
                 </div>
               </div>
@@ -1007,17 +1111,28 @@ export default function AdminUsers() {
             {/* Security Section */}
             <div className="space-y-4">
               <h3 className="text-sm font-semibold text-foreground border-b pb-2">Security</h3>
-              <div className="space-y-2">
-                <Label htmlFor="edit-password">New Password (optional)</Label>
-                <Input
-                  id="edit-password"
-                  type="password"
+                <div className="space-y-2">
+                  <Label htmlFor="edit-password">New Password (optional)</Label>
+                  <Input
+                    id="edit-password"
+                    type="password"
                   placeholder="Leave empty to keep current password"
                   value={editUserData.password}
-                  onChange={(e) => setEditUserData({ ...editUserData, password: e.target.value })}
-                  data-testid="input-edit-password"
-                />
-              </div>
+                    onChange={(e) => setEditUserData({ ...editUserData, password: e.target.value })}
+                    data-testid="input-edit-password"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-confirm-password">Confirm New Password</Label>
+                  <Input
+                    id="edit-confirm-password"
+                    type="password"
+                    placeholder="Re-enter new password"
+                    value={editUserData.confirmPassword}
+                    onChange={(e) => setEditUserData({ ...editUserData, confirmPassword: e.target.value })}
+                    data-testid="input-edit-confirm-password"
+                  />
+                </div>
             </div>
           </div>
         ) : (

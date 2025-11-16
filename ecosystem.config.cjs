@@ -1,16 +1,18 @@
 module.exports = {
   apps: [
     {
-      name: "hptourism-rc3",
+      name: "hptourism-stg-rc3",
       // Run the compiled server bundle
       script: "dist/index.js",
       cwd: __dirname,
       node_args: "--enable-source-maps",
       env: {
         NODE_ENV: "production",
-        PORT: process.env.PORT || "5000",
-        DATABASE_URL: process.env.DATABASE_URL || "postgresql://hptourism_user:8fd2fa604c5cd25571427be2ec22bf4c@localhost:5432/hptourism",
-        SESSION_SECRET: process.env.SESSION_SECRET || "hp-tourism-local-dev-secret",
+        PORT: process.env.PORT || "4000",
+        DATABASE_URL: process.env.DATABASE_URL || "postgresql://hptourism_user:8fd2fa604c5cd25571427be2ec22bf4c@localhost:5432/hptourism_stg",
+        SESSION_SECRET:
+          process.env.SESSION_SECRET ||
+          "hp-tourism-rc4-session-secret-2025-safe",
         OBJECT_STORAGE_MODE: process.env.OBJECT_STORAGE_MODE || "local",
         LOCAL_OBJECT_DIR: process.env.LOCAL_OBJECT_DIR || `${__dirname}/local-object-storage`,
         LOCAL_MAX_UPLOAD_BYTES: process.env.LOCAL_MAX_UPLOAD_BYTES || String(20 * 1024 * 1024),
@@ -28,6 +30,8 @@ module.exports = {
         HIMKOSH_ALLOW_DEV_FALLBACK: process.env.HIMKOSH_ALLOW_DEV_FALLBACK || "false",
         HIMKOSH_KEY_FILE_PATH:
           process.env.HIMKOSH_KEY_FILE_PATH || `${__dirname}/server/himkosh/echallan.key`,
+        SECURITY_ENABLE_RATE_LIMIT: process.env.SECURITY_ENABLE_RATE_LIMIT || "false",
+        CAPTCHA_FORCE_DISABLE: process.env.CAPTCHA_FORCE_DISABLE || "true",
       },
       instances: 1,
       autorestart: true,

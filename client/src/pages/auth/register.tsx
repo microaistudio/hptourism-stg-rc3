@@ -6,19 +6,25 @@ import { useMutation } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
 import { Mountain, Loader2 } from "lucide-react";
 import { NavigationHeader } from "@/components/navigation-header";
 
-const registerSchema = z.object({
-  fullName: z.string().min(3, "Name must be at least 3 characters"),
-  mobile: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit mobile number"),
-  email: z.string().email("Enter a valid email").optional().or(z.literal("")),
-  password: z.string().min(6, "Password must be at least 6 characters"),
-  aadhaarNumber: z.string().regex(/^\d{12}$/, "Aadhaar must be 12 digits").optional().or(z.literal("")),
-});
+const registerSchema = z
+  .object({
+    fullName: z.string().min(3, "Name must be at least 3 characters"),
+    mobile: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit mobile number"),
+    email: z.string().email("Enter a valid email").optional().or(z.literal("")),
+    password: z.string().min(6, "Password must be at least 6 characters"),
+    confirmPassword: z.string().min(6, "Confirm password must be at least 6 characters"),
+    aadhaarNumber: z.string().regex(/^\d{12}$/, "Aadhaar must be 12 digits").optional().or(z.literal("")),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: "Passwords do not match",
+    path: ["confirmPassword"],
+  });
 
 type RegisterForm = z.infer<typeof registerSchema>;
 
@@ -33,17 +39,19 @@ export default function Register() {
       mobile: "",
       email: "",
       password: "",
+      confirmPassword: "",
       aadhaarNumber: "",
     },
   });
 
   const registerMutation = useMutation({
     mutationFn: async (data: RegisterForm) => {
+      const { confirmPassword, ...formData } = data;
       const cleanData = {
-        ...data,
+        ...formData,
         role: "property_owner", // Hardcoded: public registration only for property owners
-        email: data.email || undefined,
-        aadhaarNumber: data.aadhaarNumber || undefined,
+        email: formData.email || undefined,
+        aadhaarNumber: formData.aadhaarNumber || undefined,
       };
       const response = await apiRequest("POST", "/api/auth/register", cleanData);
       return response.json();
@@ -102,6 +110,8 @@ export default function Register() {
                         <Input
                           placeholder="Enter your full name"
                           data-testid="input-fullname"
+                          characterRestriction="alpha-space"
+                          maxLength={100}
                           {...field}
                         />
                       </FormControl>
@@ -120,6 +130,8 @@ export default function Register() {
                         <Input
                           placeholder="10-digit mobile number"
                           data-testid="input-mobile"
+                          characterRestriction="numeric"
+                          maxLength={10}
                           {...field}
                         />
                       </FormControl>
@@ -151,6 +163,28 @@ export default function Register() {
 
                 <FormField
                   control={form.control}
+                  name="aadhaarNumber"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Aadhaar Number (Optional)</FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder="12-digit Aadhaar number"
+                          data-testid="input-aadhaar"
+                          characterRestriction="numeric"
+                          maxLength={12}
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <FormField
+                  control={form.control}
                   name="password"
                   render={({ field }) => (
                     <FormItem>
@@ -167,25 +201,26 @@ export default function Register() {
                     </FormItem>
                   )}
                 />
-              </div>
 
-              <FormField
-                control={form.control}
-                name="aadhaarNumber"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Aadhaar Number (Optional)</FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder="12-digit Aadhaar number"
-                        data-testid="input-aadhaar"
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+                <FormField
+                  control={form.control}
+                  name="confirmPassword"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Confirm Password</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="password"
+                          placeholder="Re-enter password"
+                          data-testid="input-confirm-password"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
 
               <Button 
                 type="submit" 

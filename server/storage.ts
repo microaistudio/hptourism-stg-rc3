@@ -1,10 +1,16 @@
 import { type User, type InsertUser, type HomestayApplication, type InsertHomestayApplication, type Document, type InsertDocument, type Payment, type InsertPayment, type Notification, type InsertNotification, type ApplicationAction, type InsertApplicationAction } from "@shared/schema";
 import { randomUUID } from "crypto";
+import { config } from "@shared/config";
+import { normalizeUsername } from "@shared/userUtils";
+import { formatApplicationNumber } from "@shared/applicationNumber";
+import { lookupStaffAccountByIdentifier } from "@shared/districtStaffManifest";
 
 export interface IStorage {
   // User methods
   getUser(id: string): Promise<User | undefined>;
   getUserByMobile(mobile: string): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  getUserByEmail(email: string): Promise<User | undefined>;
   getAllUsers(): Promise<User[]>;
   createUser(user: InsertUser): Promise<User>;
   updateUser(id: string, updates: Partial<User>): Promise<User | undefined>;
@@ -84,6 +90,34 @@ export class MemStorage implements IStorage {
       (user) => user.mobile === mobile,
     );
   }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    const normalized = normalizeUsername(username);
+    if (!normalized) {
+      return undefined;
+    }
+    const match = Array.from(this.users.values()).find(
+      (user) => user.username === normalized,
+    );
+    if (match) {
+      return match;
+    }
+    const manifestEntry = lookupStaffAccountByIdentifier(normalized);
+    if (manifestEntry) {
+      return this.getUserByMobile(manifestEntry.mobile);
+    }
+    return undefined;
+  }
+
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const normalized = email?.trim().toLowerCase();
+    if (!normalized) {
+      return undefined;
+    }
+    return Array.from(this.users.values()).find(
+      (user) => (user.email ?? "").toLowerCase() === normalized,
+    );
+  }
   
   async getAllUsers(): Promise<User[]> {
     return Array.from(this.users.values());
@@ -92,13 +126,14 @@ export class MemStorage implements IStorage {
   async createUser(insertUser: InsertUser): Promise<User> {
     const id = randomUUID();
     const now = new Date();
+    const normalizedUsername = normalizeUsername(insertUser.username);
     const user: User = { 
       ...insertUser, 
       id,
       fullName: insertUser.fullName,
       firstName: insertUser.firstName ?? null,
       lastName: insertUser.lastName ?? null,
-      username: insertUser.username ?? null,
+      username: normalizedUsername,
       email: insertUser.email ?? null,
       alternatePhone: insertUser.alternatePhone ?? null,
       designation: insertUser.designation ?? null,
@@ -120,10 +155,17 @@ export class MemStorage implements IStorage {
   async updateUser(id: string, updates: Partial<User>): Promise<User | undefined> {
     const user = this.users.get(id);
     if (!user) return undefined;
+
+    const processedUpdates: Partial<User> = {
+      ...updates,
+    };
+    if (updates.username !== undefined) {
+      processedUpdates.username = normalizeUsername(updates.username);
+    }
     
     const updatedUser: User = {
       ...user,
-      ...updates,
+      ...processedUpdates,
       id: user.id, // Prevent ID from being changed
       createdAt: user.createdAt, // Preserve creation date
       updatedAt: new Date(), // Update modification date
@@ -161,7 +203,7 @@ export class MemStorage implements IStorage {
   async createApplication(insertApp: InsertHomestayApplication, options?: { trusted?: boolean }): Promise<HomestayApplication> {
     const id = randomUUID();
     const now = new Date();
-    const applicationNumber = `HP-HS-2025-${String(this.applications.size + 1).padStart(6, '0')}`;
+    const applicationNumber = formatApplicationNumber(this.applications.size + 1, insertApp.district);
     
     // Security: Only trusted server code (not client requests) can override status
     // Untrusted calls (from client) always get 'draft' status
@@ -170,10 +212,12 @@ export class MemStorage implements IStorage {
     const submittedAt = isTrusted && insertApp.submittedAt ? insertApp.submittedAt : (status === 'pending' ? now : null);
     const currentStage = status === 'pending' ? 'district' : null;
     
+    const applicationKind = insertApp.applicationKind ?? 'new_registration';
     const app = ({
       ...(MemStorage.normalizeNullable(insertApp) as InsertHomestayApplication),
       id,
       applicationNumber,
+      applicationKind,
       latitude: insertApp.latitude ?? null,
       longitude: insertApp.longitude ?? null,
       ownerEmail: insertApp.ownerEmail ?? null,
@@ -402,6 +446,6 @@ import { DbStorage } from './db-storage';
 
 // Use DbStorage by default (PostgreSQL)
 // Set USE_MEM_STORAGE=true to use in-memory storage (testing only)
-export const storage: IStorage = process.env.USE_MEM_STORAGE === 'true' 
-  ? new MemStorage() 
+export const storage: IStorage = config.storage.useMemory
+  ? new MemStorage()
   : new DbStorage();

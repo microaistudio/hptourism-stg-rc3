@@ -1,10 +1,9 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, useLocation } from "wouter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import {
@@ -21,22 +20,26 @@ import {
   XCircle,
   ArrowLeft,
   Loader2,
-  FileText,
   User,
   MapPin,
-  Home as HomeIcon,
-  Calendar,
   ClipboardCheck,
   AlertTriangle,
-  Shield,
-  Star,
   ThumbsUp,
   ThumbsDown,
+  Home as HomeIcon,
+  Printer,
+  Download,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { format } from "date-fns";
-import type { HomestayApplication, InspectionReport, InspectionOrder } from "@shared/schema";
+import type { HomestayApplication, InspectionReport, InspectionOrder, ApplicationKind } from "@shared/schema";
+import { ApplicationKindBadge, getApplicationKindLabel, isServiceApplication } from "@/components/application/application-kind-badge";
+import hpGovLogo from "@/assets/logos_tr/HP_Gov_TR.png";
+import hpTourismLogo from "@/assets/logos_tr/HP_Touris_TR.png";
+import { generateInspectionReportPdf } from "@/lib/inspectionReportPdf";
+import type { InspectionReportSummary } from "@/lib/inspection-report";
+import { DESIRABLE_POINTS, MANDATORY_POINTS } from "@/constants/inspection";
 
 interface InspectionReviewData {
   report: InspectionReport;
@@ -58,16 +61,23 @@ export default function DTDOInspectionReview() {
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   
-  const [actionType, setActionType] = useState<'approve' | 'reject' | 'objections' | null>(null);
+  const [actionType, setActionType] = useState<'approve' | 'reject' | 'revert' | null>(null);
   const [remarks, setRemarks] = useState("");
+  const [checklistTab, setChecklistTab] = useState<"mandatory" | "desirable">("mandatory");
 
   const { data, isLoading } = useQuery<InspectionReviewData>({
     queryKey: ["/api/dtdo/inspection-report", id],
   });
 
+  const actionEndpointMap = {
+    approve: "approve",
+    reject: "reject",
+    revert: "raise-objections",
+  } as const;
+
   const actionMutation = useMutation({
-    mutationFn: async ({ action, remarks }: { action: string; remarks: string }) => {
-      const response = await apiRequest("POST", `/api/dtdo/inspection-report/${id}/${action}`, {
+    mutationFn: async ({ endpoint, remarks }: { endpoint: string; remarks: string }) => {
+      const response = await apiRequest("POST", `/api/dtdo/inspection-report/${id}/${endpoint}`, {
         remarks,
       });
       return response.json();
@@ -89,6 +99,46 @@ export default function DTDOInspectionReview() {
       });
     },
   });
+
+  const inspectionSummary = useMemo<InspectionReportSummary | null>(() => {
+    if (!data) {
+      return null;
+    }
+    return {
+      report: data.report,
+      inspectionOrder: data.inspectionOrder,
+      application: {
+        id: data.application.id,
+        applicationNumber: data.application.applicationNumber,
+        propertyName: data.application.propertyName,
+        district: data.application.district,
+        tehsil: data.application.tehsil,
+        address: data.application.address,
+        category: data.application.category,
+        status: data.application.status,
+        siteInspectionOutcome: data.application.siteInspectionOutcome ?? null,
+        siteInspectionNotes: data.application.siteInspectionNotes ?? null,
+        siteInspectionCompletedDate: data.application.siteInspectionCompletedDate ?? null,
+      },
+      owner: data.owner
+        ? {
+            id: data.application.userId,
+            fullName: data.owner.fullName,
+            mobile: data.owner.mobile,
+            email: data.owner.email ?? null,
+          }
+        : null,
+      da: data.da
+        ? {
+            id: data.report.submittedBy,
+            fullName: data.da.fullName,
+            mobile: data.da.mobile,
+            district: data.application.district,
+          }
+        : null,
+      dtdo: null,
+    };
+  }, [data]);
 
   if (isLoading) {
     return (
@@ -117,8 +167,13 @@ export default function DTDOInspectionReview() {
   }
 
   const { report, application, inspectionOrder, owner, da } = data;
+  const applicationKind = application.applicationKind as ApplicationKind | undefined;
+  const isServiceApp = isServiceApplication(applicationKind);
+  const serviceLabel = getApplicationKindLabel(applicationKind);
+  const normalizedRecommendation = (report.recommendation || "").toLowerCase();
+  const hasDAObjection = normalizedRecommendation === "raise_objections";
 
-  const handleAction = (action: 'approve' | 'reject' | 'objections') => {
+  const handleAction = (action: 'approve' | 'reject' | 'revert') => {
     setActionType(action);
     setRemarks("");
   };
@@ -126,7 +181,7 @@ export default function DTDOInspectionReview() {
   const confirmAction = () => {
     if (!actionType) return;
     
-    if (!remarks.trim() && (actionType === 'reject' || actionType === 'objections')) {
+    if (!remarks.trim() && (actionType === 'reject' || actionType === 'revert')) {
       toast({
         title: "Remarks Required",
         description: `Please provide ${actionType === 'reject' ? 'rejection reason' : 'objection details'}`,
@@ -135,12 +190,13 @@ export default function DTDOInspectionReview() {
       return;
     }
 
-    actionMutation.mutate({ action: actionType, remarks: remarks.trim() });
+    const endpoint = actionEndpointMap[actionType];
+    actionMutation.mutate({ endpoint, remarks: remarks.trim() });
   };
 
   // Calculate compliance
-  const mandatoryChecklist = report.mandatoryChecklist as Record<string, boolean> || {};
-  const desirableChecklist = report.desirableChecklist as Record<string, boolean> || {};
+  const mandatoryChecklist = (report.mandatoryChecklist as Record<string, boolean>) || {};
+  const desirableChecklist = (report.desirableChecklist as Record<string, boolean>) || {};
   
   const mandatoryValues = Object.values(mandatoryChecklist);
   const mandatoryCompliance = mandatoryValues.length > 0 
@@ -151,6 +207,29 @@ export default function DTDOInspectionReview() {
   const desirableCompliance = desirableValues.length > 0
     ? Math.round((desirableValues.filter(Boolean).length / desirableValues.length) * 100)
     : 0;
+  const mandatoryMetCount = MANDATORY_POINTS.filter((point) => mandatoryChecklist?.[point.key]).length;
+  const desirableMetCount = DESIRABLE_POINTS.filter((point) => desirableChecklist?.[point.key]).length;
+  const mandatoryTotalPoints = MANDATORY_POINTS.length;
+  const desirableTotalPoints = DESIRABLE_POINTS.length;
+  const scheduledOn = inspectionOrder?.inspectionDate ? format(new Date(inspectionOrder.inspectionDate), "PPP") : "—";
+  const inspectionDoneOn = report.actualInspectionDate ? format(new Date(report.actualInspectionDate), "PPP") : "—";
+  const reportSubmittedOn = report.createdAt ? format(new Date(report.createdAt), "PPP") : "—";
+  const inspectionLocation = inspectionOrder?.inspectionAddress || "—";
+  const ownerMessage = inspectionOrder?.specialInstructions || null;
+  const recommendedCategory = report.recommendedCategory || application.category;
+  const recommendationLabel = hasDAObjection ? "Raise Objections" : "Recommend Verification";
+  const recommendationTone = hasDAObjection
+    ? "bg-amber-50 text-amber-700 border-amber-200"
+    : "bg-emerald-50 text-emerald-700 border-emerald-200";
+  const verificationFlags = [
+    { label: "Room Count Matches Application", value: report.roomCountVerified },
+    { label: "Category Meets Standards", value: report.categoryMeetsStandards },
+    { label: "Overall Satisfactory", value: report.overallSatisfactory },
+  ];
+
+  const handlePrint = () => {
+    window.print();
+  };
 
   const getCategoryBadge = (category: string) => {
     const colorMap: Record<string, string> = {
@@ -166,80 +245,124 @@ export default function DTDOInspectionReview() {
   };
 
   return (
-    <div className="container mx-auto p-6 max-w-7xl space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setLocation("/dtdo/dashboard")}
-            data-testid="button-back"
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">Inspection Report Review</h1>
-            <p className="text-muted-foreground mt-1">
-              Review and approve inspection findings
-            </p>
+    <div className="container mx-auto max-w-7xl space-y-6 p-6 print:space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="icon" onClick={() => setLocation("/dtdo/dashboard")} data-testid="button-back">
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+            Back to Dashboard
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {report.reportDocumentUrl ? (
+              <Button asChild variant="outline" size="sm" data-testid="button-download-report">
+                <a href={report.reportDocumentUrl} target="_blank" rel="noreferrer">
+                  <Download className="mr-2 h-4 w-4" /> Download Attachment
+                </a>
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => inspectionSummary && generateInspectionReportPdf(inspectionSummary)}
+                disabled={!inspectionSummary}
+                data-testid="button-generate-report-snapshot"
+              >
+                <Download className="mr-2 h-4 w-4" /> Download Snapshot
+              </Button>
+            )}
+            <Button variant="secondary" size="sm" onClick={handlePrint} data-testid="button-print-report">
+              <Printer className="mr-2 h-4 w-4" /> Print Report
+            </Button>
           </div>
         </div>
-        <Badge variant="outline" className="bg-green-50 text-green-700 dark:bg-green-950/20">
-          Under Review
-        </Badge>
-      </div>
 
-      {/* Quick Overview */}
-      <div className="grid gap-4 md:grid-cols-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Application</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{application.applicationNumber}</div>
-            <p className="text-xs text-muted-foreground mt-1">{application.propertyName}</p>
-          </CardContent>
-        </Card>
+      <div className="rounded-3xl border border-slate-200 bg-white shadow-sm print:border print:shadow-none">
+        <div className="flex flex-col items-center justify-between gap-4 border-b border-slate-100 px-6 py-6 md:flex-row">
+          <img src={hpGovLogo} alt="Government of Himachal Pradesh" className="h-16 w-auto" />
+          <div className="text-center md:text-left">
+            <p className="text-[11px] uppercase tracking-[0.4em] text-slate-500">Government of Himachal Pradesh</p>
+            <h1 className="text-3xl font-bold tracking-tight">District Inspection Memorandum</h1>
+            <p className="text-sm text-muted-foreground">
+              Application #{application.applicationNumber} • Homestay Registration 2025
+            </p>
+          </div>
+          <img src={hpTourismLogo} alt="Himachal Tourism" className="h-16 w-auto" />
+        </div>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Category</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="mt-2">{getCategoryBadge(report.recommendedCategory || application.category)}</div>
-            {report.categoryMeetsStandards ? (
-              <p className="text-xs text-green-600 dark:text-green-400 mt-1">✓ Meets standards</p>
-            ) : (
-              <p className="text-xs text-red-600 dark:text-red-400 mt-1">✗ Does not meet standards</p>
-            )}
-          </CardContent>
-        </Card>
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-6 py-4 text-xs uppercase tracking-wide text-muted-foreground">
+          <div>
+            <p>Status</p>
+            <Badge variant="outline" className={hasDAObjection ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}>
+              {hasDAObjection ? "DA Raised Objections" : "Under Review"}
+            </Badge>
+          </div>
+          <div>
+            <p>Inspection Window</p>
+            <p className="text-sm font-medium normal-case text-slate-900">
+              {scheduledOn} → {inspectionDoneOn}
+            </p>
+          </div>
+          <div>
+            <p>Report Submitted</p>
+            <p className="text-sm font-medium normal-case text-slate-900">{reportSubmittedOn}</p>
+          </div>
+        </div>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Mandatory Compliance</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold text-green-600 dark:text-green-400">{mandatoryCompliance}%</div>
-            <p className="text-xs text-muted-foreground mt-1">{mandatoryValues.filter(Boolean).length} of {mandatoryValues.length} met</p>
-          </CardContent>
-        </Card>
+        <div className="space-y-6 px-6 py-6">
+          <div className="grid gap-4 md:grid-cols-4">
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium text-muted-foreground">Application</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold">{application.applicationNumber}</div>
+                <p className="text-xs text-muted-foreground mt-1">{application.propertyName}</p>
+              </CardContent>
+            </Card>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Desirable Compliance</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">{desirableCompliance}%</div>
-            <p className="text-xs text-muted-foreground mt-1">{desirableValues.filter(Boolean).length} of {desirableValues.length} met</p>
-          </CardContent>
-        </Card>
-      </div>
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium text-muted-foreground">Category</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="mt-2">{getCategoryBadge(report.recommendedCategory || application.category)}</div>
+                {report.categoryMeetsStandards ? (
+                  <p className="text-xs text-green-600 dark:text-green-400 mt-1">✓ Meets standards</p>
+                ) : (
+                  <p className="text-xs text-red-600 dark:text-red-400 mt-1">✗ Does not meet standards</p>
+                )}
+              </CardContent>
+            </Card>
 
-      <div className="grid gap-6 md:grid-cols-3">
-        {/* Left Column - Application & Owner Details */}
-        <div className="space-y-6">
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium text-muted-foreground">Mandatory Compliance</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold text-green-600 dark:text-green-400">{mandatoryCompliance}%</div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {mandatoryValues.filter(Boolean).length} of {mandatoryValues.length} met
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium text-muted-foreground">Desirable Compliance</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">{desirableCompliance}%</div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {desirableValues.filter(Boolean).length} of {desirableValues.length} met
+                </p>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="grid gap-6 md:grid-cols-3">
+            {/* Left Column */}
+            <div className="space-y-6">
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
@@ -325,7 +448,6 @@ export default function DTDOInspectionReview() {
           </Card>
         </div>
 
-        {/* Right Column - Inspection Findings */}
         <div className="md:col-span-2 space-y-6">
           <Card>
             <CardHeader>
@@ -334,77 +456,85 @@ export default function DTDOInspectionReview() {
                 ANNEXURE-III Compliance Checklist (HP Homestay Rules 2025)
               </CardDescription>
             </CardHeader>
-            <CardContent>
-              <Tabs defaultValue="mandatory">
-                <TabsList className="grid w-full grid-cols-2">
-                  <TabsTrigger value="mandatory" data-testid="tab-mandatory">
-                    Section A: Mandatory
-                    <Badge variant="secondary" className="ml-auto">{mandatoryCompliance}%</Badge>
-                  </TabsTrigger>
-                  <TabsTrigger value="desirable" data-testid="tab-desirable">
-                    Section B: Desirable
-                    <Badge variant="secondary" className="ml-auto">{desirableCompliance}%</Badge>
-                  </TabsTrigger>
-                </TabsList>
+            <CardContent className="space-y-4">
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  className={`rounded-full border px-4 py-1 text-sm font-medium ${
+                    checklistTab === "mandatory"
+                      ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                      : "border-muted text-muted-foreground"
+                  }`}
+                  onClick={() => setChecklistTab("mandatory")}
+                >
+                  Section A · Mandatory ({mandatoryCompliance}%)
+                </button>
+                <button
+                  type="button"
+                  className={`rounded-full border px-4 py-1 text-sm font-medium ${
+                    checklistTab === "desirable"
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-muted text-muted-foreground"
+                  }`}
+                  onClick={() => setChecklistTab("desirable")}
+                >
+                  Section B · Desirable ({desirableCompliance}%)
+                </button>
+              </div>
 
-                <TabsContent value="mandatory" className="space-y-4 mt-6">
-                  <div className="bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900 rounded-lg p-4">
-                    <p className="text-sm text-red-800 dark:text-red-200 font-medium">
-                      <Shield className="w-4 h-4 inline mr-2" />
-                      All 18 mandatory requirements must be met for approval
-                    </p>
+              {checklistTab === "mandatory" ? (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900">
+                    All 18 mandatory requirements must be met for approval.
                   </div>
-
                   <div className="grid grid-cols-1 gap-2">
-                    {Object.entries(mandatoryChecklist).map(([key, value]) => (
-                      <div key={key} className="flex items-center gap-2 p-2 rounded border">
-                        {value ? (
+                    {MANDATORY_POINTS.map((point) => (
+                      <div key={point.key} className="flex items-center gap-2 rounded border p-2 text-sm">
+                        {mandatoryChecklist[point.key] ? (
                           <CheckCircle className="h-4 w-4 text-green-600 flex-shrink-0" />
                         ) : (
                           <XCircle className="h-4 w-4 text-red-600 flex-shrink-0" />
                         )}
-                        <span className="text-sm capitalize">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                        <span className={mandatoryChecklist[point.key] ? "text-slate-900" : "text-muted-foreground"}>
+                          {point.label}
+                        </span>
                       </div>
                     ))}
                   </div>
-
                   {report.mandatoryRemarks && (
-                    <div className="mt-4 p-4 bg-muted rounded-lg">
-                      <p className="text-sm font-medium mb-2">DA Remarks:</p>
-                      <p className="text-sm text-muted-foreground">{report.mandatoryRemarks}</p>
+                    <div className="rounded border bg-muted/30 p-3 text-sm">
+                      <p className="font-medium mb-1">DA Remarks</p>
+                      {report.mandatoryRemarks}
                     </div>
                   )}
-                </TabsContent>
-
-                <TabsContent value="desirable" className="space-y-4 mt-6">
-                  <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-900 rounded-lg p-4">
-                    <p className="text-sm text-blue-800 dark:text-blue-200 font-medium">
-                      <Star className="w-4 h-4 inline mr-2" />
-                      Desirable requirements enhance guest experience and property rating
-                    </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-900">
+                    Desirable amenities enhance guest comfort and property rating.
                   </div>
-
                   <div className="grid grid-cols-1 gap-2">
-                    {Object.entries(desirableChecklist).map(([key, value]) => (
-                      <div key={key} className="flex items-center gap-2 p-2 rounded border">
-                        {value ? (
+                    {DESIRABLE_POINTS.map((point) => (
+                      <div key={point.key} className="flex items-center gap-2 rounded border p-2 text-sm">
+                        {desirableChecklist[point.key] ? (
                           <CheckCircle className="h-4 w-4 text-green-600 flex-shrink-0" />
                         ) : (
                           <XCircle className="h-4 w-4 text-gray-400 flex-shrink-0" />
                         )}
-                        <span className="text-sm capitalize">{key.replace(/([A-Z])/g, ' $1').trim()}</span>
+                        <span className={desirableChecklist[point.key] ? "text-slate-900" : "text-muted-foreground"}>
+                          {point.label}
+                        </span>
                       </div>
                     ))}
                   </div>
-
                   {report.desirableRemarks && (
-                    <div className="mt-4 p-4 bg-muted rounded-lg">
-                      <p className="text-sm font-medium mb-2">DA Remarks:</p>
-                      <p className="text-sm text-muted-foreground">{report.desirableRemarks}</p>
+                    <div className="rounded border bg-muted/30 p-3 text-sm">
+                      <p className="font-medium mb-1">DA Remarks</p>
+                      {report.desirableRemarks}
                     </div>
                   )}
-                </TabsContent>
-              </Tabs>
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -441,16 +571,16 @@ export default function DTDOInspectionReview() {
                   data-testid="button-approve"
                 >
                   <ThumbsUp className="mr-2 h-4 w-4" />
-                  Approve
+                  Verify for Payment
                 </Button>
                 <Button
                   variant="outline"
                   className="flex-1"
-                  onClick={() => handleAction('objections')}
-                  data-testid="button-objections"
+                  onClick={() => handleAction('revert')}
+                  data-testid="button-revert"
                 >
                   <AlertTriangle className="mr-2 h-4 w-4" />
-                  Raise Objections
+                  Revert to Applicant
                 </Button>
                 <Button
                   variant="destructive"
@@ -466,20 +596,22 @@ export default function DTDOInspectionReview() {
           </Card>
         </div>
       </div>
+      </div>
+      </div>
 
       {/* Action Dialog */}
       <Dialog open={!!actionType} onOpenChange={() => setActionType(null)}>
         <DialogContent data-testid="dialog-action">
           <DialogHeader>
             <DialogTitle>
-              {actionType === 'approve' && 'Approve Inspection Report'}
+              {actionType === 'approve' && 'Verify for Payment'}
               {actionType === 'reject' && 'Reject Application'}
-              {actionType === 'objections' && 'Raise Objections'}
+              {actionType === 'revert' && 'Revert to Applicant'}
             </DialogTitle>
             <DialogDescription>
-              {actionType === 'approve' && 'The application will proceed to payment verification.'}
+              {actionType === 'approve' && 'The owner will be allowed to proceed with payment.'}
               {actionType === 'reject' && 'The application will be permanently rejected.'}
-              {actionType === 'objections' && 'The application will require re-inspection after issues are addressed.'}
+              {actionType === 'revert' && 'Send the application back to the owner with your remarks for correction.'}
             </DialogDescription>
           </DialogHeader>
 

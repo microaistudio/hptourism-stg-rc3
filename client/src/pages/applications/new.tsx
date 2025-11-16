@@ -1,5 +1,4 @@
-import { useState, useEffect, useRef } from "react";
-import type { KeyboardEvent } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { nanoid } from "nanoid";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -14,37 +13,150 @@ import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, For
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { useToast } from "@/hooks/use-toast";
-import { ArrowLeft, ArrowRight, Save, Send, Home, User as UserIcon, Bed, Wifi, FileText, IndianRupee, Eye, Lightbulb, AlertTriangle, Sparkles, Info, MapPin, Wind, ParkingCircle, UtensilsCrossed, Droplets, Tv, Shirt, ConciergeBell, Trees, Mountain, PawPrint, Video, Flame } from "lucide-react";
-import type { User, HomestayApplication, UserProfile } from "@shared/schema";
+import { ArrowLeft, ArrowRight, Save, Send, Home, User as UserIcon, Bed, Wifi, FileText, IndianRupee, Eye, Lightbulb, AlertTriangle, Sparkles, Info, MapPin, Wind, ParkingCircle, UtensilsCrossed, Droplets, Tv, Shirt, ConciergeBell, Trees, Mountain, PawPrint, Video, Flame, Plus, Trash2, Copy } from "lucide-react";
+import type { User, HomestayApplication, UserProfile, ApplicationServiceContext, ApplicationKind } from "@shared/schema";
 import { ObjectUploader, type UploadedFileMetadata } from "@/components/ObjectUploader";
+import { ApplicationSummaryCard } from "@/components/application/application-summary";
+import { ApplicationKindBadge, getApplicationKindLabel, isServiceApplication } from "@/components/application/application-kind-badge";
 import { calculateHomestayFee, formatFee, suggestCategory, validateCategorySelection, CATEGORY_REQUIREMENTS, MAX_ROOMS_ALLOWED, MAX_BEDS_ALLOWED, type CategoryType, type LocationType } from "@shared/fee-calculator";
+import type { RoomCalcModeSetting } from "@shared/appSettings";
+import { DEFAULT_ROOM_CALC_MODE } from "@shared/appSettings";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { ApplicationStepper } from "@/components/application-stepper";
 import { useLocation } from "wouter";
-import { 
-  getDistricts, 
-  getTehsilsForDistrict, 
-  getBlocksForTehsil, 
-  getUrbanBodiesForDistrict, 
-  getWardsForUrbanBody,
-  LOCATION_TYPE_LABELS 
-} from "@shared/lgd-data";
+import {
+  DEFAULT_STATE,
+  getDistricts,
+  getTehsilsForDistrict,
+  LOCATION_TYPE_OPTIONS,
+} from "@shared/regions";
 import {
   DEFAULT_UPLOAD_POLICY,
   type UploadPolicy,
 } from "@shared/uploadPolicy";
+import { isCorrectionRequiredStatus } from "@/constants/workflow";
+import {
+  DEFAULT_CATEGORY_ENFORCEMENT,
+  DEFAULT_CATEGORY_RATE_BANDS,
+  type CategoryEnforcementSetting,
+  type CategoryRateBands,
+} from "@shared/appSettings";
 
+const HP_STATE = DEFAULT_STATE;
 const HP_DISTRICTS = getDistricts();
+const canonicalizeInput = (value?: string | null) =>
+  typeof value === "string" ? value.trim() : "";
 
-const LOCATION_TYPES = [
-  { value: "gp", label: LOCATION_TYPE_LABELS.gp },
-  { value: "mc", label: LOCATION_TYPE_LABELS.mc },
-  { value: "tcp", label: LOCATION_TYPE_LABELS.tcp },
-];
+const findCanonicalMatch = (value: string, options: string[]) => {
+  if (!value) {
+    return "";
+  }
+  const normalized = value.trim();
+  if (!normalized) {
+    return "";
+  }
+  const lower = normalized.toLowerCase();
+  const exact = options.find((option) => option.toLowerCase() === lower);
+  if (exact) {
+    return exact;
+  }
+  const sanitized = lower.replace(/district$/i, "").trim();
+  const sanitizedMatch = options.find(
+    (option) => option.toLowerCase() === sanitized,
+  );
+  if (sanitizedMatch) {
+    return sanitizedMatch;
+  }
+  const partial = options.find((option) =>
+    lower.includes(option.toLowerCase()),
+  );
+  return partial || normalized;
+};
+
+const clampInt = (value: string) => {
+  if (!value || value.trim() === "") {
+    return 0;
+  }
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) ? 0 : Math.max(0, parsed);
+};
+
+const NON_NEGATIVE_DECIMAL = /^\d*(\.\d*)?$/;
+
+const clampFloat = (value: string) => {
+  if (!value) {
+    return undefined;
+  }
+  const sanitized = value.replace(/,/g, "").trim();
+  if (!sanitized) {
+    return undefined;
+  }
+  if (!NON_NEGATIVE_DECIMAL.test(sanitized)) {
+    return undefined;
+  }
+  const parsed = parseFloat(sanitized);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    return undefined;
+  }
+  return parsed;
+};
+
+const sanitizeGstinInput = (value: string) =>
+  value.toUpperCase().replace(/[^0-9A-Z]/g, "").slice(0, 15);
+const GSTIN_REGEX = /^[0-9A-Z]{15}$/;
+
+const PINCODE_PREFIX = "17";
+const PINCODE_SUFFIX_LENGTH = 6 - PINCODE_PREFIX.length;
+const PINCODE_REGEX = /^[1-9]\d{5}$/;
+const sanitizePincodeSuffix = (value: string) =>
+  value.replace(/[^\d]/g, "").slice(0, PINCODE_SUFFIX_LENGTH);
+const ensurePincodeWithPrefix = (value?: string) => {
+  const incoming = value ?? "";
+  const suffixSource = incoming.startsWith(PINCODE_PREFIX)
+    ? incoming.slice(PINCODE_PREFIX.length)
+    : incoming;
+  return (PINCODE_PREFIX + sanitizePincodeSuffix(suffixSource)).slice(0, 6);
+};
+
+const normalizeOptionalFloat = (value: string) => clampFloat(value);
+
+const LOCATION_TYPES = LOCATION_TYPE_OPTIONS;
+const LOCATION_LABEL_MAP = LOCATION_TYPE_OPTIONS.reduce(
+  (acc, option) => ({ ...acc, [option.value]: option.label }),
+  {} as Record<string, string>,
+);
+
+const PROJECT_TYPE_OPTIONS = [
+  { value: "new_project", label: "New Homestay Registration" },
+] as const;
+
+const formatDateDisplay = (value?: string | Date | null) => {
+  if (!value) return "—";
+  const date = typeof value === "string" ? new Date(value) : value;
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+  return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+};
+
+const formatDistanceDisplay = (value?: number | null) => {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return `${value} km`;
+  }
+  return "Enter distance in KM";
+};
+
+const normalizePositiveNumber = (value: unknown) => {
+  const num = coerceNumber(value);
+  if (typeof num === "number" && Number.isFinite(num) && num > 0) {
+    return num;
+  }
+  return undefined;
+};
 
 const GENDER_OPTIONS = [
   { value: "female", label: "Female (5% additional discount)" },
@@ -56,29 +168,153 @@ const normalizeGender = (value: unknown): "male" | "female" => {
 };
 
 // District-based typical distances (user can override)
-const DISTRICT_DISTANCES: Record<string, { airport: number; railway: number; cityCenter: number; shopping: number; busStand: number }> = {
-  "Shimla": { airport: 23, railway: 90, cityCenter: 5, shopping: 3, busStand: 2 },
-  "Kangra": { airport: 15, railway: 25, cityCenter: 8, shopping: 5, busStand: 3 },
-  "Kullu": { airport: 10, railway: 125, cityCenter: 6, shopping: 4, busStand: 2 },
-  "Kinnaur": { airport: 245, railway: 350, cityCenter: 12, shopping: 8, busStand: 5 },
-  "Lahaul and Spiti": { airport: 250, railway: 400, cityCenter: 15, shopping: 10, busStand: 8 },
-  "Mandi": { airport: 50, railway: 125, cityCenter: 7, shopping: 5, busStand: 3 },
-  "Chamba": { airport: 120, railway: 100, cityCenter: 10, shopping: 6, busStand: 4 },
-  "Hamirpur": { airport: 85, railway: 90, cityCenter: 6, shopping: 4, busStand: 2 },
-  "Sirmaur": { airport: 60, railway: 45, cityCenter: 8, shopping: 5, busStand: 3 },
-  "Solan": { airport: 65, railway: 30, cityCenter: 7, shopping: 4, busStand: 2 },
-  "Una": { airport: 110, railway: 35, cityCenter: 8, shopping: 5, busStand: 3 },
-  "Bilaspur": { airport: 105, railway: 95, cityCenter: 6, shopping: 4, busStand: 2 },
-  "Bharmour": { airport: 180, railway: 150, cityCenter: 12, shopping: 8, busStand: 6 },
-  "Dodra Kwar": { airport: 280, railway: 420, cityCenter: 20, shopping: 15, busStand: 10 },
-  "Pangi": { airport: 320, railway: 450, cityCenter: 25, shopping: 18, busStand: 12 },
-};
+const DISTRICT_DISTANCES: Record<string, { airport: number; railway: number; cityCenter: number; shopping: number; busStand: number }> = {};
 
 // Strict schema for final submission - all required fields
 const OWNERSHIP_LABELS: Record<"owned" | "leased", string> = {
   owned: "Owned",
   leased: "Lease Deed",
 };
+
+const CATEGORY_CARD_INFO: Array<{ value: CategoryType; title: string; description: string }> = [
+  { value: "silver", title: "Silver", description: "Neighborhood-scale, budget stays" },
+  { value: "gold", title: "Gold", description: "Premium comforts & curated experiences" },
+  { value: "diamond", title: "Diamond", description: "Luxury suites with bespoke amenities" },
+];
+
+const ROOM_TYPE_OPTIONS = [
+  { value: "single", label: "Type 1 (Single)" },
+  { value: "double", label: "Type 2 (Double)" },
+  { value: "suite", label: "Suite" },
+] as const;
+
+type RoomTypeOption = typeof ROOM_TYPE_OPTIONS[number]["value"];
+
+const MAX_BEDS_PER_ROOM = 6;
+
+const ROOM_TYPE_CONFIG: Record<
+  RoomTypeOption,
+  {
+    roomsField: keyof ApplicationForm;
+    bedsField: keyof ApplicationForm;
+    rateField: keyof ApplicationForm;
+    sizeField: keyof ApplicationForm;
+    defaultBeds: number;
+  }
+> = {
+  single: {
+    roomsField: "singleBedRooms",
+    bedsField: "singleBedBeds",
+    rateField: "singleBedRoomRate",
+    sizeField: "singleBedRoomSize",
+    defaultBeds: 1,
+  },
+  double: {
+    roomsField: "doubleBedRooms",
+    bedsField: "doubleBedBeds",
+    rateField: "doubleBedRoomRate",
+    sizeField: "doubleBedRoomSize",
+    defaultBeds: 2,
+  },
+  suite: {
+    roomsField: "familySuites",
+    bedsField: "familySuiteBeds",
+    rateField: "familySuiteRate",
+    sizeField: "familySuiteSize",
+    defaultBeds: 4,
+  },
+};
+
+const TARIFF_BUCKETS = [
+  { value: "lt3k", label: "Less than ₹3,000/night", explanation: "Eligible for SILVER category", minRate: 0, maxRate: 2999, minCategory: "silver" as const },
+  { value: "3kto10k", label: "₹3,000 – ₹10,000/night", explanation: "Requires GOLD category or higher", minRate: 3000, maxRate: 10000, minCategory: "gold" as const },
+  { value: "gt10k", label: "Above ₹10,000/night", explanation: "Requires DIAMOND category", minRate: 10001, maxRate: 50000, minCategory: "diamond" as const },
+];
+
+type TariffBucket = typeof TARIFF_BUCKETS[number]["value"];
+
+const CATEGORY_ORDER: Record<"silver" | "gold" | "diamond", number> = {
+  silver: 1,
+  gold: 2,
+  diamond: 3,
+};
+
+type Type2Row = {
+  id: string;
+  roomType: RoomTypeOption;
+  quantity: number;
+  tariffBucket: TariffBucket;
+  bedsPerRoom: number;
+  area?: number | "";
+  customRate?: number | "";
+};
+
+type RoomCalculationMode = "buckets" | "direct";
+
+const makeEmptyType2Row = (roomType: RoomTypeOption): Type2Row => ({
+  id: nanoid(6),
+  roomType,
+  quantity: 1,
+  tariffBucket: "lt3k",
+  bedsPerRoom: ROOM_TYPE_CONFIG[roomType].defaultBeds,
+  area: "",
+});
+
+const getUnusedRoomType = (currentRows: Type2Row[]): RoomTypeOption => {
+  const used = new Set(currentRows.map((row) => row.roomType));
+  const available = ROOM_TYPE_OPTIONS.find((option) => !used.has(option.value));
+  return available ? (available.value as RoomTypeOption) : "single";
+};
+
+const getRowBedsPerRoom = (row: Type2Row) => {
+  if (typeof row.bedsPerRoom === "number" && row.bedsPerRoom > 0) {
+    return row.bedsPerRoom;
+  }
+  return ROOM_TYPE_CONFIG[row.roomType].defaultBeds;
+};
+
+const summarizeRows = (rows: Type2Row[], excludeId?: string) =>
+  rows.reduce(
+    (acc, row) => {
+      if (excludeId && row.id === excludeId) {
+        return acc;
+      }
+      const rooms = Math.max(0, row.quantity);
+      const beds = rooms * getRowBedsPerRoom(row);
+      return {
+        rooms: acc.rooms + rooms,
+        beds: acc.beds + beds,
+      };
+    },
+    { rooms: 0, beds: 0 },
+  );
+
+const enforceRoomAndBedLimits = (rows: Type2Row[]): Type2Row[] =>
+  rows.map((row) => {
+    const { rooms: roomsUsedElsewhere, beds: bedsUsedElsewhere } = summarizeRows(rows, row.id);
+    let roomsAvailable = Math.max(0, MAX_ROOMS_ALLOWED - roomsUsedElsewhere);
+    let bedsAvailable = Math.max(0, MAX_BEDS_ALLOWED - bedsUsedElsewhere);
+
+    let quantity = Math.max(0, Math.min(row.quantity, roomsAvailable));
+    if (quantity > bedsAvailable) {
+      quantity = bedsAvailable;
+    }
+
+    let bedsPerRoom = getRowBedsPerRoom(row);
+    if (quantity <= 0 || bedsAvailable <= 0) {
+      quantity = quantity <= 0 ? 0 : quantity;
+      bedsPerRoom = Math.min(bedsPerRoom, MAX_BEDS_PER_ROOM);
+    } else {
+      const maxBedsPerRoom = Math.max(1, Math.min(MAX_BEDS_PER_ROOM, Math.floor(bedsAvailable / quantity)));
+      bedsPerRoom = Math.max(1, Math.min(bedsPerRoom, maxBedsPerRoom));
+    }
+
+    return {
+      ...row,
+      quantity,
+      bedsPerRoom,
+    };
+  });
 
 const formatBytes = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -99,8 +335,6 @@ const applicationSchema = z.object({
   district: z.string().min(1, "District is required"),
   tehsil: z.string().optional(),
   tehsilOther: z.string().optional().or(z.literal("")),
-  block: z.string().optional(),
-  blockOther: z.string().optional().or(z.literal("")),
   gramPanchayat: z.string().optional(),
   gramPanchayatOther: z.string().optional().or(z.literal("")),
   urbanBody: z.string().optional(),
@@ -142,7 +376,9 @@ const applicationSchema = z.object({
   projectType: z.enum(["new_rooms", "new_project"]),
   
   // Property details
-  propertyArea: z.number().min(1, "Property area required"),
+  propertyArea: z
+    .number()
+    .min(0, "Property area cannot be negative"),
   
   // Room configuration (single/double/suite)
   singleBedRooms: z.number().int().min(0).default(0),
@@ -183,8 +419,6 @@ const draftSchema = z.object({
   district: z.string().optional(),
   tehsil: z.string().optional(),
   tehsilOther: z.string().optional(),
-  block: z.string().optional(),
-  blockOther: z.string().optional(),
   gramPanchayat: z.string().optional(),
   gramPanchayatOther: z.string().optional(),
   urbanBody: z.string().optional(),
@@ -252,24 +486,58 @@ const splitFullName = (fullName?: string | null) => {
 const sanitizeNamePart = (value: string) =>
   value.replace(/[^A-Za-z\s'-]/g, "").replace(/\s{2,}/g, " ");
 
-  const sanitizeDigits = (value: string, maxLength?: number) => {
-    let digitsOnly = value.replace(/\D/g, "");
-    if (typeof maxLength === "number") {
-      digitsOnly = digitsOnly.slice(0, maxLength);
-    }
+const sanitizeDigits = (value: string, maxLength?: number) => {
+  let digitsOnly = value.replace(/\D/g, "");
+  if (typeof maxLength === "number") {
+    digitsOnly = digitsOnly.slice(0, maxLength);
+  }
   return digitsOnly;
 };
 
-const preventDigitKey = (event: KeyboardEvent<HTMLInputElement>) => {
-  if (
-    event.key.length === 1 &&
-    /\d/.test(event.key) &&
-    !event.metaKey &&
-    !event.ctrlKey &&
-    !event.altKey
-  ) {
-    event.preventDefault();
+const bucketToRate = (bucket: TariffBucket) => {
+  const info = TARIFF_BUCKETS.find((b) => b.value === bucket);
+  if (!info) return 0;
+  if (info.value === "gt10k") {
+    return info.minRate;
   }
+  return info.maxRate;
+};
+
+const rateToBucket = (rate?: number | null): TariffBucket | null => {
+  if (typeof rate !== "number" || Number.isNaN(rate)) return null;
+  if (rate <= 0) return null;
+  if (rate <= 3000) return "lt3k";
+  if (rate <= 10000) return "3kto10k";
+  return "gt10k";
+};
+
+const formatShortCurrency = (value: number) => `₹${value.toLocaleString("en-IN")}`;
+
+const formatBandLabel = (band: { min: number; max: number | null }) => {
+  if (band.max === null) {
+    const previousThreshold = Math.max(0, band.min - 1);
+    return `Above ${formatShortCurrency(previousThreshold)} / night`;
+  }
+  if (band.min <= 1) {
+    const nextWhole = Math.max(band.max + 1, 1);
+    return `Less than ${formatShortCurrency(nextWhole)} / night`;
+  }
+  return `${formatShortCurrency(band.min)} – ${formatShortCurrency(band.max)} / night`;
+};
+
+type BandStatus = "empty" | "ok" | "below" | "above";
+
+const evaluateBandStatus = (rate: number, band: { min: number; max: number | null }): BandStatus => {
+  if (rate <= 0 || Number.isNaN(rate)) {
+    return "empty";
+  }
+  if (rate < band.min) {
+    return "below";
+  }
+  if (band.max !== null && rate > band.max) {
+    return "above";
+  }
+  return "ok";
 };
 
 const coerceNumber = (value: unknown, fallback: number | undefined = undefined) => {
@@ -323,8 +591,8 @@ const FEE_STRUCTURE = {
 
 // Room rate thresholds for categories (as per official document)
 const ROOM_RATE_THRESHOLDS = {
-  diamond: { min: 10000, label: "Higher than ₹10,000 per room per day" },
-  gold: { min: 3000, max: 10000, label: "₹3,000 to ₹10,000 per room per day" },
+  diamond: { min: 10001, label: "Above ₹10,000 per room per day" },
+  gold: { min: 3000, max: 10000, label: "₹3,000 – ₹10,000 per room per day" },
   silver: { max: 3000, label: "Less than ₹3,000 per room per day" },
 };
 
@@ -335,7 +603,7 @@ const STEP_CONFIG = [
     label: "Property Details",
     shortLabel: "Property",
     icon: Home,
-    requiredFields: ["propertyName", "address", "district", "tehsil", "pincode", "locationType"],
+    requiredFields: ["propertyName", "projectType", "address", "district", "tehsil", "pincode", "locationType"],
   },
   {
     id: 2,
@@ -358,7 +626,7 @@ const STEP_CONFIG = [
     label: "Rooms & Category",
     shortLabel: "Rooms",
     icon: Bed,
-    requiredFields: ["category", "proposedRoomRate", "projectType", "propertyArea", "attachedWashrooms"],
+    requiredFields: ["category", "proposedRoomRate", "attachedWashrooms"],
   },
   {
     id: 4,
@@ -372,7 +640,7 @@ const STEP_CONFIG = [
     label: "Documents Upload",
     shortLabel: "Documents",
     icon: FileText,
-    requiredFields: ["revenuePapers", "affidavitSection29", "undertakingFormC", "registerForVerification", "billBook", "propertyPhotos"],
+    requiredFields: ["revenuePapers", "affidavitSection29", "undertakingFormC", "propertyPhotos"],
   },
   {
     id: 6,
@@ -385,13 +653,51 @@ const STEP_CONFIG = [
 
 export default function NewApplication() {
   const [, setLocation] = useLocation();
+  const goToProfile = () => setLocation("/profile");
+  const renderProfileManagedDescription = (fieldLabel?: string) => (
+    <FormDescription>
+      {fieldLabel ? `${fieldLabel} ` : "This information "}
+      is managed from{" "}
+      <Button
+        type="button"
+        variant="link"
+        className="h-auto px-0 text-primary"
+        onClick={goToProfile}
+      >
+        My Profile
+      </Button>
+      .
+    </FormDescription>
+  );
   const { toast } = useToast();
 const { data: uploadPolicyData } = useQuery<UploadPolicy>({
   queryKey: ["/api/settings/upload-policy"],
   staleTime: 5 * 60 * 1000,
 });
 const uploadPolicy = uploadPolicyData ?? DEFAULT_UPLOAD_POLICY;
-const isCategoryEnforced = false;
+
+const { data: categoryEnforcementSetting } = useQuery<CategoryEnforcementSetting>({
+  queryKey: ["/api/settings/category-enforcement"],
+  staleTime: 5 * 60 * 1000,
+});
+const { data: roomCalcModeSettingData } = useQuery<RoomCalcModeSetting>({
+  queryKey: ["/api/settings/room-calc-mode"],
+  staleTime: 5 * 60 * 1000,
+});
+const { data: roomRateBandsData } = useQuery<CategoryRateBands>({
+  queryKey: ["/api/settings/room-rate-bands"],
+  staleTime: 5 * 60 * 1000,
+});
+const { data: activeExistingOwner } = useQuery<{ application: { id: string } | null }>({
+  queryKey: ["/api/existing-owners/active"],
+  staleTime: 30 * 1000,
+});
+const isCategoryEnforced =
+  categoryEnforcementSetting?.enforce ?? DEFAULT_CATEGORY_ENFORCEMENT.enforce;
+const lockToRecommendedCategory =
+  categoryEnforcementSetting?.lockToRecommended ??
+  DEFAULT_CATEGORY_ENFORCEMENT.lockToRecommended;
+const categoryRateBands = roomRateBandsData ?? DEFAULT_CATEGORY_RATE_BANDS;
 const maxTotalUploadBytes = uploadPolicy.totalPerApplicationMB * 1024 * 1024;
 const [step, setStep] = useState(1);
   const [maxStepReached, setMaxStepReached] = useState(1); // Track highest step visited
@@ -403,12 +709,18 @@ const [selectedAmenities, setSelectedAmenities] = useState<Record<string, boolea
     revenuePapers: [],
     affidavitSection29: [],
     undertakingFormC: [],
-    registerForVerification: [],
-    billBook: [],
+    commercialElectricityBill: [],
+    commercialWaterBill: [],
   });
 const [propertyPhotos, setPropertyPhotos] = useState<UploadedFileMetadata[]>([]);
 const totalSteps = 6;
 const guardrailToastShownRef = useRef(false);
+
+  useEffect(() => {
+    if (activeExistingOwner?.application) {
+      setLocation(`/applications/${activeExistingOwner.application.id}`);
+    }
+  }, [activeExistingOwner, setLocation]);
 
 // Get draft ID and correction ID from URL query parameters
 const searchParams = new URLSearchParams(window.location.search);
@@ -417,9 +729,46 @@ const correctionIdFromUrl = searchParams.get('application');
 const [draftId, setDraftId] = useState<string | null>(draftIdFromUrl);
 const [correctionId, setCorrectionId] = useState<string | null>(correctionIdFromUrl);
 const [showPreview, setShowPreview] = useState(false);
+const [correctionAcknowledged, setCorrectionAcknowledged] = useState(false);
+const [type2Rows, setType2RowsBase] = useState<Type2Row[]>(() =>
+  enforceRoomAndBedLimits([makeEmptyType2Row("single")]),
+);
+const setType2RowsSafe = useCallback(
+  (updater: (rows: Type2Row[]) => Type2Row[]) => setType2RowsBase((rows) => enforceRoomAndBedLimits(updater(rows))),
+  [],
+);
+const [syncAttachedBaths, setSyncAttachedBaths] = useState(true);
+const derivedRoomCalcMode = roomCalcModeSettingData?.mode ?? DEFAULT_ROOM_CALC_MODE.mode;
+const [roomCalcMode, setRoomCalcMode] = useState<RoomCalculationMode>(derivedRoomCalcMode);
+useEffect(() => {
+  setRoomCalcMode(derivedRoomCalcMode);
+}, [derivedRoomCalcMode]);
+useEffect(() => {
+  setType2RowsSafe((rows) =>
+    rows.map((row) => {
+      if (roomCalcMode === "direct") {
+        const resolvedRate = coerceNumber(row.customRate, undefined);
+        return {
+          ...row,
+          customRate: resolvedRate && resolvedRate > 0 ? resolvedRate : "",
+        };
+      }
+      const candidate = coerceNumber(row.customRate, 0);
+      return {
+        ...row,
+        tariffBucket: rateToBucket(candidate) ?? row.tariffBucket,
+      };
+    }),
+  );
+}, [roomCalcMode, setType2RowsSafe]);
 
 const [, navigate] = useLocation();
 const isCorrectionMode = Boolean(correctionId);
+useEffect(() => {
+  if (!isCorrectionMode) {
+    setCorrectionAcknowledged(false);
+  }
+}, [isCorrectionMode]);
 
 const { data: userData } = useQuery<{ user: User }>({
   queryKey: ["/api/auth/me"],
@@ -494,18 +843,37 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
   enabled: !!correctionIdFromUrl,
 });
 
+const activeDraftApplication = draftData?.application ?? null;
+const activeCorrectionApplication = correctionData?.application ?? null;
+const activeHydratedApplication = activeDraftApplication ?? (isCorrectionMode ? activeCorrectionApplication : null);
+const activeApplicationKind = (activeHydratedApplication?.applicationKind as ApplicationKind | undefined) ?? "new_registration";
+  const isServiceDraft = Boolean(activeDraftApplication && isServiceApplication(activeApplicationKind));
+  const serviceContext = (activeDraftApplication?.serviceContext ?? null) as ApplicationServiceContext | null;
+  const parentApplicationNumber = activeDraftApplication?.parentApplicationNumber ?? null;
+  const parentApplicationId = activeDraftApplication?.parentApplicationId ?? null;
+  const parentCertificateNumber = activeDraftApplication?.parentCertificateNumber ?? activeDraftApplication?.certificateNumber ?? null;
+const inheritedCertificateExpiry = activeDraftApplication?.inheritedCertificateValidUpto ?? activeDraftApplication?.certificateExpiryDate ?? null;
+const requestedRooms = serviceContext?.requestedRooms;
+const requestedRoomDelta = serviceContext?.requestedRoomDelta;
+const serviceNote = activeDraftApplication?.serviceNotes;
+  const shouldLockPropertyDetails = isServiceDraft;
+
   const defaultOwnerNameParts = splitFullName(userData?.user?.fullName || "");
 
-  const form = useForm<ApplicationForm>({
+const form = useForm<ApplicationForm>({
     // No resolver - validation happens manually on next/submit to allow draft saves
     defaultValues: {
       propertyName: "",
       address: "",
       district: "",
-      pincode: "",
-      locationType: "gp",
+      pincode: PINCODE_PREFIX,
+      locationType: "" as LocationType | "",
       telephone: "",
+      tehsil: "",
       tehsilOther: "",
+      gramPanchayat: "",
+      urbanBody: "",
+      ward: "",
       ownerEmail: userData?.user?.email || "",
       ownerMobile: userData?.user?.mobile || "",
       ownerName: userData?.user?.fullName || "",
@@ -517,14 +885,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       category: "silver",
       proposedRoomRate: 2000,
       singleBedRoomRate: 0,
-      doubleBedRoomRate: 2000,
+      doubleBedRoomRate: 0,
       familySuiteRate: 0,
       projectType: "new_project",
       propertyArea: 0,
       singleBedRooms: 0,
       singleBedBeds: 1,
       singleBedRoomSize: undefined,
-      doubleBedRooms: 1,
+      doubleBedRooms: 0,
       doubleBedBeds: 2,
       doubleBedRoomSize: undefined,
       familySuites: 0,
@@ -544,31 +912,250 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       differentlyAbledFacilities: "",
       fireEquipmentDetails: "",
       certificateValidityYears: "1",
-      nearestHospital: "",
-    },
-  });
+  nearestHospital: "",
+},
+});
 
-  const category = form.watch("category");
-  const locationType = form.watch("locationType");
-  const district = form.watch("district");
-  const tehsil = form.watch("tehsil");
-  const tehsilOther = form.watch("tehsilOther");
-  const ownerFirstName = form.watch("ownerFirstName");
-  const ownerLastName = form.watch("ownerLastName");
-  const ownerGender = form.watch("ownerGender");
-  const propertyOwnership = form.watch("propertyOwnership") as "owned" | "leased" | undefined;
-  const certificateValidityYears = form.watch("certificateValidityYears");
-  const isLeaseBlocked = step === 2 && propertyOwnership === "leased";
-  const submitButtonLabel = isCorrectionMode ? "Resubmit Application" : "Submit Application";
+const buildType2RowsFromForm = useCallback((): Type2Row[] => {
+  const rows: Type2Row[] = [];
+  ROOM_TYPE_OPTIONS.forEach((option) => {
+    const config = ROOM_TYPE_CONFIG[option.value];
+    const qty = Number(form.getValues(config.roomsField)) || 0;
+    const rate = Number(form.getValues(config.rateField)) || 0;
+    const directRate = rate > 0 ? rate : "";
+    const bedsPerRoomValue =
+      coerceNumber(form.getValues(config.bedsField), config.defaultBeds) ?? config.defaultBeds;
+    const normalizedBeds = Math.max(1, Math.min(bedsPerRoomValue, MAX_BEDS_PER_ROOM));
+    const areaValue = form.getValues(config.sizeField);
+    const areaNumber =
+      typeof areaValue === "number"
+        ? areaValue
+        : typeof areaValue === "string" && areaValue.trim()
+        ? Number(areaValue)
+        : "";
+    if (qty > 0 || rate > 0 || (typeof areaNumber === "number" && areaNumber > 0)) {
+      rows.push({
+        id: nanoid(6),
+        roomType: option.value as RoomTypeOption,
+        quantity: qty,
+        tariffBucket: rateToBucket(rate) ?? "lt3k",
+        bedsPerRoom: normalizedBeds,
+        area: areaNumber,
+        customRate: directRate,
+      });
+    }
+  });
+  if (rows.length === 0) {
+    rows.push(makeEmptyType2Row("single"));
+  }
+  return rows;
+}, [form]);
+
+const applyType2RowsToForm = useCallback(
+  (rows: Type2Row[]) => {
+    form.setValue("singleBedRooms", 0);
+    form.setValue("singleBedRoomRate", 0);
+    form.setValue("singleBedRoomSize", undefined);
+    form.setValue("singleBedBeds", ROOM_TYPE_CONFIG.single.defaultBeds);
+    form.setValue("doubleBedRooms", 0);
+    form.setValue("doubleBedRoomRate", 0);
+    form.setValue("doubleBedRoomSize", undefined);
+    form.setValue("doubleBedBeds", ROOM_TYPE_CONFIG.double.defaultBeds);
+    form.setValue("familySuites", 0);
+    form.setValue("familySuiteRate", 0);
+    form.setValue("familySuiteSize", undefined);
+    form.setValue("familySuiteBeds", ROOM_TYPE_CONFIG.suite.defaultBeds);
+
+    rows.forEach((row) => {
+      const config = ROOM_TYPE_CONFIG[row.roomType];
+      form.setValue(config.roomsField, row.quantity);
+      form.setValue(config.bedsField, getRowBedsPerRoom(row));
+      const directRate = coerceNumber(row.customRate, undefined);
+      const resolvedRate =
+        roomCalcMode === "direct"
+          ? directRate && directRate > 0
+            ? directRate
+            : undefined
+          : bucketToRate(row.tariffBucket);
+      form.setValue(config.rateField, resolvedRate);
+      const areaValue =
+        typeof row.area === "number"
+          ? row.area
+          : typeof row.area === "string" && row.area.trim()
+          ? Number(row.area)
+          : undefined;
+      form.setValue(config.sizeField, areaValue);
+    });
+  },
+  [form, roomCalcMode],
+);
+
+useEffect(() => {
+  setType2RowsSafe(() => buildType2RowsFromForm());
+}, [buildType2RowsFromForm, setType2RowsSafe]);
+
+useEffect(() => {
+  applyType2RowsToForm(type2Rows);
+}, [type2Rows, applyType2RowsToForm]);
+
+const updateType2Row = useCallback((rowId: string, updates: Partial<Type2Row>) => {
+  setType2RowsSafe((rows) =>
+    rows.map((row) =>
+      row.id === rowId
+        ? {
+            ...row,
+            ...updates,
+            quantity:
+              typeof updates.quantity === "number"
+                ? Math.max(0, Math.min(updates.quantity, MAX_ROOMS_ALLOWED))
+                : row.quantity,
+          }
+        : row,
+    ),
+  );
+}, [setType2RowsSafe]);
+
+const addType2Row = useCallback(() => {
+  setType2RowsSafe((rows) => {
+    if (rows.length >= ROOM_TYPE_OPTIONS.length) {
+      return rows;
+    }
+    const newType = getUnusedRoomType(rows);
+    return [...rows, makeEmptyType2Row(newType)];
+  });
+}, [setType2RowsSafe]);
+
+const removeType2Row = useCallback((rowId: string) => {
+  setType2RowsSafe((rows) => rows.filter((row) => row.id !== rowId));
+}, [setType2RowsSafe]);
+
+const resetType2Rows = useCallback(() => {
+  setType2RowsSafe(() => [makeEmptyType2Row("single")]);
+  setSyncAttachedBaths(true);
+  applyType2RowsToForm([makeEmptyType2Row("single")]);
+}, [applyType2RowsToForm, setType2RowsSafe]);
+
+  // Ensure location type starts blank for fresh applications (force manual selection)
+  useEffect(() => {
+    if (draftIdFromUrl || correctionIdFromUrl || activeDraftApplication) {
+      return;
+    }
+    form.setValue("locationType", "" as LocationType | "", {
+      shouldDirty: false,
+      shouldValidate: false,
+    });
+  }, [draftIdFromUrl, correctionIdFromUrl, activeDraftApplication, form]);
+
+const category = form.watch("category");
+const isPremiumCategory = category === "gold" || category === "diamond";
+const requiresGstin = isPremiumCategory;
+const requiresCommercialUtilityProof = isPremiumCategory;
+const watchedGstin = form.watch("gstin");
+const normalizedWatchedGstin = sanitizeGstinInput(watchedGstin ?? "");
+const gstinHasValue = normalizedWatchedGstin.length > 0;
+const gstinMatchesPattern = GSTIN_REGEX.test(normalizedWatchedGstin);
+const gstinIsValid = !requiresGstin || (gstinHasValue && gstinMatchesPattern);
+const gstinBlocking = requiresGstin && !gstinIsValid;
+const locationType = (form.watch("locationType") || "") as LocationType | "";
+const resolvedLocationType = (locationType || "gp") as LocationType;
+  const watchedDistrict = form.watch("district");
   const isHydratingDraft = useRef(false);
-  const trimmedTehsilOther = tehsilOther?.trim() || "";
-  const displayTehsil = tehsil === "__other" ? (trimmedTehsilOther || "—") : (tehsil || "—");
-  const tehsilForRules = tehsil === "__other" ? trimmedTehsilOther : tehsil;
+  const gramFieldConfig =
+    locationType === "gp"
+      ? {
+          label: "Village / Locality (PO)",
+          placeholder: "Type your village, locality, or Post Office",
+          description: "Required for Gram Panchayat areas.",
+          requiredMessage: "Village / locality is required for Gram Panchayat properties",
+        }
+      : null;
+
+  const urbanBodyConfig =
+    locationType === "mc"
+      ? {
+          label: "Enter City/Town (MC/Council)",
+          placeholder: "e.g., Shimla, Theog",
+          description: "Required for Municipal Corporation or Council applicants.",
+        }
+      : locationType === "tcp"
+        ? {
+            label: "Enter Town (TCP/SADA/NP)",
+            placeholder: "e.g., Suni, Narkanda",
+            description: "Required for TCP/SADA/Nagar Panchayat applicants.",
+          }
+        : {
+            label: "Municipal Corporation / TCP / Nagar Panchayat",
+            placeholder: "e.g., Shimla MC, Theog NP",
+            description: "Type the name of your urban local body.",
+          };
 
   useEffect(() => {
     if (isHydratingDraft.current) {
       return;
     }
+    if (!watchedDistrict) {
+      form.setValue("tehsil", "", {
+        shouldDirty: false,
+        shouldValidate: step >= 1,
+      });
+      form.setValue("tehsilOther", "", {
+        shouldDirty: false,
+        shouldValidate: step >= 1,
+      });
+      return;
+    }
+
+    const tehsilsForDistrict = getTehsilsForDistrict(watchedDistrict);
+    const currentTehsil = form.getValues("tehsil");
+    if (currentTehsil === "__other") {
+      return;
+    }
+
+    if (tehsilsForDistrict.length === 0) {
+      if (currentTehsil !== "__other") {
+        form.setValue("tehsil", "__other", {
+          shouldDirty: false,
+          shouldValidate: step >= 1,
+        });
+      }
+      return;
+    }
+
+    if (!currentTehsil || !tehsilsForDistrict.includes(currentTehsil)) {
+      form.setValue("tehsil", "", {
+        shouldDirty: false,
+        shouldValidate: step >= 1,
+      });
+      form.setValue("tehsilOther", "", {
+        shouldDirty: false,
+        shouldValidate: step >= 1,
+      });
+    }
+  }, [watchedDistrict, form, step]);
+  const district = form.watch("district");
+const tehsil = form.watch("tehsil");
+const tehsilOther = form.watch("tehsilOther");
+const pincodeValue = form.watch("pincode");
+const ownerFirstName = form.watch("ownerFirstName");
+const ownerLastName = form.watch("ownerLastName");
+const ownerGender = form.watch("ownerGender");
+const propertyOwnership = form.watch("propertyOwnership") as "owned" | "leased" | undefined;
+const certificateValidityYears = form.watch("certificateValidityYears");
+  const isLeaseBlocked = step === 2 && propertyOwnership === "leased";
+const submitButtonLabel = isCorrectionMode ? "Resubmit Application" : "Submit Application";
+const stepTopRef = useRef<HTMLDivElement | null>(null);
+const trimmedTehsilOther = tehsilOther?.trim() || "";
+const displayTehsil = tehsil === "__other" ? (trimmedTehsilOther || "—") : (tehsil || "—");
+const tehsilForRules = tehsil === "__other" ? trimmedTehsilOther : tehsil;
+const normalizedPincode = ensurePincodeWithPrefix(pincodeValue ?? PINCODE_PREFIX);
+const pincodeSuffixValue = normalizedPincode.slice(PINCODE_PREFIX.length);
+const pincodeIsValid = PINCODE_REGEX.test(normalizedPincode);
+const showPincodeHint = pincodeSuffixValue.length < PINCODE_SUFFIX_LENGTH;
+
+useEffect(() => {
+  if (isHydratingDraft.current) {
+    return;
+  }
     if (!district) {
       if (tehsil || tehsilOther) {
         form.setValue("tehsil", "", { shouldDirty: false, shouldValidate: step >= 1 });
@@ -581,13 +1168,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     const hasOptions = tehsilOptions.length > 0;
 
     if (tehsil === "__other") {
+      if (!hasOptions) {
+        return;
+      }
       if (tehsilOther && tehsilOther.trim().length > 0) {
         return;
       }
-      if (hasOptions) {
-        form.setValue("tehsil", tehsilOptions[0], { shouldDirty: false, shouldValidate: step >= 1 });
-        form.setValue("tehsilOther", "", { shouldDirty: false, shouldValidate: step >= 1 });
-      }
+      form.setValue("tehsil", "", { shouldDirty: false, shouldValidate: step >= 1 });
+      form.setValue("tehsilOther", "", { shouldDirty: false, shouldValidate: step >= 1 });
       return;
     }
 
@@ -601,14 +1189,15 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     }
 
     if (!tehsil) {
-      form.setValue("tehsil", tehsilOptions[0], { shouldDirty: false, shouldValidate: step >= 1 });
-      form.setValue("tehsilOther", "", { shouldDirty: false, shouldValidate: step >= 1 });
+      if (tehsilOther) {
+        form.setValue("tehsilOther", "", { shouldDirty: false, shouldValidate: step >= 1 });
+      }
       return;
     }
 
     if (!tehsilOptions.includes(tehsil)) {
-      form.setValue("tehsil", "__other", { shouldDirty: false, shouldValidate: step >= 1 });
-      form.setValue("tehsilOther", tehsil, { shouldDirty: false, shouldValidate: step >= 1 });
+      form.setValue("tehsil", "", { shouldDirty: false, shouldValidate: step >= 1 });
+      form.setValue("tehsilOther", "", { shouldDirty: false, shouldValidate: step >= 1 });
       return;
     }
 
@@ -617,7 +1206,42 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     }
   }, [district, tehsil, tehsilOther, form, step]);
 
-  const hydrateFormFromSource = (source: Partial<HomestayApplication> | DraftForm | null | undefined) => {
+useEffect(() => {
+const enforced = ensurePincodeWithPrefix(pincodeValue ?? PINCODE_PREFIX);
+  if (enforced !== pincodeValue) {
+    form.setValue("pincode", enforced, { shouldDirty: true, shouldValidate: step >= 1 });
+  }
+}, [pincodeValue, form, step]);
+
+useEffect(() => {
+  if (!requiresGstin) {
+    form.clearErrors("gstin");
+    return;
+  }
+  if (!gstinHasValue) {
+    form.setError("gstin", {
+      type: "manual",
+      message: "GSTIN is required for Diamond and Gold categories",
+    });
+    return;
+  }
+  if (!gstinMatchesPattern) {
+    form.setError("gstin", {
+      type: "manual",
+      message: "GSTIN must be exactly 15 characters (numbers and capital letters only)",
+    });
+    return;
+  }
+  form.clearErrors("gstin");
+}, [requiresGstin, gstinHasValue, gstinMatchesPattern, form]);
+
+useEffect(() => {
+  stepTopRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+}, [step]);
+
+const lastHydratedTehsil = useRef<{ value: string; other: string }>({ value: "", other: "" });
+
+const hydrateFormFromSource = (source: Partial<HomestayApplication> | DraftForm | null | undefined) => {
     if (!source) return;
     const defaults = form.getValues();
     const explicitFirst = (source as any).ownerFirstName as string | undefined;
@@ -630,23 +1254,35 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
         ? String((source as any).certificateValidityYears)
         : defaults.certificateValidityYears;
 
-    const districtValue = (source as any).district ?? defaults.district ?? "";
-    let incomingTehsilRaw = (source as any).tehsil ?? defaults.tehsil ?? "";
-    const incomingTehsilOtherRaw = (source as any).tehsilOther ?? defaults.tehsilOther ?? "";
+    const rawDistrictValue =
+      (source as any).district ?? defaults.district ?? "";
+    const districtValue = findCanonicalMatch(
+      canonicalizeInput(rawDistrictValue),
+      HP_DISTRICTS,
+    );
+    const incomingTehsilRaw =
+      (source as any).tehsil ?? defaults.tehsil ?? "";
+    const incomingTehsilOtherRaw =
+      (source as any).tehsilOther ?? defaults.tehsilOther ?? "";
 
-    if (typeof incomingTehsilRaw === "string" && incomingTehsilRaw.trim() === "Not Provided") {
-      incomingTehsilRaw = "";
-    }
-
-    const tehsilOptions = districtValue ? getTehsilsForDistrict(districtValue) : [];
-    const trimmedTehsil = typeof incomingTehsilRaw === "string" ? incomingTehsilRaw.trim() : "";
-    const trimmedTehsilOther = typeof incomingTehsilOtherRaw === "string" ? incomingTehsilOtherRaw.trim() : "";
+    const tehsilOptions = districtValue
+      ? getTehsilsForDistrict(districtValue)
+      : [];
+    const trimmedTehsil = canonicalizeInput(incomingTehsilRaw).replace(
+      /^not provided$/i,
+      "",
+    );
+    const trimmedTehsilOther = canonicalizeInput(incomingTehsilOtherRaw);
+    const canonicalTehsil =
+      tehsilOptions.length > 0
+        ? findCanonicalMatch(trimmedTehsil, tehsilOptions)
+        : trimmedTehsil;
 
     let resolvedTehsil: string;
     let resolvedTehsilOther: string;
 
-    if (trimmedTehsil && tehsilOptions.includes(trimmedTehsil)) {
-      resolvedTehsil = trimmedTehsil;
+    if (canonicalTehsil && tehsilOptions.includes(canonicalTehsil)) {
+      resolvedTehsil = canonicalTehsil;
       resolvedTehsilOther = "";
     } else if (trimmedTehsil) {
       resolvedTehsil = "__other";
@@ -663,6 +1299,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     }
 
     isHydratingDraft.current = true;
+    lastHydratedTehsil.current = { value: resolvedTehsil, other: resolvedTehsilOther };
     form.reset({
       ...defaults,
       propertyName: source.propertyName ?? defaults.propertyName ?? "",
@@ -670,12 +1307,11 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       district: districtValue,
       tehsil: resolvedTehsil,
       tehsilOther: resolvedTehsilOther,
-      block: (source as any).block ?? defaults.block ?? "",
       gramPanchayat: (source as any).gramPanchayat ?? defaults.gramPanchayat ?? "",
       urbanBody: (source as any).urbanBody ?? defaults.urbanBody ?? "",
       ward: (source as any).ward ?? defaults.ward ?? "",
       pincode: (source as any).pincode ?? defaults.pincode ?? "",
-      locationType: ((source.locationType as "mc" | "tcp" | "gp") || defaults.locationType || "gp"),
+      locationType: ((source.locationType as "mc" | "tcp" | "gp") ?? "") as LocationType | "",
       telephone: (source as any).telephone ?? defaults.telephone ?? "",
       ownerEmail: source.ownerEmail ?? defaults.ownerEmail ?? "",
       ownerMobile: source.ownerMobile ?? defaults.ownerMobile ?? "",
@@ -705,13 +1341,13 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       familySuiteSize: coerceNumber((source as any).familySuiteSize),
       attachedWashrooms: coerceNumber((source as any).attachedWashrooms, defaults.attachedWashrooms ?? 0) ?? 0,
       gstin: (source as any).gstin ?? defaults.gstin ?? "",
-      distanceAirport: coerceNumber((source as any).distanceAirport),
-      distanceRailway: coerceNumber((source as any).distanceRailway),
-      distanceCityCenter: coerceNumber((source as any).distanceCityCenter),
-      distanceShopping: coerceNumber((source as any).distanceShopping),
-      distanceBusStand: coerceNumber((source as any).distanceBusStand),
-      lobbyArea: coerceNumber((source as any).lobbyArea),
-      diningArea: coerceNumber((source as any).diningArea),
+      distanceAirport: normalizePositiveNumber((source as any).distanceAirport),
+      distanceRailway: normalizePositiveNumber((source as any).distanceRailway),
+      distanceCityCenter: normalizePositiveNumber((source as any).distanceCityCenter),
+      distanceShopping: normalizePositiveNumber((source as any).distanceShopping),
+      distanceBusStand: normalizePositiveNumber((source as any).distanceBusStand),
+      lobbyArea: normalizePositiveNumber((source as any).lobbyArea),
+      diningArea: normalizePositiveNumber((source as any).diningArea),
       parkingArea: (source as any).parkingArea ?? defaults.parkingArea ?? "",
       ecoFriendlyFacilities: (source as any).ecoFriendlyFacilities ?? defaults.ecoFriendlyFacilities ?? "",
       differentlyAbledFacilities: (source as any).differentlyAbledFacilities ?? defaults.differentlyAbledFacilities ?? "",
@@ -737,8 +1373,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
         revenuePapers: [],
         affidavitSection29: [],
         undertakingFormC: [],
-        registerForVerification: [],
-        billBook: [],
+        commercialElectricityBill: [],
+        commercialWaterBill: [],
       };
       const photos: UploadedFileMetadata[] = [];
       documentsSource.forEach((doc: any) => {
@@ -759,11 +1395,11 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
           case "undertaking_form_c":
             docs.undertakingFormC.push(base);
             break;
-          case "register_for_verification":
-            docs.registerForVerification.push(base);
+          case "commercial_electricity_bill":
+            docs.commercialElectricityBill.push(base);
             break;
-          case "bill_book":
-            docs.billBook.push(base);
+          case "commercial_water_bill":
+            docs.commercialWaterBill.push(base);
             break;
           case "property_photo":
             photos.push(base);
@@ -779,8 +1415,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
         revenuePapers: [],
         affidavitSection29: [],
         undertakingFormC: [],
-        registerForVerification: [],
-        billBook: [],
+        commercialElectricityBill: [],
+        commercialWaterBill: [],
       });
       setPropertyPhotos([]);
     }
@@ -808,8 +1444,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       ...normalize(uploadedDocuments.revenuePapers, "revenue_papers"),
       ...normalize(uploadedDocuments.affidavitSection29, "affidavit_section_29"),
       ...normalize(uploadedDocuments.undertakingFormC, "undertaking_form_c"),
-      ...normalize(uploadedDocuments.registerForVerification, "register_for_verification"),
-      ...normalize(uploadedDocuments.billBook, "bill_book"),
+      ...normalize(uploadedDocuments.commercialElectricityBill, "commercial_electricity_bill"),
+      ...normalize(uploadedDocuments.commercialWaterBill, "commercial_water_bill"),
       ...normalize(propertyPhotos, "property_photo"),
     ];
   };
@@ -840,13 +1476,18 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
   const doubleBedRoomRate = form.watch("doubleBedRoomRate") || 0;
   const familySuiteRate = form.watch("familySuiteRate") || 0;
   const totalRooms = singleBedRooms + doubleBedRooms + familySuites;
-  const totalBeds =
+const totalBeds =
     singleBedRooms * singleBedBeds +
     doubleBedRooms * doubleBedBeds +
     familySuites * familySuiteBeds;
-  const roomLimitExceeded = totalRooms > MAX_ROOMS_ALLOWED;
-  const bedLimitExceeded = totalBeds > MAX_BEDS_ALLOWED;
-  const bathroomsBelowRooms = totalRooms > 0 && attachedWashroomsValue < totalRooms;
+const roomLimitExceeded = totalRooms > MAX_ROOMS_ALLOWED;
+const bedLimitExceeded = totalBeds > MAX_BEDS_ALLOWED;
+const bathroomsBelowRooms = totalRooms > 0 && attachedWashroomsValue < totalRooms;
+useEffect(() => {
+  if (syncAttachedBaths) {
+    form.setValue("attachedWashrooms", totalRooms, { shouldDirty: true });
+  }
+}, [syncAttachedBaths, totalRooms, form]);
 
   // Calculate weighted average rate (2025 Rules - based on total revenue)
   const calculateWeightedAverageRate = (): number => {
@@ -862,27 +1503,99 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
 
   // Use weighted average if per-room-type rates are set, otherwise fall back to proposedRoomRate (legacy)
   const hasPerRoomTypeRates = singleBedRoomRate > 0 || doubleBedRoomRate > 0 || familySuiteRate > 0;
-  const effectiveRate = hasPerRoomTypeRates ? calculateWeightedAverageRate() : proposedRoomRate;
-  const calculatedHighestRoomRate = Math.max(
-    singleBedRooms > 0 ? singleBedRoomRate : 0,
-    doubleBedRooms > 0 ? doubleBedRoomRate : 0,
-    familySuites > 0 ? familySuiteRate : 0,
-    !hasPerRoomTypeRates ? proposedRoomRate : 0
-  );
-  const highestRoomRate = calculatedHighestRoomRate > 0 ? calculatedHighestRoomRate : proposedRoomRate;
-  const categoryBlocked = isCategoryEnforced && categoryValidation && !categoryValidation.isValid;
-  const isNextDisabled =
-    isLeaseBlocked || roomLimitExceeded || bedLimitExceeded || bathroomsBelowRooms || categoryBlocked;
+const effectiveRate = hasPerRoomTypeRates ? calculateWeightedAverageRate() : proposedRoomRate;
+const calculatedHighestRoomRate = Math.max(
+  singleBedRooms > 0 ? singleBedRoomRate : 0,
+  doubleBedRooms > 0 ? doubleBedRoomRate : 0,
+  familySuites > 0 ? familySuiteRate : 0,
+  !hasPerRoomTypeRates ? proposedRoomRate : 0
+);
+const highestRoomRate =
+  totalRooms > 0
+    ? calculatedHighestRoomRate > 0
+      ? calculatedHighestRoomRate
+      : proposedRoomRate
+    : 0;
+const highestTariffBucket = highestRoomRate > 0 ? rateToBucket(highestRoomRate) : null;
+const highestTariffLabel =
+  roomCalcMode === "direct"
+    ? highestRoomRate > 0
+      ? `${formatShortCurrency(highestRoomRate)}/night`
+      : "₹0/night"
+    : highestTariffBucket
+      ? TARIFF_BUCKETS.find((bucket) => bucket.value === highestTariffBucket)?.label ?? "None selected"
+      : "₹0/night";
+  const categoryValidation =
+    category && totalRooms > 0 && highestRoomRate > 0
+      ? validateCategorySelection(category as CategoryType, totalRooms, highestRoomRate, categoryRateBands)
+      : null;
+  const categoryWarnings = categoryValidation?.warnings ?? [];
+  const shouldLockCategoryWarning = lockToRecommendedCategory && categoryWarnings.length > 0;
+  const resolvedCategory = (category as CategoryType) || "silver";
+  const resolvedCategoryBand = categoryRateBands[resolvedCategory] ?? DEFAULT_CATEGORY_RATE_BANDS[resolvedCategory];
+  const suggestedCategory = categoryValidation?.suggestedCategory;
+  const type2CategoryConflict =
+    roomCalcMode === "direct"
+      ? type2Rows.some((row) => {
+          const rate = coerceNumber(row.customRate, 0) ?? 0;
+          if (rate <= 0) {
+            return false;
+          }
+          const status = evaluateBandStatus(rate, resolvedCategoryBand);
+          return status === "below" || status === "above";
+        })
+      : type2Rows.some((row) => {
+          const bucketInfo = TARIFF_BUCKETS.find((bucket) => bucket.value === row.tariffBucket);
+          if (!bucketInfo) return false;
+          return CATEGORY_ORDER[resolvedCategory] < CATEGORY_ORDER[bucketInfo.minCategory];
+        });
+const categoryBlocked = Boolean(
+  (isCategoryEnforced && categoryValidation && !categoryValidation.isValid) ||
+    type2CategoryConflict ||
+    shouldLockCategoryWarning,
+);
+const safetyChecklistFailed = !selectedAmenities.cctv || !selectedAmenities.fireSafety;
+const roomGuardrailsFailed =
+  isLeaseBlocked ||
+  roomLimitExceeded ||
+  bedLimitExceeded ||
+  bathroomsBelowRooms ||
+  categoryBlocked ||
+  safetyChecklistFailed ||
+  totalRooms === 0;
+const isNextDisabled = step === 1
+  ? !pincodeIsValid
+  : step === 2
+    ? propertyOwnership === "leased"
+    : step === 3
+      ? roomGuardrailsFailed || gstinBlocking
+      : step > 3
+        ? roomGuardrailsFailed
+        : false;
 
   // Smart category suggestion based on room count + weighted average rate
   const suggestedCategoryValue = totalRooms > 0 && highestRoomRate > 0 
-    ? suggestCategory(totalRooms, highestRoomRate) 
+    ? suggestCategory(totalRooms, highestRoomRate, categoryRateBands) 
     : null;
+const selectedAmenitiesCount = Object.values(selectedAmenities).filter(Boolean).length;
+const applicationNumber = activeHydratedApplication?.applicationNumber ?? null;
 
-  // Validate selected category against room specs
-  const categoryValidation = category && totalRooms > 0 && highestRoomRate > 0
-    ? validateCategorySelection(category as CategoryType, totalRooms, highestRoomRate)
-    : null;
+const copyApplicationNumber = async () => {
+  if (!applicationNumber) return;
+  try {
+    await navigator.clipboard.writeText(applicationNumber);
+    toast({
+      title: "Application number copied",
+      description: applicationNumber,
+    });
+  } catch (error) {
+    toast({
+      title: "Copy failed",
+      description: error instanceof Error ? error.message : "Unable to copy application number",
+      variant: "destructive",
+    });
+  }
+};
 
   // Load draft data into form when resuming
   useEffect(() => {
@@ -899,9 +1612,15 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       setMaxStepReached(1);
     }
 
+    const draftKind = draft.applicationKind as ApplicationKind | undefined;
+    const isService = isServiceApplication(draftKind);
     toast({
-      title: "Draft loaded",
-      description: "Continue editing your application from where you left off.",
+      title: isService
+        ? `${getApplicationKindLabel(draftKind)} draft ready`
+        : "Draft loaded",
+      description: isService
+        ? "This request is linked to your approved application. Review and submit once adjustments are complete."
+        : "Continue editing your application from where you left off.",
     });
   }, [draftData]);
 
@@ -910,7 +1629,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     if (!correctionData?.application) return;
     const application = correctionData.application;
 
-    if (!['sent_back_for_corrections', 'reverted_to_applicant', 'reverted_by_dtdo'].includes((application.status || '') as string)) {
+    if (!isCorrectionRequiredStatus(application.status)) {
       toast({
         title: "Application not editable",
         description: "This application is no longer awaiting corrections.",
@@ -922,6 +1641,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
 
     setCorrectionId(application.id);
     hydrateFormFromSource(application);
+    setCorrectionAcknowledged(false);
     setDraftId(null);
     setStep(1);
     setMaxStepReached(totalSteps);
@@ -961,7 +1681,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
 
     form.reset({
       propertyName: "",
-      locationType: "gp",
+      locationType: "" as LocationType | "",
       category: "silver",
       proposedRoomRate: 2000,
       singleBedRoomRate: 0,
@@ -972,7 +1692,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       singleBedRooms: 0,
       singleBedBeds: 1,
       singleBedRoomSize: undefined,
-      doubleBedRooms: 1,
+      doubleBedRooms: 0,
       doubleBedBeds: 2,
       doubleBedRoomSize: undefined,
       familySuites: 0,
@@ -1003,7 +1723,6 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       district: profileDistrict,
       tehsil: defaultTehsilValue,
       tehsilOther: defaultTehsilOtherValue,
-      block: userProfile.block || "",
       gramPanchayat: userProfile.gramPanchayat || "",
       urbanBody: userProfile.urbanBody || "",
       ward: userProfile.ward || "",
@@ -1037,6 +1756,22 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     }
   }, [district]);
 
+  useEffect(() => {
+    if (step !== 1 || isHydratingDraft.current) {
+      return;
+    }
+    if (!form.getValues("tehsil") && lastHydratedTehsil.current.value) {
+      form.setValue("tehsil", lastHydratedTehsil.current.value, {
+        shouldDirty: false,
+        shouldValidate: true,
+      });
+      form.setValue("tehsilOther", lastHydratedTehsil.current.other, {
+        shouldDirty: false,
+        shouldValidate: true,
+      });
+    }
+  }, [form, step]);
+
   const calculateFee = () => {
     // Detect Pangi sub-division (Chamba district, Pangi tehsil)
   const isPangiSubDivision = district === "Chamba" && tehsilForRules === "Pangi";
@@ -1044,7 +1779,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     // Use new 2025 fee calculator
     const feeBreakdown = calculateHomestayFee({
       category: category as CategoryType,
-      locationType: locationType as LocationType,
+      locationType: resolvedLocationType,
       validityYears: parseInt(certificateValidityYears) as 1 | 3,
       ownerGender: (ownerGender || "male") as "male" | "female" | "other",
       isPangiSubDivision,
@@ -1191,8 +1926,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     },
   });
 
-  const submitApplicationMutation = useMutation({
-    mutationFn: async (formData: ApplicationForm) => {
+const submitApplicationMutation = useMutation({
+  mutationFn: async (formData: ApplicationForm) => {
       const fees = calculateFee();
       const documentsPayload = buildDocumentsPayload();
       const totalDocumentBytes = documentsPayload.reduce(
@@ -1242,8 +1977,6 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       }
 
       if (isCorrectionMode && correctionId) {
-        const normalizedBlock = normalizeOptionalString(formData.block);
-        const normalizedBlockOther = normalizeOptionalString(formData.blockOther);
         const normalizedGramPanchayat = normalizeOptionalString(formData.gramPanchayat);
         const normalizedGramPanchayatOther = normalizeOptionalString(formData.gramPanchayatOther);
         const normalizedUrbanBody = normalizeOptionalString(formData.urbanBody);
@@ -1256,8 +1989,6 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
           district: formData.district,
           tehsil: resolvedTehsil,
           tehsilOther: normalizedTehsilOther || "",
-          block: normalizedBlock ?? "",
-          blockOther: normalizedBlockOther ?? "",
           gramPanchayat: normalizedGramPanchayat ?? "",
           gramPanchayatOther: normalizedGramPanchayatOther ?? "",
           urbanBody: normalizedUrbanBody ?? "",
@@ -1324,14 +2055,18 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
         return response.json();
       }
 
+      const requiresGstinSubmission = formData.category === "gold" || formData.category === "diamond";
+      const sanitizedGstinValue = requiresGstinSubmission
+        ? sanitizeGstinInput(formData.gstin ?? "")
+        : undefined;
+
       const normalizedFormData = {
         ...formData,
         tehsil: resolvedTehsil,
         tehsilOther: normalizedTehsilOther || "",
+        gstin: sanitizedGstinValue,
       };
 
-      const normalizedBlock = normalizeOptionalString(formData.block);
-      const normalizedBlockOther = normalizeOptionalString(formData.blockOther);
       const normalizedGramPanchayat = normalizeOptionalString(formData.gramPanchayat);
       const normalizedGramPanchayatOther = normalizeOptionalString(formData.gramPanchayatOther);
       const normalizedUrbanBody = normalizeOptionalString(formData.urbanBody);
@@ -1340,10 +2075,9 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
 
       const payload = {
         ...normalizedFormData,
+        gstin: sanitizedGstinValue,
         ownerEmail: normalizeOptionalString(formData.ownerEmail) || undefined,
         telephone: normalizeOptionalString(formData.telephone) || undefined,
-        block: normalizedBlock ?? undefined,
-        blockOther: normalizedBlockOther ?? undefined,
         gramPanchayat: normalizedGramPanchayat ?? undefined,
         gramPanchayatOther: normalizedGramPanchayatOther ?? undefined,
         urbanBody: normalizedUrbanBody ?? undefined,
@@ -1396,10 +2130,69 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
         description: error.message || "Please try again",
         variant: "destructive",
       });
-    },
-  });
+  },
+});
 
-  const onSubmit = (data: ApplicationForm) => {
+  const enforceGstinRequirements = (options?: {
+    redirectToStep3?: boolean;
+    focusField?: boolean;
+    showToast?: boolean;
+  }) => {
+    const categoryValue = form.getValues("category");
+    if (categoryValue !== "gold" && categoryValue !== "diamond") {
+      return true;
+    }
+
+    const gstinValue = form.getValues("gstin");
+    const normalizedGstin = sanitizeGstinInput(gstinValue ?? "");
+
+    const guideUser = () => {
+      if (options?.redirectToStep3) {
+        setStep(3);
+      }
+      if (options?.showToast) {
+        toast({
+          title: "GSTIN required before submission",
+          description: "Fill the GSTIN on the Rooms & Category step to continue.",
+        });
+      }
+      if (options?.focusField) {
+        requestAnimationFrame(() => {
+          document
+            .querySelector<HTMLInputElement>('[data-testid="input-gstin"]')
+            ?.focus();
+        });
+      }
+    };
+
+    if (!normalizedGstin) {
+      form.setError("gstin", {
+        type: "manual",
+        message: "GSTIN is required for Diamond and Gold categories",
+      });
+      guideUser();
+      return false;
+    }
+
+    if (normalizedGstin.length !== 15 || !/^[0-9A-Z]{15}$/.test(normalizedGstin)) {
+      form.setError("gstin", {
+        type: "manual",
+        message: "GSTIN must be 15 characters (numbers and capital letters only)",
+      });
+      guideUser();
+      return false;
+    }
+
+    if (normalizedGstin !== gstinValue) {
+      form.setValue("gstin", normalizedGstin, { shouldValidate: true, shouldDirty: true });
+    } else {
+      form.clearErrors("gstin");
+    }
+
+    return true;
+  };
+
+  const onSubmit = async (data: ApplicationForm) => {
     console.log("onSubmit called - Step:", step, "Total Steps:", totalSteps);
     console.log("Form data:", data);
     console.log("Form errors:", form.formState.errors);
@@ -1407,6 +2200,24 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     // Only allow submission on the final step
     if (step !== totalSteps) {
       console.warn("Form submission blocked - not on final step");
+      return;
+    }
+
+    if (!enforceGstinRequirements({ redirectToStep3: true, focusField: true, showToast: true })) {
+      return;
+    }
+
+    const isValid = await form.trigger(undefined, { shouldFocus: true });
+    if (!isValid) {
+      return;
+    }
+
+    if (isCorrectionMode && !correctionAcknowledged) {
+      toast({
+        title: "Confirm corrections",
+        description: "Please confirm that you have addressed all issues before resubmitting.",
+        variant: "destructive",
+      });
       return;
     }
     
@@ -1489,15 +2300,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       // Add GSTIN validation for Diamond/Gold categories
       if (category === "diamond" || category === "gold") {
         fieldsToValidate.push("gstin");
-        
-        // Check if GSTIN is filled
-        const gstinValue = form.getValues("gstin");
-        if (!gstinValue || gstinValue.trim() === "") {
-          toast({
-            title: "GSTIN is required",
-            description: "GSTIN is mandatory for Diamond and Gold category properties",
-            variant: "destructive"
-          });
+        if (!enforceGstinRequirements({ focusField: true })) {
           return;
         }
       }
@@ -1580,8 +2383,10 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
       if (uploadedDocuments.revenuePapers.length === 0) missingDocs.push("Revenue Papers");
       if (uploadedDocuments.affidavitSection29.length === 0) missingDocs.push("Affidavit under Section 29");
       if (uploadedDocuments.undertakingFormC.length === 0) missingDocs.push("Undertaking in Form-C");
-      if (uploadedDocuments.registerForVerification.length === 0) missingDocs.push("Register for Verification");
-      if (uploadedDocuments.billBook.length === 0) missingDocs.push("Bill Book");
+      if (requiresCommercialUtilityProof) {
+        if (uploadedDocuments.commercialElectricityBill.length === 0) missingDocs.push("Commercial electricity bill");
+        if (uploadedDocuments.commercialWaterBill.length === 0) missingDocs.push("Commercial water bill");
+      }
       if (propertyPhotos.length < 2) missingDocs.push("Property Photos (minimum 2)");
       
       if (missingDocs.length > 0) {
@@ -1632,8 +2437,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
     revenuePapers: uploadedDocuments.revenuePapers,
     affidavitSection29: uploadedDocuments.affidavitSection29,
     undertakingFormC: uploadedDocuments.undertakingFormC,
-    registerForVerification: uploadedDocuments.registerForVerification,
-    billBook: uploadedDocuments.billBook,
+    commercialElectricityBill: uploadedDocuments.commercialElectricityBill,
+    commercialWaterBill: uploadedDocuments.commercialWaterBill,
     propertyPhotos: propertyPhotos,
   };
 
@@ -1652,9 +2457,92 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
           </div>
         )}
 
-        <ApplicationStepper
-          currentStep={step}
-          maxStepReached={maxStepReached}
+        {isServiceDraft && activeDraftApplication && (
+          <Alert className="mb-6 border-sky-200 bg-sky-50">
+            <AlertTitle className="flex items-center gap-2">
+              <ApplicationKindBadge kind={activeApplicationKind} showDefault />
+              {getApplicationKindLabel(activeApplicationKind)} draft
+            </AlertTitle>
+            <AlertDescription>
+              {activeApplicationKind === "renewal"
+                ? "You are renewing an approved certificate. Property and ownership details are locked to prevent accidental edits."
+                : activeApplicationKind === "add_rooms"
+                ? "You are requesting to add rooms to the approved inventory. Update Step 3 to capture the additional rooms."
+                : "You are requesting to delete rooms from the approved inventory. Verify the counts below and provide the updated documents."}
+            </AlertDescription>
+            <div className="mt-4 grid gap-3 text-sm text-slate-700 md:grid-cols-2">
+              <p>
+                <span className="font-medium">Linked application:</span>{" "}
+                {parentApplicationNumber || "—"}
+              </p>
+              <p>
+                <span className="font-medium">Certificate #:</span>{" "}
+                {parentCertificateNumber || "—"}
+              </p>
+              <p>
+                <span className="font-medium">Certificate valid upto:</span>{" "}
+                {formatDateDisplay(inheritedCertificateExpiry)}
+              </p>
+              <p>
+                <span className="font-medium">Current rooms:</span>{" "}
+                {activeDraftApplication.totalRooms} total
+              </p>
+              {requestedRooms && (
+                <p>
+                  <span className="font-medium">Target rooms:</span>{" "}
+                  {requestedRooms.total} total (S:{requestedRooms.single ?? activeDraftApplication.singleBedRooms} · D:{requestedRooms.double ?? activeDraftApplication.doubleBedRooms} · F:{requestedRooms.family ?? activeDraftApplication.familySuites})
+                </p>
+              )}
+              {serviceContext?.renewalWindow && (
+                <p>
+                  <span className="font-medium">Renewal window:</span>{" "}
+                  {formatDateDisplay(serviceContext.renewalWindow.start)} – {formatDateDisplay(serviceContext.renewalWindow.end)}
+                </p>
+              )}
+              {typeof requestedRoomDelta === "number" && (
+                <p>
+                  <span className="font-medium">Room delta:</span>{" "}
+                  {requestedRoomDelta > 0 ? `+${requestedRoomDelta}` : requestedRoomDelta}
+                </p>
+              )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-600">
+              {parentApplicationId && (
+                <Button variant="outline" size="sm" onClick={() => setLocation(`/applications/${parentApplicationId}`)}>
+                  View approved record
+                </Button>
+              )}
+              {serviceNote && (
+                <span className="italic">
+                  Note: {serviceNote}
+                </span>
+              )}
+            </div>
+        </Alert>
+      )}
+
+        {applicationNumber && (
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between rounded-md border bg-muted/40 px-4 py-3 mb-4">
+            <div className="text-sm text-muted-foreground">
+              Application #:{" "}
+              <span className="font-semibold text-foreground">{applicationNumber}</span>
+            </div>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="gap-2"
+              onClick={copyApplicationNumber}
+              type="button"
+            >
+              <Copy className="h-4 w-4" />
+              Copy
+            </Button>
+          </div>
+        )}
+
+      <ApplicationStepper
+        currentStep={step}
+        maxStepReached={maxStepReached}
           totalSteps={totalSteps}
           formData={combinedFormData}
           onStepClick={handleStepClick}
@@ -1663,6 +2551,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
 
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+            <div ref={stepTopRef} />
             {step === 1 && (
               <Card>
                 <CardHeader>
@@ -1673,86 +2562,99 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                   <CardDescription>Basic information about your homestay property</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <FormField
-                    control={form.control}
-                    name="propertyName"
-                    rules={{ required: "Property name is required" }}
-                    render={({ field, fieldState }) => (
-                      <FormItem>
-                        <FormLabel>
-                          Property Name <span className="text-destructive">*</span>
-                        </FormLabel>
-                        <FormControl>
-                          <Input
-                            placeholder="e.g., Himalayan View Homestay"
-                            data-testid="input-property-name"
-                            aria-invalid={fieldState.invalid}
-                            className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>Choose a memorable name for your property</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="locationType"
-                    rules={{ required: "Location type is required" }}
-                    render={({ field, fieldState }) => (
-                      <FormItem>
-                        <FormLabel>
-                          Location Type (affects registration fee) <span className="text-destructive">*</span>
-                        </FormLabel>
-                        <Select onValueChange={field.onChange} value={field.value}>
-                          <FormControl>
-                            <SelectTrigger
-                              data-testid="select-location-type"
-                              className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
-                              aria-invalid={fieldState.invalid}
-                            >
-                              <SelectValue placeholder="Select location type" />
-                            </SelectTrigger>
-                          </FormControl>
-                          <SelectContent>
-                            {LOCATION_TYPES.map((type) => (
-                              <SelectItem key={type.value} value={type.value}>
-                                {type.label}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <FormDescription>Rural (GP) or Urban (MC/TCP) - Required for fee calculation</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* LGD Hierarchical Address - Step 1: District & Tehsil */}
+                  {isServiceDraft && (
+                    <p className="text-sm text-muted-foreground">
+                      Property identity is inherited from your approved application. Start a new registration if structural details need to change.
+                    </p>
+                  )}
+                  <fieldset disabled={isServiceDraft} className="space-y-4">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <FormField
-                    control={form.control}
-                    name="district"
-                    rules={{ required: "District is required" }}
-                    render={({ field, fieldState }) => (
-                      <FormItem>
-                        <FormLabel>
-                          District <span className="text-destructive">*</span>
+                    <FormField
+                      control={form.control}
+                      name="propertyName"
+                      rules={{ required: "Property name is required" }}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>
+                            Homestay Name <span className="text-destructive">*</span>
                           </FormLabel>
-                          <Select 
+                          <FormControl>
+                            <Input
+                              placeholder="e.g., Himalayan View Homestay"
+                              data-testid="input-property-name"
+                              aria-invalid={fieldState.invalid}
+                              className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
+                              {...field}
+                            />
+                          </FormControl>
+                          <FormDescription>Choose a memorable name for your homestay</FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="projectType"
+                      rules={{ required: "Property type is required" }}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>
+                            New Registration <span className="text-destructive">*</span>
+                          </FormLabel>
+                          <Select onValueChange={field.onChange} value={field.value}>
+                            <FormControl>
+                              <SelectTrigger
+                                aria-invalid={fieldState.invalid}
+                                className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
+                              >
+                                <SelectValue placeholder="Select registration type" />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {PROJECT_TYPE_OPTIONS.map((option) => (
+                                <SelectItem key={option.value} value={option.value}>
+                                  {option.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <FormDescription>Submit a fresh homestay registration.</FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+
+                  {/* LGD Hierarchical Address - State, District & Tehsil */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <FormLabel>State</FormLabel>
+                      <Input value={HP_STATE} readOnly disabled className="bg-muted/60" aria-readonly />
+                      <p className="text-xs text-muted-foreground">Portal currently supports Himachal Pradesh only.</p>
+                    </div>
+
+                    <FormField
+                      control={form.control}
+                      name="district"
+                      rules={{ required: "District is required" }}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>
+                            District <span className="text-destructive">*</span>
+                          </FormLabel>
+                          <Select
                             onValueChange={(value) => {
                               field.onChange(value);
-                              // Reset dependent fields when district changes
-                              form.setValue('block', '');
                               form.setValue('gramPanchayat', '');
                               form.setValue('urbanBody', '');
                               form.setValue('ward', '');
+                              form.clearErrors("ward");
 
                               const tehsilOptions = getTehsilsForDistrict(value);
-                              const defaultTehsil = tehsilOptions[0] ?? '__other';
-                              form.setValue('tehsil', defaultTehsil, {
+                              const nextTehsilValue =
+                                tehsilOptions.length === 0 ? '__other' : '';
+                              form.setValue('tehsil', nextTehsilValue, {
                                 shouldDirty: false,
                                 shouldValidate: step >= 1,
                               });
@@ -1760,8 +2662,8 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                                 shouldDirty: false,
                                 shouldValidate: step >= 1,
                               });
-                            }} 
-                            value={field.value}
+                            }}
+                            value={field.value || undefined}
                           >
                             <FormControl>
                               <SelectTrigger
@@ -1786,217 +2688,228 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                       )}
                     />
 
-                  <FormField
-                    control={form.control}
-                    name="tehsil"
-                    render={({ field, fieldState }) => (
-                      <FormItem>
-                        <FormLabel>
-                          Tehsil / Sub-Division <span className="text-destructive">*</span>
+                    <FormField
+                      control={form.control}
+                      name="tehsil"
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel>
+                            Tehsil <span className="text-destructive">*</span>
                           </FormLabel>
                           {(() => {
-                            const districtValue = form.watch('district') || '';
-                            const tehsilOptions = getTehsilsForDistrict(districtValue);
+                            const districtValue = watchedDistrict || '';
+                            const fallbackTehsils = getTehsilsForDistrict(districtValue);
                             const currentTehsil = field.value;
                             const includeCurrentValue =
                               currentTehsil &&
                               typeof currentTehsil === "string" &&
-                              !tehsilOptions.includes(currentTehsil);
-                            
+                              !fallbackTehsils.includes(currentTehsil);
+
                             return (
-                              <Select 
+                              <Select
                                 onValueChange={(value) => {
                                   const previousTehsil = form.getValues('tehsil');
                                   field.onChange(value);
 
                                   const tehsilChanged = value !== previousTehsil;
-                                  if (!isHydratingDraft.current && tehsilChanged) {
-                                    form.setValue('block', '', { shouldDirty: false, shouldValidate: step >= 1 });
-                                    form.setValue('gramPanchayat', '', { shouldDirty: false, shouldValidate: step >= 1 });
-                                  }
+                                    if (!isHydratingDraft.current && tehsilChanged) {
+                                      form.setValue('gramPanchayat', '', { shouldDirty: false, shouldValidate: step >= 1 });
+                                      form.setValue('urbanBody', '', { shouldDirty: false, shouldValidate: step >= 1 });
+                                      form.setValue('ward', '', { shouldDirty: false, shouldValidate: step >= 1 });
+                                      form.clearErrors("ward");
+                                    }
 
                                   if (!isHydratingDraft.current && value !== '__other') {
                                     form.setValue('tehsilOther', '', { shouldDirty: false, shouldValidate: step >= 1 });
                                   }
-                                }} 
-                            value={field.value}
-                            disabled={!districtValue}
-                          >
-                            <FormControl>
-                              <SelectTrigger
-                                data-testid="select-tehsil"
-                                className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
-                                aria-invalid={fieldState.invalid}
+                                }}
+                                value={field.value || undefined}
+                                disabled={!districtValue}
                               >
-                                <SelectValue placeholder="Select tehsil" />
-                              </SelectTrigger>
-                            </FormControl>
-                              <SelectContent>
-                                {tehsilOptions.map((tehsil) => (
-                                  <SelectItem key={tehsil} value={tehsil}>
-                                    {tehsil}
-                                  </SelectItem>
-                                ))}
-                                <SelectItem value="__other">Other (Manual Entry)</SelectItem>
-                                {includeCurrentValue && (
-                                  <SelectItem key={currentTehsil} value={currentTehsil}>
-                                    {currentTehsil}
-                                  </SelectItem>
-                                )}
-                              </SelectContent>
+                                <FormControl>
+                                  <SelectTrigger
+                                    data-testid="select-tehsil"
+                                    className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
+                                    aria-invalid={fieldState.invalid}
+                                  >
+                                    <SelectValue placeholder="Select tehsil" />
+                                  </SelectTrigger>
+                                </FormControl>
+                                <SelectContent>
+                                  {fallbackTehsils.map((tehsil) => (
+                                    <SelectItem key={tehsil} value={tehsil}>
+                                      {tehsil}
+                                    </SelectItem>
+                                  ))}
+                                  <SelectItem value="__other">Other (Manual Entry)</SelectItem>
+                                  {includeCurrentValue && (
+                                    <SelectItem key={currentTehsil} value={currentTehsil}>
+                                      {currentTehsil}
+                                    </SelectItem>
+                                  )}
+                                </SelectContent>
                               </Select>
-                              );
-                            })()}
-                            <FormDescription>Select tehsil after district</FormDescription>
-                            <FormMessage />
-                            {form.watch('tehsil') === '__other' && (
-                              <FormField
-                                control={form.control}
-                                name="tehsilOther"
-                                rules={{ required: "Please enter the tehsil name" }}
-                                render={({ field, fieldState }) => (
-                                  <FormItem className="mt-3">
-                                    <FormLabel>Manual Tehsil Entry <span className="text-destructive">*</span></FormLabel>
-                                    <FormControl>
-                                      <Input
-                                        placeholder="Type tehsil or sub-division name"
-                                        data-testid="input-tehsil-other"
-                                        value={field.value ?? ""}
-                                        onChange={(event) => field.onChange(event.target.value)}
-                                        aria-invalid={fieldState.invalid}
-                                      />
-                                    </FormControl>
-                                    <FormDescription>Provide the correct tehsil if it is not listed above.</FormDescription>
-                                    <FormMessage />
-                                  </FormItem>
-                                )}
-                              />
-                            )}
-                          </FormItem>
-                        )}
-                      />
-                    </div>
+                            );
+                          })()}
+                          <FormDescription>Select tehsil after district</FormDescription>
+                          <FormMessage />
+                          {form.watch('tehsil') === '__other' && (
+                            <FormField
+                              control={form.control}
+                              name="tehsilOther"
+                              rules={{ required: "Please enter the tehsil name" }}
+                              render={({ field, fieldState }) => (
+                                <FormItem className="mt-3">
+                                  <FormLabel>Manual Tehsil Entry <span className="text-destructive">*</span></FormLabel>
+                                  <FormControl>
+                                    <Input
+                                      placeholder="Type tehsil or subdivision name"
+                                      data-testid="input-tehsil-other"
+                                      value={field.value ?? ""}
+                                      onChange={(event) => field.onChange(event.target.value)}
+                                      aria-invalid={fieldState.invalid}
+                                    />
+                                  </FormControl>
+                                  <FormDescription>Provide the correct tehsil if it is not listed above.</FormDescription>
+                                  <FormMessage />
+                                </FormItem>
+                              )}
+                            />
+                          )}
+                        </FormItem>
+                      )}
+                    />
+                  </div>
 
-                  {/* Conditional: Rural Address (Gram Panchayat) */}
-                  {form.watch('locationType') === 'gp' && (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <FormField
-                        control={form.control}
-                        name="block"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Block / Development Block</FormLabel>
-                            <Select 
-                              onValueChange={field.onChange} 
-                              value={field.value}
-                              disabled={!tehsil || tehsil === '__other'}
+                  <FormField
+                    control={form.control}
+                    name="locationType"
+                    rules={{ required: "Location type is required" }}
+                    render={({ field, fieldState }) => (
+                      <FormItem>
+                        <FormLabel>
+                          Location Type (affects registration fee) <span className="text-destructive">*</span>
+                        </FormLabel>
+                        <Select
+                          onValueChange={(value) => {
+                            field.onChange(value);
+                            if (value === "gp") {
+                              form.setValue("urbanBody", "", { shouldDirty: false, shouldValidate: step >= 1 });
+                                  form.setValue("ward", "", { shouldDirty: false, shouldValidate: step >= 1 });
+                                  form.clearErrors("ward");
+                            }
+                          }}
+                          value={field.value || undefined}
+                        >
+                          <FormControl>
+                            <SelectTrigger
+                              data-testid="select-location-type"
+                              className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
+                              aria-invalid={fieldState.invalid}
                             >
-                              <FormControl>
-                                <SelectTrigger data-testid="select-block">
-                                  <SelectValue placeholder="Select block" />
-                                </SelectTrigger>
-                              </FormControl>
-                              <SelectContent>
-                                {(tehsil && tehsil !== '__other' ? getBlocksForTehsil(district, tehsil) : []).map((block) => (
-                                  <SelectItem key={block} value={block}>
-                                    {block}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <FormDescription>Rural development block</FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+                              <SelectValue placeholder="Select location type" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {LOCATION_TYPES.map((type) => (
+                              <SelectItem key={type.value} value={type.value}>
+                                {type.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <FormDescription>Rural (GP) or Urban (MC/TCP) - Required for fee calculation</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
 
-                      <FormField
-                        control={form.control}
-                        name="gramPanchayat"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Gram Panchayat / Village</FormLabel>
-                            <FormControl>
-                              <Input 
-                                placeholder="Enter Gram Panchayat name" 
-                                data-testid="input-gram-panchayat" 
-                                {...field} 
-                              />
-                            </FormControl>
-                            <FormDescription>Your village/gram panchayat name</FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
+                  {gramFieldConfig && (
+                    <FormField
+                      control={form.control}
+                      name="gramPanchayat"
+                      rules={{
+                        validate: (value) => {
+                          if (!value?.trim()) {
+                            return gramFieldConfig.requiredMessage;
+                          }
+                          return true;
+                        },
+                      }}
+                      render={({ field, fieldState }) => (
+                        <FormItem>
+                          <FormLabel className="flex items-center gap-1">
+                            {gramFieldConfig.label}
+                            <span className="text-destructive">*</span>
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              placeholder={gramFieldConfig.placeholder}
+                              data-testid="input-gram-panchayat"
+                              value={field.value ?? ""}
+                              onChange={(event) => field.onChange(event.target.value)}
+                              aria-invalid={fieldState.invalid}
+                            />
+                          </FormControl>
+                          <FormDescription>{gramFieldConfig.description}</FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
                   )}
 
                   {/* Conditional: Urban Address (MC/TCP) */}
-                  {(form.watch('locationType') === 'mc' || form.watch('locationType') === 'tcp') && (
+                  {(locationType === 'mc' || locationType === 'tcp') && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <FormField
                         control={form.control}
                         name="urbanBody"
-                        render={({ field }) => (
+                        rules={{ required: "Urban local body is required" }}
+                        render={({ field, fieldState }) => (
                           <FormItem>
-                            <FormLabel>Municipal Corporation / Nagar Panchayat</FormLabel>
-                            <Select 
-                              onValueChange={(value) => {
-                                field.onChange(value);
-                                form.setValue('ward', '');
-                              }} 
-                              value={field.value}
-                              disabled={!form.watch('district')}
-                            >
+                              <FormLabel>
+                                {urbanBodyConfig.label} <span className="text-destructive">*</span>
+                              </FormLabel>
                               <FormControl>
-                                <SelectTrigger data-testid="select-urban-body">
-                                  <SelectValue placeholder="Select urban body" />
-                                </SelectTrigger>
+                                <Input
+                                  placeholder={urbanBodyConfig.placeholder}
+                                  data-testid="input-urban-body"
+                                  value={field.value ?? ""}
+                                  onChange={(event) => {
+                                    field.onChange(event.target.value);
+                                    form.setValue("ward", "", { shouldDirty: false, shouldValidate: step >= 1 });
+                                    form.clearErrors("ward");
+                                  }}
+                                  aria-invalid={fieldState.invalid}
+                                />
                               </FormControl>
-                              <SelectContent>
-                                {getUrbanBodiesForDistrict(form.watch('district')).map((ub) => (
-                                  <SelectItem key={ub.name} value={ub.name}>
-                                    {ub.name}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <FormDescription>MC/TCP/Nagar Panchayat</FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+                              <FormDescription>{urbanBodyConfig.description}</FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
 
                       <FormField
                         control={form.control}
                         name="ward"
-                        render={({ field }) => (
+                        render={({ field, fieldState }) => (
                           <FormItem>
-                            <FormLabel>Ward Number</FormLabel>
-                            <Select 
-                              onValueChange={field.onChange} 
-                              value={field.value}
-                              disabled={!form.watch('urbanBody')}
-                            >
-                              <FormControl>
-                                <SelectTrigger data-testid="select-ward">
-                                  <SelectValue placeholder="Select ward" />
-                                </SelectTrigger>
-                              </FormControl>
-                              <SelectContent>
-                                {getWardsForUrbanBody(form.watch('district'), form.watch('urbanBody') || '').map((ward) => (
-                                  <SelectItem key={ward} value={ward}>
-                                    {ward}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            <FormDescription>Your ward number</FormDescription>
+                            <FormLabel>Ward / Zone (optional)</FormLabel>
+                            <FormControl>
+                              <Input
+                                placeholder="Ward number or zone"
+                                data-testid="input-ward-manual"
+                                value={field.value ?? ""}
+                                onChange={(event) => field.onChange(event.target.value)}
+                                aria-invalid={fieldState.invalid}
+                              />
+                            </FormControl>
+                            <FormDescription>Provide the ward or zone if assigned by the urban body.</FormDescription>
                             <FormMessage />
                           </FormItem>
                         )}
                       />
-                    </div>
+              </div>
                   )}
 
                   <FormField
@@ -2036,23 +2949,36 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                           PIN Code <span className="text-destructive">*</span>
                         </FormLabel>
                         <FormControl>
-                          <Input
-                            placeholder="6-digit PIN code"
-                            data-testid="input-pincode"
-                            aria-invalid={fieldState.invalid}
-                            className={fieldState.invalid ? "border-destructive focus-visible:ring-destructive" : ""}
-                            value={field.value ?? ""}
-                            onChange={(event) => {
-                              const nextValue = sanitizeDigits(event.target.value, 6);
-                              field.onChange(nextValue);
-                            }}
-                            onBlur={(event) => {
-                              const trimmed = sanitizeDigits(event.target.value, 6);
-                              field.onChange(trimmed);
-                              field.onBlur();
-                            }}
-                          />
+                          <div className="flex items-center gap-2">
+                            <span className="inline-flex items-center rounded-md border bg-muted px-3 py-2 font-mono text-sm text-muted-foreground">
+                              {PINCODE_PREFIX}-
+                            </span>
+                            <Input
+                              placeholder="Last 4 digits"
+                              data-testid="input-pincode"
+                              aria-invalid={fieldState.invalid}
+                              className={`bg-muted/60 ${
+                                showPincodeHint ? "border-amber-500 focus-visible:ring-amber-500 ring-offset-background" : ""
+                              }`}
+                              value={pincodeSuffixValue}
+                              onChange={(event) => {
+                                const suffix = sanitizePincodeSuffix(event.target.value);
+                                field.onChange((PINCODE_PREFIX + suffix).slice(0, 6));
+                              }}
+                              onBlur={(event) => {
+                                const suffix = sanitizePincodeSuffix(event.target.value);
+                                field.onChange((PINCODE_PREFIX + suffix).slice(0, 6));
+                                field.onBlur();
+                              }}
+                            />
+                          </div>
                         </FormControl>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Prefix <span className="font-semibold">{PINCODE_PREFIX}</span> is fixed—enter the last 4 digits of your PIN code.
+                        </p>
+                        {showPincodeHint && (
+                          <p className="text-xs text-amber-600 mt-1">Enter all remaining digits to continue.</p>
+                        )}
                         <FormMessage />
                       </FormItem>
                     )}
@@ -2074,6 +3000,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                     />
 
                   </div>
+                  </fieldset>
                 </CardContent>
               </Card>
             )}
@@ -2088,6 +3015,24 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                   <CardDescription>Details of the property owner</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
+                  <Alert className="bg-muted/60 border-dashed border-muted">
+                    <Info className="h-4 w-4" />
+                    <AlertTitle>Profile-managed details</AlertTitle>
+                    <AlertDescription className="flex flex-wrap items-center gap-2">
+                      Name, contact and Aadhaar information come from your verified profile. Update them via
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-3"
+                        onClick={goToProfile}
+                      >
+                        My Profile
+                      </Button>
+                      before starting the application.
+                    </AlertDescription>
+                  </Alert>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <FormField
                       control={form.control}
@@ -2102,19 +3047,16 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                               ref={field.ref}
                               name={field.name}
                               value={field.value ?? ""}
+                              readOnly
+                              aria-readonly="true"
                               placeholder="First name"
                               autoComplete="given-name"
                               autoCapitalize="words"
                               data-testid="input-owner-first-name"
-                              onKeyDown={preventDigitKey}
-                              onChange={(event) => field.onChange(sanitizeNamePart(event.target.value))}
-                              onBlur={(event) => {
-                                field.onChange(sanitizeNamePart(event.target.value).trim());
-                                field.onBlur();
-                              }}
+                              className="bg-muted cursor-not-allowed"
                             />
                           </FormControl>
-                          <FormDescription>Letters only; digits are blocked automatically.</FormDescription>
+                          {renderProfileManagedDescription("First name")}
                           <FormMessage />
                         </FormItem>
                       )}
@@ -2133,19 +3075,16 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                               ref={field.ref}
                               name={field.name}
                               value={field.value ?? ""}
+                              readOnly
+                              aria-readonly="true"
                               placeholder="Last name"
                               autoComplete="family-name"
                               autoCapitalize="words"
                               data-testid="input-owner-last-name"
-                              onKeyDown={preventDigitKey}
-                              onChange={(event) => field.onChange(sanitizeNamePart(event.target.value))}
-                              onBlur={(event) => {
-                                field.onChange(sanitizeNamePart(event.target.value).trim());
-                                field.onBlur();
-                              }}
+                              className="bg-muted cursor-not-allowed"
                             />
                           </FormControl>
-                          <FormDescription>Only alphabets, spaces, hyphen or apostrophe are allowed.</FormDescription>
+                          {renderProfileManagedDescription("Last name")}
                           <FormMessage />
                         </FormItem>
                       )}
@@ -2165,7 +3104,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             value={field.value ?? ""}
                             readOnly
                             data-testid="input-owner-name"
-                            className="bg-muted"
+                            className="bg-muted cursor-not-allowed"
                           />
                         </FormControl>
                         <FormDescription>Generated from first and last name for application records.</FormDescription>
@@ -2214,19 +3153,18 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                               ref={field.ref}
                               name={field.name}
                               value={field.value ?? ""}
+                              readOnly
+                              aria-readonly="true"
                               placeholder="10-digit mobile"
                               autoComplete="tel"
                               inputMode="numeric"
                               pattern="[0-9]*"
                               maxLength={10}
                               data-testid="input-owner-mobile"
-                              onChange={(event) => field.onChange(sanitizeDigits(event.target.value, 10))}
-                              onBlur={(event) => {
-                                field.onChange(sanitizeDigits(event.target.value, 10));
-                                field.onBlur();
-                              }}
+                              className="bg-muted cursor-not-allowed"
                             />
                           </FormControl>
+                          {renderProfileManagedDescription("Mobile number")}
                           <FormMessage />
                         </FormItem>
                       )}
@@ -2239,24 +3177,23 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                       name="ownerEmail"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>
-                            Email <span className="text-destructive">*</span>
-                          </FormLabel>
-                          <FormControl>
-                            <Input
-                              ref={field.ref}
-                              name={field.name}
-                              type="email"
-                              value={field.value ?? ""}
-                              placeholder="your@email.com"
-                              data-testid="input-owner-email"
-                              onChange={(event) => field.onChange(event.target.value)}
-                              onBlur={(event) => {
-                                field.onChange(event.target.value.trim());
-                                field.onBlur();
-                              }}
-                            />
-                          </FormControl>
+                            <FormLabel>
+                              Email <span className="text-destructive">*</span>
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                ref={field.ref}
+                                name={field.name}
+                                type="email"
+                                value={field.value ?? ""}
+                                readOnly
+                                aria-readonly="true"
+                                placeholder="your@email.com"
+                                data-testid="input-owner-email"
+                                className="bg-muted cursor-not-allowed"
+                              />
+                            </FormControl>
+                          {renderProfileManagedDescription("Email")}
                           <FormMessage />
                         </FormItem>
                       )}
@@ -2275,18 +3212,17 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                               ref={field.ref}
                               name={field.name}
                               value={field.value ?? ""}
+                              readOnly
+                              aria-readonly="true"
                               placeholder="12-digit Aadhaar"
                               inputMode="numeric"
                               pattern="[0-9]*"
                               maxLength={12}
                               data-testid="input-owner-aadhaar"
-                              onChange={(event) => field.onChange(sanitizeDigits(event.target.value, 12))}
-                              onBlur={(event) => {
-                                field.onChange(sanitizeDigits(event.target.value, 12));
-                                field.onBlur();
-                              }}
+                              className="bg-muted cursor-not-allowed"
                             />
                           </FormControl>
+                          {renderProfileManagedDescription("Aadhaar number")}
                           <FormMessage />
                         </FormItem>
                       )}
@@ -2373,574 +3309,483 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
               <>
               <Card>
                 <CardHeader>
-                  <div className="flex items-center gap-2 mb-2">
+                  <div className="flex items-center gap-2">
                     <Bed className="w-5 h-5 text-primary" />
                     <CardTitle>Rooms & Category</CardTitle>
                   </div>
                   <CardDescription>Number of rooms and property category</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-6">
-                  <div className="bg-muted/50 p-4 rounded-lg">
-                    <p className="text-sm font-medium mb-2">
-                      Total Rooms: {totalRooms} / {MAX_ROOMS_ALLOWED} allowed
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      HP Homestay Rules 2025 permit up to {MAX_ROOMS_ALLOWED} rooms and {MAX_BEDS_ALLOWED} beds across all room types.
-                    </p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Total beds configured: {totalBeds}
-                    </p>
-                  </div>
-
-                  {/* Nightly Rate Summary */}
-                  {highestRoomRate > 0 && (
-                    <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
-                      <div className="flex items-center gap-2">
-                        <Info className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-                        <div>
-                          <p className="font-medium text-sm">Highest Nightly Rate</p>
-                          <p className="text-lg font-bold text-blue-600 dark:text-blue-400 mt-1">
-                            ₹{highestRoomRate.toLocaleString('en-IN')}/night
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-1">
-                            Used to determine category per HP Homestay Rules 2025.
-                          </p>
-                          {hasPerRoomTypeRates && effectiveRate > 0 && (
-                            <p className="text-xs text-muted-foreground mt-2">
-                              Weighted average (for reference): ₹{effectiveRate.toLocaleString('en-IN')}/night across {totalRooms} {totalRooms === 1 ? "room" : "rooms"}.
-                            </p>
-                          )}
-                        </div>
+                    <div className="bg-muted/50 p-4 rounded-lg grid gap-4 md:grid-cols-3 text-sm">
+                      <div>
+                        <p className="text-xs text-muted-foreground">Total Rooms Configured</p>
+                        <p className="text-2xl font-semibold">{totalRooms}</p>
+                        <p className="text-xs text-muted-foreground mt-1">Limit: {MAX_ROOMS_ALLOWED} rooms</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Total Beds Planned</p>
+                        <p className="text-2xl font-semibold">{totalBeds}</p>
+                        <p className="text-xs text-muted-foreground mt-1">Limit: {MAX_BEDS_ALLOWED} beds</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Highest Tariff Range</p>
+                        <p className="text-sm font-semibold">
+                          {highestTariffLabel}
+                        </p>
+                        {highestRoomRate <= 0 && (
+                          <p className="text-xs text-muted-foreground mt-1">No rooms configured yet</p>
+                        )}
                       </div>
                     </div>
-                  )}
 
-                  {/* Smart Category Suggestion */}
-                  {suggestedCategoryValue && totalRooms > 0 && highestRoomRate > 0 && (
-                    <div className="bg-primary/5 border border-primary/20 rounded-lg p-4" data-testid="alert-category-suggestion">
-                      <div className="flex items-start gap-3">
-                        <Lightbulb className="w-5 h-5 text-primary mt-0.5" />
-                        <div className="flex-1">
-                          <p className="font-medium text-sm">Recommended Category</p>
-                          <p className="text-sm text-muted-foreground mt-1">
-                            Based on {totalRooms} {totalRooms === 1 ? 'room' : 'rooms'} with highest nightly rate ₹{highestRoomRate.toLocaleString('en-IN')}.
-                          </p>
-                          <div className="mt-3 flex items-center gap-3">
-                            <Badge variant={getCategoryBadge(suggestedCategoryValue).variant} className="text-base px-3 py-1">
-                              {getCategoryBadge(suggestedCategoryValue).label}
-                            </Badge>
-                            {category !== suggestedCategoryValue && (
-                              <Button 
-                                type="button" 
-                                variant="outline" 
-                                size="sm"
-                                data-testid="button-apply-suggested-category"
-                                onClick={() => form.setValue("category", suggestedCategoryValue)}
-                              >
-                                Use this category
-                              </Button>
-                            )}
-                          </div>
-                          <div className="mt-3 text-xs text-muted-foreground">
-                            <p className="font-medium mb-1">Category Criteria:</p>
-                            <ul className="space-y-0.5">
-                              <li>• Tariff: {CATEGORY_REQUIREMENTS[suggestedCategoryValue].tariffLabel}</li>
-                              <li>• Capacity: Up to {MAX_ROOMS_ALLOWED} rooms / {MAX_BEDS_ALLOWED} beds (applies to all categories)</li>
-                            </ul>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  <FormField
-                    control={form.control}
-                    name="category"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Property Category</FormLabel>
-                        <FormDescription className="mb-4">
-                          Category is determined by nightly tariff per HP Homestay Rules 2025.
-                        </FormDescription>
-                        <FormControl>
-                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                            {(["diamond", "gold", "silver"] as const).map((cat) => (
-                              <div
-                                key={cat}
-                                onClick={() => field.onChange(cat)}
-                                className={`p-4 border-2 rounded-lg cursor-pointer transition-all hover-elevate ${
-                                  field.value === cat ? "border-primary bg-primary/5" : "border-border"
-                                }`}
-                                data-testid={`option-category-${cat}`}
-                              >
-                                <div className="flex items-center justify-between mb-3">
-                                  <Badge variant={getCategoryBadge(cat).variant}>
-                                    {getCategoryBadge(cat).label}
-                                  </Badge>
-                                  {field.value === cat && (
-                                    <div className="w-5 h-5 rounded-full bg-primary flex items-center justify-center">
-                                      <div className="w-2 h-2 rounded-full bg-primary-foreground" />
-                                    </div>
-                                  )}
-                                </div>
-                                <ul className="text-xs text-muted-foreground space-y-1">
-                                  <li>{CATEGORY_REQUIREMENTS[cat].tariffLabel}</li>
-                                  <li>Capacity: Up to {MAX_ROOMS_ALLOWED} rooms / {MAX_BEDS_ALLOWED} beds</li>
-                                </ul>
-                              </div>
-                            ))}
-                          </div>
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* Category Validation Warnings */}
-                  {categoryValidation && !categoryValidation.isValid && (
-                    <div className="bg-destructive/10 border border-destructive/20 rounded-lg p-4" data-testid="alert-category-validation">
-                      <div className="flex items-start gap-2">
-                        <AlertTriangle className="w-5 h-5 text-destructive mt-0.5" />
-                        <div className="flex-1">
-                          <p className="font-medium text-sm text-destructive">Category Criteria Not Met</p>
-                          <ul className="mt-2 space-y-1 text-sm text-destructive/90">
-                            {categoryValidation.errors.map((error, idx) => (
-                              <li key={idx}>• {error}</li>
-                            ))}
-                          </ul>
-                          {isCategoryEnforced && (
-                            <p className="mt-3 text-xs text-destructive/80">
-                              Category enforcement is active. Please adjust room tariffs or selected category to meet the required criteria before continuing.
-                            </p>
-                          )}
-                          {categoryValidation.suggestedCategory && (
-                            <div className="mt-3 pt-3 border-t border-destructive/20">
-                              <p className="text-sm text-muted-foreground">Suggested: 
-                                <Button 
-                                  type="button" 
-                                  variant="outline" 
-                                  size="sm" 
-                                  className="ml-2"
-                                  data-testid="button-use-suggested-category"
-                                  onClick={() => form.setValue("category", categoryValidation.suggestedCategory!)}
-                                >
-                                  Switch to {categoryValidation.suggestedCategory.charAt(0).toUpperCase() + categoryValidation.suggestedCategory.slice(1)}
-                                </Button>
-                              </p>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {CATEGORY_CARD_INFO.map((card) => {
+                        const selected = category === card.value;
+                        const band = categoryRateBands[card.value] ?? DEFAULT_CATEGORY_RATE_BANDS[card.value];
+                        const rangeLabel = formatBandLabel(band);
+                        return (
+                          <div
+                            key={card.value}
+                            className={`rounded-lg border p-4 transition ${selected ? "border-primary bg-primary/5" : "border-border"}`}
+                            onClick={() => form.setValue("category", card.value)}
+                          >
+                            <div className="flex items-center justify-between mb-2">
+                              <Badge variant={getCategoryBadge(card.value).variant}>{card.title}</Badge>
+                              {selected && <span className="text-xs font-semibold text-primary">Selected</span>}
                             </div>
+                            <p className="text-sm font-medium">{rangeLabel}</p>
+                            <p className="text-xs text-muted-foreground mt-2">{card.description}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="rounded-lg border border-muted p-4 space-y-2 bg-muted/30">
+                      <FormLabel className="text-xs uppercase text-muted-foreground">Room configuration mode</FormLabel>
+                      <p className="text-sm font-semibold">
+                        {roomCalcMode === "direct" ? "Option 2 · Actual nightly rent" : "Option 1 · Guided tariff buckets"}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        This option is fixed by the Admin console so every applicant quotes tariffs the same way.
+                      </p>
+                    </div>
+
+                    {type2CategoryConflict && (
+                      <Alert variant="destructive">
+                        <AlertTriangle className="h-4 w-4" />
+                        <AlertTitle>
+                          {roomCalcMode === "direct"
+                            ? "Tariff outside selected category"
+                            : "Category conflict detected"}
+                        </AlertTitle>
+                        <AlertDescription>
+                          {roomCalcMode === "direct"
+                            ? "One or more actual nightly rents fall outside this category’s allowed band. Update the rent values or switch to a higher category."
+                            : "One or more room types have tariffs above the selected category’s permitted range. Please switch the category or adjust the tariff buckets below to stay compliant with HP Homestay Rules 2025."}
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                    {categoryWarnings.length ? (
+                      <Alert className="border-amber-300 bg-amber-50 text-amber-900">
+                        <AlertTriangle className="h-4 w-4 text-amber-600" />
+                        <AlertTitle>Category exceeds published tariff</AlertTitle>
+                        <AlertDescription className="space-y-1">
+                          {categoryWarnings.map((warning) => (
+                            <p key={warning}>{warning}</p>
+                          ))}
+                          {lockToRecommendedCategory && (
+                            <p className="text-xs text-amber-800">
+                              Admin policy requires aligning with the recommended category
+                              {suggestedCategory ? ` (${getCategoryBadge(suggestedCategory).label})` : ""} before continuing.
+                            </p>
                           )}
+                        </AlertDescription>
+                      </Alert>
+                    ) : null}
+
+                    {type2Rows.length === 0 ? (
+                      <div className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
+                        No room configurations yet. Use “Add room type” to begin{" "}
+                        {roomCalcMode === "direct" ? "and enter the actual nightly rent for each room." : "by selecting the tariff bucket."}
+                      </div>
+                    ) : (
+                    <div className="space-y-4">
+                      {type2Rows.map((row, index) => {
+                        const availableTypeOptions = ROOM_TYPE_OPTIONS.filter(
+                          (option) =>
+                            option.value === row.roomType ||
+                            !type2Rows.some((other) => other.roomType === option.value && other.id !== row.id),
+                        );
+
+                        const bucketInfo = TARIFF_BUCKETS.find((bucket) => bucket.value === row.tariffBucket);
+                        const rowCategoryConflict =
+                          bucketInfo ? CATEGORY_ORDER[resolvedCategory] < CATEGORY_ORDER[bucketInfo.minCategory] : false;
+                        const rowCategoryOverkill =
+                          bucketInfo && shouldLockCategoryWarning
+                            ? CATEGORY_ORDER[resolvedCategory] > CATEGORY_ORDER[bucketInfo.minCategory]
+                            : false;
+                        const directRateValue =
+                          typeof row.customRate === "number"
+                            ? row.customRate
+                            : row.customRate === "" || row.customRate === undefined
+                              ? ""
+                              : Number(row.customRate);
+                        const directRateNumber =
+                          typeof directRateValue === "number" && Number.isFinite(directRateValue) ? directRateValue : 0;
+                        const directStatus = evaluateBandStatus(directRateNumber, resolvedCategoryBand);
+                        const rowHighlightVariant =
+                          roomCalcMode === "direct"
+                            ? directStatus === "above"
+                              ? "error"
+                              : directStatus === "below"
+                                ? "warning"
+                                : "none"
+                            : rowCategoryConflict
+                              ? "error"
+                              : rowCategoryOverkill
+                                ? "warning"
+                                : "none";
+                        const tariffHighlightClass =
+                          rowHighlightVariant === "error"
+                            ? "border-destructive focus-visible:ring-destructive ring-offset-background"
+                            : rowHighlightVariant === "warning"
+                              ? "border-amber-500 focus-visible:ring-amber-500 ring-offset-background"
+                              : undefined;
+                        const tariffHelperText =
+                          rowHighlightVariant === "error"
+                            ? "This tariff exceeds the selected category's limit."
+                            : rowHighlightVariant === "warning"
+                              ? "Tariff fits a lower category. Consider switching to reduce the fee."
+                              : null;
+                        const directHelperText =
+                          roomCalcMode === "direct"
+                            ? directStatus === "above"
+                              ? "Exceeds this category’s upper band. Reduce the rate or upgrade the category."
+                              : directStatus === "below"
+                                ? "Below the minimum for this category. Consider lowering the category or increasing the tariff."
+                                : null
+                            : null;
+                        const containerHighlight =
+                          roomCalcMode === "direct"
+                            ? rowHighlightVariant === "error"
+                              ? "border-destructive/60 bg-red-50"
+                              : rowHighlightVariant === "warning"
+                                ? "border-amber-400 bg-amber-50"
+                                : "border-sky-200 bg-sky-50"
+                            : "border-border bg-background";
+                        const directInputHighlight =
+                          rowHighlightVariant === "error"
+                            ? "border-destructive focus-visible:ring-destructive ring-offset-background"
+                            : rowHighlightVariant === "warning"
+                              ? "border-amber-500 focus-visible:ring-amber-500 ring-offset-background"
+                              : undefined;
+                        const isDirectRateEmpty =
+                          roomCalcMode === "direct" &&
+                          (row.customRate === "" || row.customRate === undefined || directRateNumber <= 0);
+                        const directPlaceholderClasses = isDirectRateEmpty
+                          ? "text-muted-foreground/80 placeholder:text-muted-foreground/60 italic border-dashed border-amber-300 bg-amber-50/50 focus:text-foreground"
+                          : "";
+                        return (
+                          <div key={row.id} className={`rounded-xl p-4 space-y-3 border ${containerHighlight}`}>
+                            <div className="flex items-center justify-between">
+                              <p className="text-sm font-medium">
+                                Room Configuration {type2Rows.length > 1 ? `#${index + 1}` : ""}
+                              </p>
+                              {type2Rows.length > 1 && (
+                                <Button variant="ghost" size="sm" onClick={() => removeType2Row(row.id)}>
+                                  <Trash2 className="h-4 w-4 text-muted-foreground" />
+                                </Button>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                              {(() => {
+                                const { rooms: roomsUsedElsewhere, beds: bedsUsedElsewhere } = summarizeRows(type2Rows, row.id);
+                                const roomsAvailable = Math.max(0, MAX_ROOMS_ALLOWED - roomsUsedElsewhere);
+                                const bedsAvailable = Math.max(0, MAX_BEDS_ALLOWED - bedsUsedElsewhere);
+                                const quantityOptions =
+                                  roomsAvailable > 0
+                                    ? Array.from({ length: roomsAvailable }, (_, idx) => idx + 1)
+                                    : row.quantity > 0
+                                      ? [row.quantity]
+                                      : [1];
+                                const effectiveQuantity = row.quantity || 1;
+                                const rawMaxBeds =
+                                  effectiveQuantity > 0
+                                    ? Math.floor(bedsAvailable / effectiveQuantity)
+                                    : bedsAvailable || MAX_BEDS_PER_ROOM;
+                                const maxBedsOption = Math.max(1, Math.min(MAX_BEDS_PER_ROOM, rawMaxBeds));
+                                const bedOptions = Array.from({ length: maxBedsOption }, (_, idx) => idx + 1);
+                                const bedsPerRoom = getRowBedsPerRoom(row);
+                                const roomsRemaining = Math.max(
+                                  0,
+                                  MAX_ROOMS_ALLOWED - (roomsUsedElsewhere + effectiveQuantity),
+                                );
+                                const bedsRemaining = Math.max(
+                                  0,
+                                  MAX_BEDS_ALLOWED - (bedsUsedElsewhere + effectiveQuantity * bedsPerRoom),
+                                );
+
+                                return (
+                                  <>
+                                    <div>
+                                      <FormLabel className="text-xs uppercase text-muted-foreground">Room Type</FormLabel>
+                                      <Select
+                                        value={row.roomType}
+                                        onValueChange={(value) => updateType2Row(row.id, { roomType: value as RoomTypeOption })}
+                                      >
+                                        <SelectTrigger>
+                                          <SelectValue placeholder="Select type" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          {availableTypeOptions.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                              {option.label}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                    </div>
+                                    <div>
+                                      <FormLabel className="text-xs uppercase text-muted-foreground">Qty (rooms)</FormLabel>
+                                      <Select
+                                        value={String(row.quantity || 1)}
+                                        onValueChange={(value) => updateType2Row(row.id, { quantity: Number(value) })}
+                                      >
+                                        <SelectTrigger>
+                                          <SelectValue placeholder="1" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          {quantityOptions.map((qty) => (
+                                            <SelectItem key={qty} value={String(qty)}>
+                                              {qty}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                      <p className="text-[11px] text-muted-foreground mt-1">
+                                        {roomsRemaining} rooms remaining
+                                      </p>
+                                    </div>
+                                    <div>
+                                      <FormLabel className="text-xs uppercase text-muted-foreground">Beds per room</FormLabel>
+                                      <Select
+                                        value={String(bedsPerRoom)}
+                                        onValueChange={(value) => updateType2Row(row.id, { bedsPerRoom: Number(value) })}
+                                      >
+                                        <SelectTrigger>
+                                          <SelectValue placeholder="Beds" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          {bedOptions.map((bedsOption) => (
+                                            <SelectItem key={bedsOption} value={String(bedsOption)}>
+                                              {bedsOption}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                      <p className="text-[11px] text-muted-foreground mt-1">
+                                        {bedsRemaining} beds remaining
+                                      </p>
+                                    </div>
+                                    <div>
+                                      <FormLabel className="text-xs uppercase text-muted-foreground">Tariff Range</FormLabel>
+                                      {roomCalcMode === "direct" ? (
+                                        <>
+                                          <Input
+                                            type="number"
+                                            min={resolvedCategoryBand.min}
+                                            max={resolvedCategoryBand.max ?? undefined}
+                                            step="100"
+                                            value={directRateValue === "" ? "" : directRateValue}
+                                            className={`${directInputHighlight ?? ""} ${directPlaceholderClasses}`}
+                                            placeholder="e.g. 4500"
+                                            onChange={(event) =>
+                                              updateType2Row(row.id, {
+                                                customRate:
+                                                  event.target.value === "" ? "" : Number(event.target.value),
+                                              })
+                                            }
+                                          />
+                                          <p className="text-[11px] text-muted-foreground mt-1">
+                                            Allowed band: {formatBandLabel(resolvedCategoryBand)}
+                                          </p>
+                                          {directHelperText && (
+                                            <p
+                                              className={`text-[11px] mt-1 ${
+                                                rowHighlightVariant === "error" ? "text-destructive" : "text-amber-600"
+                                              }`}
+                                            >
+                                              {directHelperText}
+                                            </p>
+                                          )}
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Select
+                                            value={row.tariffBucket}
+                                            onValueChange={(value) =>
+                                              updateType2Row(row.id, { tariffBucket: value as TariffBucket })
+                                            }
+                                          >
+                                            <SelectTrigger className={tariffHighlightClass}>
+                                              <SelectValue placeholder="Select tariff" />
+                                            </SelectTrigger>
+                                            <SelectContent>
+                                              {TARIFF_BUCKETS.map((bucket) => (
+                                                <SelectItem key={bucket.value} value={bucket.value}>
+                                                  {bucket.label}
+                                                </SelectItem>
+                                              ))}
+                                            </SelectContent>
+                                          </Select>
+                                          {tariffHelperText && (
+                                            <p
+                                              className={`text-[11px] mt-1 ${
+                                                rowHighlightVariant === "error" ? "text-destructive" : "text-amber-600"
+                                              }`}
+                                            >
+                                              {tariffHelperText}
+                                            </p>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                    <div>
+                                      <FormLabel className="text-xs uppercase text-muted-foreground">Average Area (sq.m.)</FormLabel>
+                                      <Input
+                                        type="number"
+                                        min={0}
+                                        step="0.5"
+                                        value={row.area === "" ? "" : row.area ?? ""}
+                                        placeholder="e.g. 18"
+                                        onChange={(event) =>
+                                          updateType2Row(row.id, {
+                                            area: event.target.value === "" ? "" : Number(event.target.value),
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    )}
+
+                    <div className="flex flex-wrap gap-3">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={addType2Row}
+                        className="w-full md:w-auto"
+                        disabled={type2Rows.length >= ROOM_TYPE_OPTIONS.length}
+                      >
+                        <Plus className="h-4 w-4 mr-2" />
+                        Add another room type
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={resetType2Rows}
+                        className="w-full md:w-auto"
+                      >
+                        Clear all
+                      </Button>
+                    </div>
+
+                    <div className="rounded-lg border p-4 space-y-3">
+                      <div className="flex items-start gap-3">
+                        <Checkbox
+                          checked={syncAttachedBaths}
+                          onCheckedChange={(checked) => {
+                            const nextValue = checked === true;
+                            setSyncAttachedBaths(nextValue);
+                            if (nextValue) {
+                              form.setValue("attachedWashrooms", totalRooms, { shouldDirty: true });
+                            }
+                          }}
+                        />
+                        <div>
+                          <p className="font-medium text-sm">Every room has an attached washroom</p>
+                          <p className="text-xs text-muted-foreground">
+                            Keep this on if all configured rooms include attached washrooms. Turn it off to enter a different count.
+                          </p>
                         </div>
                       </div>
-                    </div>
-                  )}
-
-                  {categoryValidation && categoryValidation.warnings.length > 0 && categoryValidation.isValid && (
-                    <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4" data-testid="alert-category-warnings">
-                      <div className="flex items-start gap-2">
-                        <Lightbulb className="w-5 h-5 text-yellow-600 dark:text-yellow-500 mt-0.5" />
-                        <div className="flex-1">
-                          <p className="font-medium text-sm text-yellow-600 dark:text-yellow-500">Category Recommendations</p>
-                          <ul className="mt-2 space-y-1 text-sm text-yellow-600/90 dark:text-yellow-500/90">
-                            {categoryValidation.warnings.map((warning, idx) => (
-                              <li key={idx}>• {warning}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <FormField
-                      control={form.control}
-                      name="projectType"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Project Type</FormLabel>
-                          <Select onValueChange={field.onChange} value={field.value}>
-                            <FormControl>
-                              <SelectTrigger data-testid="select-project-type">
-                                <SelectValue placeholder="Select type" />
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              <SelectItem value="new_rooms">New Rooms (adding to existing house)</SelectItem>
-                              <SelectItem value="new_project">New Project (constructing new building)</SelectItem>
-                            </SelectContent>
-                          </Select>
-                          <FormMessage />
-                        </FormItem>
+                      {!syncAttachedBaths && (
+                        <FormField
+                          control={form.control}
+                          name="attachedWashrooms"
+                          render={({ field }) => (
+                            <FormItem className="mt-2">
+                              <FormLabel>Total rooms with attached washrooms</FormLabel>
+                              <FormControl>
+                                <Input
+                                  type="number"
+                                  min={0}
+                                  max={Math.max(totalRooms, 0)}
+                                  placeholder="Enter count"
+                                  value={field.value ?? ""}
+                                  onChange={(event) => field.onChange(clampInt(event.target.value))}
+                                />
+                              </FormControl>
+                              <FormDescription>Must be at least equal to the number of rooms to proceed.</FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
                       )}
-                    />
-                  </div>
-
-                  <FormField
-                    control={form.control}
-                    name="propertyArea"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Property Area (sq meters)</FormLabel>
-                        <FormControl>
-                          <Input 
-                            type="number" 
-                            placeholder="Total property area" 
-                            data-testid="input-property-area" 
-                            {...field}
-                            onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <div className="space-y-4 border-t pt-4">
-                    <h4 className="font-medium">Room Configuration</h4>
-                    
-                    {/* Single Bed Rooms Row */}
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                      <FormField
-                        control={form.control}
-                        name="singleBedRooms"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Single Bed Rooms</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="0" 
-                                data-testid="input-single-bed-rooms" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="singleBedBeds"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Beds per Single Room</FormLabel>
-                            <FormControl>
-                              <Input
-                                type="number"
-                                placeholder="1"
-                                min={0}
-                                data-testid="input-single-bed-count"
-                                {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormDescription>Maximum total beds across all room types is {MAX_BEDS_ALLOWED}.</FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="singleBedRoomRate"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Single Room Rate (₹/night)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Rate per night" 
-                                data-testid="input-single-bed-rate" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="singleBedRoomSize"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Single Room Size (sq ft)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Optional" 
-                                data-testid="input-single-bed-room-size" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
                     </div>
 
-                    {/* Double Bed Rooms Row */}
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                      <FormField
-                        control={form.control}
-                        name="doubleBedRooms"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Double Bed Rooms</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="0" 
-                                data-testid="input-double-bed-rooms" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="doubleBedBeds"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Beds per Double Room</FormLabel>
-                            <FormControl>
-                              <Input
-                                type="number"
-                                placeholder="2"
-                                min={0}
-                                data-testid="input-double-bed-count"
-                                {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="doubleBedRoomRate"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Double Room Rate (₹/night)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Rate per night" 
-                                data-testid="input-double-bed-rate" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="doubleBedRoomSize"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Double Room Size (sq ft)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Optional" 
-                                data-testid="input-double-bed-room-size" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+                    <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+                      Add up to three rows—one each for Single, Double, and Suite categories.{" "}
+                      {roomCalcMode === "direct"
+                        ? "Enter the exact nightly rent within the allowed band for the selected category."
+                        : "Select the tariff bucket that matches your published rate."}{" "}
+                      We’ll keep the running totals and highlight any category violations automatically.
                     </div>
 
-                    {/* Family Suites Row */}
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    {(category === "diamond" || category === "gold") && (
                       <FormField
                         control={form.control}
-                        name="familySuites"
+                        name="gstin"
+                        rules={{
+                          validate: (value) => {
+                            const trimmed = sanitizeGstinInput(value ?? "");
+                            if (!trimmed) {
+                              return "GSTIN is required for Diamond and Gold category properties";
+                            }
+                            if (trimmed.length !== 15) {
+                              return "GSTIN must be exactly 15 characters";
+                            }
+                            if (!/^[0-9A-Z]{15}$/.test(trimmed)) {
+                              return "GSTIN can contain only numbers and capital letters";
+                            }
+                            return true;
+                          },
+                        }}
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Family Suites (max 3)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="0" 
-                                data-testid="input-family-suites" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="familySuiteBeds"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Beds per Suite</FormLabel>
+                            <FormLabel>GSTIN (mandatory for Gold/Diamond)</FormLabel>
                             <FormControl>
                               <Input
-                                type="number"
-                                placeholder="4"
-                                min={0}
-                                data-testid="input-family-suite-bed-count"
                                 {...field}
-                                onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
+                                placeholder="15-character GSTIN"
+                                data-testid="input-gstin"
+                                maxLength={15}
+                                value={field.value ?? ""}
+                                onChange={(event) => field.onChange(sanitizeGstinInput(event.target.value))}
                               />
                             </FormControl>
+                            <FormDescription>GST registration is mandatory for Diamond and Gold categories</FormDescription>
                             <FormMessage />
                           </FormItem>
                         )}
                       />
-
-                      <FormField
-                        control={form.control}
-                        name="familySuiteRate"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Family Suite Rate (₹/night)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Rate per night" 
-                                data-testid="input-family-suite-rate" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormField
-                        control={form.control}
-                        name="familySuiteSize"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Suite Size (sq ft)</FormLabel>
-                            <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Optional" 
-                                data-testid="input-family-suite-size" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-
-                    {roomLimitExceeded && (
-                      <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4">
-                        <div className="flex items-start gap-2">
-                          <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-500 mt-0.5" />
-                          <div>
-                            <p className="font-medium text-sm text-red-700 dark:text-red-200">
-                              Room limit exceeded
-                            </p>
-                            <p className="text-sm text-red-700/80 dark:text-red-200/80">
-                              HP Homestay Rules permit a maximum of {MAX_ROOMS_ALLOWED} rooms. Please reduce the number of rooms to continue.
-                            </p>
-                          </div>
-                        </div>
-                      </div>
                     )}
-
-                    {bedLimitExceeded && (
-                      <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4">
-                        <div className="flex items-start gap-2">
-                          <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-500 mt-0.5" />
-                          <div>
-                            <p className="font-medium text-sm text-red-700 dark:text-red-200">
-                              Total bed capacity exceeded
-                            </p>
-                            <p className="text-sm text-red-700/80 dark:text-red-200/80">
-                              You currently have {totalBeds} beds configured. Homestay registrations allow a maximum of {MAX_BEDS_ALLOWED} beds across all room types.
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {bathroomsBelowRooms && (
-                      <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4">
-                        <div className="flex items-start gap-2">
-                          <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-500 mt-0.5" />
-                          <div>
-                            <p className="font-medium text-sm text-red-700 dark:text-red-200">
-                              Attached washrooms below requirement
-                            </p>
-                            <p className="text-sm text-red-700/80 dark:text-red-200/80">
-                              Each room must have an attached washroom. Increase the attached washrooms to at least {totalRooms} to continue.
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    <FormField
-                      control={form.control}
-                      name="attachedWashrooms"
-                      render={({ field }) => (
-                        <FormItem>
-                        <FormLabel>Total Attached Washrooms</FormLabel>
-                        <FormControl>
-                          <Input 
-                            type="number" 
-                            placeholder="Number of washrooms" 
-                            data-testid="input-attached-washrooms" 
-                            {...field}
-                            onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                          />
-                        </FormControl>
-                        <FormDescription>Cannot exceed the total number of rooms configured above.</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  </div>
-
-                  {(category === "diamond" || category === "gold") && (
-                    <FormField
-                      control={form.control}
-                      name="gstin"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>GSTIN {category === "diamond" || category === "gold" ? "(Mandatory)" : "(Optional)"}</FormLabel>
-                          <FormControl>
-                            <Input 
-                              placeholder="15-character GSTIN" 
-                              data-testid="input-gstin" 
-                              {...field} 
-                            />
-                          </FormControl>
-                          <FormDescription>GST registration is mandatory for Diamond and Gold categories</FormDescription>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                  )}
                 </CardContent>
               </Card>
               <Card>
@@ -3027,10 +3872,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             <FormControl>
                               <Input 
                                 type="number" 
-                                placeholder="Distance in km" 
+                                placeholder="Distance in KM" 
                                 data-testid="input-distance-airport" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                                min={0}
+                                step="any"
+                                inputMode="decimal"
+                                pattern="^\\d*(\\.\\d*)?$"
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3047,10 +3896,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             <FormControl>
                               <Input 
                                 type="number" 
-                                placeholder="Distance in km" 
+                                placeholder="Distance in KM" 
                                 data-testid="input-distance-railway" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                                min={0}
+                                step="any"
+                                inputMode="decimal"
+                                pattern="^\\d*(\\.\\d*)?$"
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3067,10 +3920,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             <FormControl>
                               <Input 
                                 type="number" 
-                                placeholder="Distance in km" 
+                                placeholder="Distance in KM" 
                                 data-testid="input-distance-city-center" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                                min={0}
+                                step="any"
+                                inputMode="decimal"
+                                pattern="^\\d*(\\.\\d*)?$"
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3087,10 +3944,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             <FormControl>
                               <Input 
                                 type="number" 
-                                placeholder="Distance in km" 
+                                placeholder="Distance in KM" 
                                 data-testid="input-distance-shopping" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                                min={0}
+                                step="any"
+                                inputMode="decimal"
+                                pattern="^\\d*(\\.\\d*)?$"
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3107,10 +3968,14 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                             <FormControl>
                               <Input 
                                 type="number" 
-                                placeholder="Distance in km" 
+                                placeholder="Distance in KM" 
                                 data-testid="input-distance-bus-stand" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                                min={0}
+                                step="any"
+                                inputMode="decimal"
+                                pattern="^\\d*(\\.\\d*)?$"
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3131,12 +3996,13 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                           <FormItem>
                             <FormLabel>Lobby/Lounge Area (sq ft)</FormLabel>
                             <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Optional" 
-                                data-testid="input-lobby-area" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                              <Input
+                                type="number"
+                                placeholder="Optional"
+                                data-testid="input-lobby-area"
+                                min={0}
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3151,12 +4017,13 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                           <FormItem>
                             <FormLabel>Dining Space (sq ft)</FormLabel>
                             <FormControl>
-                              <Input 
-                                type="number" 
-                                placeholder="Optional" 
-                                data-testid="input-dining-area" 
-                                {...field}
-                                onChange={(e) => field.onChange(parseFloat(e.target.value) || undefined)}
+                              <Input
+                                type="number"
+                                placeholder="Optional"
+                                data-testid="input-dining-area"
+                                min={0}
+                                value={field.value ?? ""}
+                                onChange={(e) => field.onChange(normalizeOptionalFloat(e.target.value))}
                               />
                             </FormControl>
                             <FormMessage />
@@ -3250,39 +4117,45 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                     />
                   </div>
 
-                  {/* Register for Verification */}
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">
-                      Register for Verification <span className="text-destructive">*</span>
-                    </label>
-                    <p className="text-xs text-muted-foreground mb-2">
-                      Guest register or booking register
-                    </p>
-                    <ObjectUploader
-                      label="Upload Register"
-                      maxFiles={1}
-                      fileType="register-verification"
-                      onUploadComplete={(paths) => setUploadedDocuments(prev => ({ ...prev, registerForVerification: paths }))}
-                      existingFiles={uploadedDocuments.registerForVerification}
-                    />
-                  </div>
+                  {requiresCommercialUtilityProof && (
+                    <>
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">
+                          Proof of Commercial Electricity Bill <span className="text-destructive">*</span>
+                        </label>
+                        <p className="text-xs text-muted-foreground mb-2">
+                          Upload the latest electricity bill that shows the commercial tariff for this property
+                        </p>
+                        <ObjectUploader
+                          label="Upload Electricity Bill"
+                          maxFiles={1}
+                          fileType="commercial-electricity-bill"
+                          onUploadComplete={(paths) =>
+                            setUploadedDocuments((prev) => ({ ...prev, commercialElectricityBill: paths }))
+                          }
+                          existingFiles={uploadedDocuments.commercialElectricityBill}
+                        />
+                      </div>
 
-                  {/* Bill Book */}
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">
-                      Bill Book <span className="text-destructive">*</span>
-                    </label>
-                    <p className="text-xs text-muted-foreground mb-2">
-                      Sample billing/invoice book
-                    </p>
-                    <ObjectUploader
-                      label="Upload Bill Book"
-                      maxFiles={1}
-                      fileType="bill-book"
-                      onUploadComplete={(paths) => setUploadedDocuments(prev => ({ ...prev, billBook: paths }))}
-                      existingFiles={uploadedDocuments.billBook}
-                    />
-                  </div>
+                      <div className="space-y-2">
+                        <label className="text-sm font-medium">
+                          Proof of Commercial Water Bill <span className="text-destructive">*</span>
+                        </label>
+                        <p className="text-xs text-muted-foreground mb-2">
+                          Upload the commercial water connection bill for this homestay
+                        </p>
+                        <ObjectUploader
+                          label="Upload Water Bill"
+                          maxFiles={1}
+                          fileType="commercial-water-bill"
+                          onUploadComplete={(paths) =>
+                            setUploadedDocuments((prev) => ({ ...prev, commercialWaterBill: paths }))
+                          }
+                          existingFiles={uploadedDocuments.commercialWaterBill}
+                        />
+                      </div>
+                    </>
+                  )}
 
                   {/* Property Photographs */}
                   <div className="space-y-2">
@@ -3304,19 +4177,39 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                   </div>
 
                   {/* Validation Messages */}
-                  {(uploadedDocuments.revenuePapers.length === 0 || uploadedDocuments.affidavitSection29.length === 0 || uploadedDocuments.undertakingFormC.length === 0 || uploadedDocuments.registerForVerification.length === 0 || uploadedDocuments.billBook.length === 0 || propertyPhotos.length < 2) && (
+                  {(() => {
+                    const missingRevenue = uploadedDocuments.revenuePapers.length === 0;
+                    const missingAffidavit = uploadedDocuments.affidavitSection29.length === 0;
+                    const missingUndertaking = uploadedDocuments.undertakingFormC.length === 0;
+                    const missingElectricity =
+                      requiresCommercialUtilityProof && uploadedDocuments.commercialElectricityBill.length === 0;
+                    const missingWater =
+                      requiresCommercialUtilityProof && uploadedDocuments.commercialWaterBill.length === 0;
+                    const missingPhotos = propertyPhotos.length < 2;
+                    const showWarning =
+                      missingRevenue ||
+                      missingAffidavit ||
+                      missingUndertaking ||
+                      missingElectricity ||
+                      missingWater ||
+                      missingPhotos;
+                    if (!showWarning) {
+                      return null;
+                    }
+                    return (
                     <div className="bg-orange-50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800 rounded-lg p-4 mt-4">
                       <p className="text-sm text-orange-800 dark:text-orange-200 font-medium mb-2">Required documents missing:</p>
                       <ul className="text-sm text-orange-700 dark:text-orange-300 list-disc list-inside space-y-1">
-                        {uploadedDocuments.revenuePapers.length === 0 && <li>Revenue Papers (Jamabandi & Tatima)</li>}
-                        {uploadedDocuments.affidavitSection29.length === 0 && <li>Affidavit under Section 29</li>}
-                        {uploadedDocuments.undertakingFormC.length === 0 && <li>Undertaking in Form-C</li>}
-                        {uploadedDocuments.registerForVerification.length === 0 && <li>Register for Verification</li>}
-                        {uploadedDocuments.billBook.length === 0 && <li>Bill Book</li>}
-                        {propertyPhotos.length < 2 && <li>At least 2 property photos ({propertyPhotos.length}/2)</li>}
+                        {missingRevenue && <li>Revenue Papers (Jamabandi & Tatima)</li>}
+                        {missingAffidavit && <li>Affidavit under Section 29</li>}
+                        {missingUndertaking && <li>Undertaking in Form-C</li>}
+                        {missingElectricity && <li>Proof of commercial electricity bill</li>}
+                        {missingWater && <li>Proof of commercial water bill</li>}
+                        {missingPhotos && <li>At least 2 property photos ({propertyPhotos.length}/2)</li>}
                       </ul>
                     </div>
-                  )}
+                    );
+                  })()}
                 </CardContent>
               </Card>
             )}
@@ -3514,7 +4407,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Location Type</span>
-                        <span className="font-medium text-sm">{LOCATION_TYPE_LABELS[locationType]}</span>
+                        <span className="font-medium text-sm">{LOCATION_LABEL_MAP[locationType] || "—"}</span>
                       </div>
                       <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Certificate Validity</span>
@@ -3566,22 +4459,34 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                           </p>
                         </div>
                       )}
-                      <div className="text-xs text-muted-foreground mt-3 pt-3 border-t">
-                        💡 GST (18%) is already included in the fees
-                      </div>
                     </div>
                   </div>
 
-                  <div className="bg-muted/50 p-4 rounded-lg">
-                    <h4 className="font-medium mb-2">Application Summary</h4>
-                    <div className="space-y-1 text-sm">
-                      <p><span className="text-muted-foreground">Property:</span> {form.watch("propertyName")}</p>
-                      <p><span className="text-muted-foreground">Location:</span> {form.watch("district")}</p>
-                      <p><span className="text-muted-foreground">Owner:</span> {form.watch("ownerName")}</p>
-                      <p><span className="text-muted-foreground">Rooms:</span> {totalRooms}</p>
-                      <p><span className="text-muted-foreground">Amenities:</span> {Object.values(selectedAmenities).filter(Boolean).length} selected</p>
-                    </div>
-                  </div>
+                  <ApplicationSummaryCard
+                    className="bg-muted/50 border-0 shadow-none"
+                    highlightCategoryBadge={false}
+                    application={{
+                      applicationNumber: draftData?.application?.applicationNumber ?? correctionId ?? undefined,
+                      propertyName: form.watch("propertyName") || undefined,
+                      address: form.watch("address") || undefined,
+                      district: form.watch("district") || undefined,
+                      tehsil: form.watch("tehsil") || undefined,
+                      tehsilOther: form.watch("tehsilOther") || undefined,
+                      pincode: form.watch("pincode") || undefined,
+                      ownerName: form.watch("ownerName") || undefined,
+                      ownerMobile: form.watch("ownerMobile") || undefined,
+                      totalRooms,
+                      category: form.watch("category") || undefined,
+                    }}
+                    owner={{
+                      name: form.watch("ownerName"),
+                      mobile: form.watch("ownerMobile"),
+                      email: form.watch("ownerEmail"),
+                    }}
+                    extraRows={[
+                      { label: "Amenities", value: `${selectedAmenitiesCount} selected` },
+                    ]}
+                  />
                   </div>
                 </CardContent>
               </Card>
@@ -3624,6 +4529,27 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                 </Button>
               )}
 
+              {isCorrectionMode && step === totalSteps && (
+                <div className="w-full rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/20">
+                  <div className="flex flex-col gap-2">
+                    <p className="font-semibold">Final Confirmation</p>
+                    <p>
+                      I confirm that every issue highlighted by DA/DTDO has been fully addressed. I understand that my application may be rejected if the corrections remain unsatisfactory.
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="correction-ack"
+                        checked={correctionAcknowledged}
+                        onCheckedChange={(checked) => setCorrectionAcknowledged(Boolean(checked))}
+                      />
+                      <label htmlFor="correction-ack" className="text-sm font-medium cursor-pointer">
+                        I agree and want to resubmit the application
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {step < totalSteps ? (
                 <Button 
                   type="button" 
@@ -3640,7 +4566,7 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
               ) : (
                 <Button 
                   type="submit" 
-                  disabled={submitApplicationMutation.isPending}
+                  disabled={submitApplicationMutation.isPending || (isCorrectionMode && !correctionAcknowledged)}
                   data-testid="button-submit-application"
                   onClick={async () => {
                     console.log("Submit button clicked");
@@ -3735,11 +4661,11 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                     <CardTitle className="text-lg">Distances & Public Areas</CardTitle>
                   </CardHeader>
                   <CardContent className="grid grid-cols-2 gap-4 text-sm">
-                    <div><span className="text-muted-foreground">Airport:</span> <span className="font-medium">{form.watch("distanceAirport") || 0} km</span></div>
-                    <div><span className="text-muted-foreground">Railway Station:</span> <span className="font-medium">{form.watch("distanceRailway") || 0} km</span></div>
-                    <div><span className="text-muted-foreground">City Center:</span> <span className="font-medium">{form.watch("distanceCityCenter") || 0} km</span></div>
-                    <div><span className="text-muted-foreground">Shopping Area:</span> <span className="font-medium">{form.watch("distanceShopping") || 0} km</span></div>
-                    <div><span className="text-muted-foreground">Bus Stand:</span> <span className="font-medium">{form.watch("distanceBusStand") || 0} km</span></div>
+                    <div><span className="text-muted-foreground">Airport:</span> <span className="font-medium">{formatDistanceDisplay(form.watch("distanceAirport"))}</span></div>
+                    <div><span className="text-muted-foreground">Railway Station:</span> <span className="font-medium">{formatDistanceDisplay(form.watch("distanceRailway"))}</span></div>
+                    <div><span className="text-muted-foreground">City Center:</span> <span className="font-medium">{formatDistanceDisplay(form.watch("distanceCityCenter"))}</span></div>
+                    <div><span className="text-muted-foreground">Shopping Area:</span> <span className="font-medium">{formatDistanceDisplay(form.watch("distanceShopping"))}</span></div>
+                    <div><span className="text-muted-foreground">Bus Stand:</span> <span className="font-medium">{formatDistanceDisplay(form.watch("distanceBusStand"))}</span></div>
                     <div><span className="text-muted-foreground">Lobby Area:</span> <span className="font-medium">{form.watch("lobbyArea") || "—"} sq ft</span></div>
                     <div><span className="text-muted-foreground">Dining Area:</span> <span className="font-medium">{form.watch("diningArea") || "—"} sq ft</span></div>
                     <div className="col-span-2"><span className="text-muted-foreground">Parking:</span> <span className="font-medium">{form.watch("parkingArea") || "—"}</span></div>
@@ -3755,8 +4681,12 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                     <div><span className="text-muted-foreground">Revenue Papers:</span> <span className="font-medium">{uploadedDocuments.revenuePapers.length} file(s)</span></div>
                     <div><span className="text-muted-foreground">Affidavit Section 29:</span> <span className="font-medium">{uploadedDocuments.affidavitSection29.length} file(s)</span></div>
                     <div><span className="text-muted-foreground">Undertaking Form-C:</span> <span className="font-medium">{uploadedDocuments.undertakingFormC.length} file(s)</span></div>
-                    <div><span className="text-muted-foreground">Register for Verification:</span> <span className="font-medium">{uploadedDocuments.registerForVerification.length} file(s)</span></div>
-                    <div><span className="text-muted-foreground">Bill Book:</span> <span className="font-medium">{uploadedDocuments.billBook.length} file(s)</span></div>
+                    {requiresCommercialUtilityProof && (
+                      <>
+                        <div><span className="text-muted-foreground">Commercial Electricity Bill:</span> <span className="font-medium">{uploadedDocuments.commercialElectricityBill.length} file(s)</span></div>
+                        <div><span className="text-muted-foreground">Commercial Water Bill:</span> <span className="font-medium">{uploadedDocuments.commercialWaterBill.length} file(s)</span></div>
+                      </>
+                    )}
                     <div><span className="text-muted-foreground">Property Photos:</span> <span className="font-medium">{propertyPhotos.length} file(s)</span></div>
                   </CardContent>
                 </Card>
@@ -3779,18 +4709,13 @@ const { data: correctionData } = useQuery<{ application: HomestayApplication }>(
                       </div>
                     </div>
                     <div className="pt-4 border-t space-y-2">
-                      <div className="flex justify-between text-sm">
-                        <span className="text-muted-foreground">Base Fee:</span>
-                        <span className="font-medium">₹{calculateFee().baseFee.toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between text-sm">
-                        <span className="text-muted-foreground">GST (18%):</span>
-                        <span className="font-medium">₹{calculateFee().gstAmount.toFixed(2)}</span>
-                      </div>
-                      <div className="flex justify-between text-lg font-bold border-t pt-2">
-                        <span>Total Fee:</span>
+                      <div className="flex justify-between text-lg font-bold">
+                        <span>Total Registration Fee</span>
                         <span className="text-primary">₹{calculateFee().totalFee.toFixed(2)}</span>
                       </div>
+                      <p className="text-xs text-muted-foreground">
+                        Single consolidated amount as per HP Tourism Policy 2025 (no per-room or GST add-ons).
+                      </p>
                     </div>
                   </CardContent>
                 </Card>

@@ -27,6 +27,7 @@ import AdminLGDImport from "@/pages/admin/lgd-import";
 import SuperAdminConsole from "@/pages/admin/super-admin-console";
 import SuperAdminDashboard from "@/pages/admin/super-admin-dashboard";
 import DADashboard from "@/pages/da/dashboard";
+import DALegacyDashboard from "@/pages/da/legacy-dashboard";
 import DAApplicationDetail from "@/pages/da/application-detail";
 import DAInspections from "@/pages/da/inspections";
 import DAInspectionReport from "@/pages/da/inspection-report";
@@ -39,6 +40,7 @@ import DTDOProfile from "@/pages/dtdo/profile";
 import OfficerApplicationSearch from "@/pages/officer-application-search";
 import TestAPI from "@/pages/test-api";
 import HimKoshTest from "@/pages/himkosh-test";
+import ExistingOwnerOnboarding from "@/pages/existing-owner-onboarding";
 import type { User } from "@shared/schema";
 
 interface ProtectedRouteProps {
@@ -103,6 +105,9 @@ function Router() {
       <Route path="/profile">
         {() => <ProtectedRoute component={ProfilePage} allowedRoles={['property_owner']} />}
       </Route>
+      <Route path="/existing-owner">
+        {() => <ProtectedRoute component={ExistingOwnerOnboarding} allowedRoles={['property_owner']} />}
+      </Route>
       <Route path="/applications/new">
         {() => <ProtectedRoute component={NewApplication} allowedRoles={['property_owner']} />}
       </Route>
@@ -146,6 +151,9 @@ function Router() {
       {/* Dealing Assistant Routes */}
       <Route path="/da/dashboard">
         {() => <ProtectedRoute component={DADashboard} allowedRoles={['dealing_assistant']} />}
+      </Route>
+      <Route path="/da/legacy">
+        {() => <ProtectedRoute component={DALegacyDashboard} allowedRoles={['dealing_assistant']} />}
       </Route>
       <Route path="/da/profile">
         {() => <ProtectedRoute component={DAProfile} allowedRoles={['dealing_assistant']} />}

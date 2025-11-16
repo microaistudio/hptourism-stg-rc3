@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ChangeEvent } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
@@ -16,15 +16,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import {
   AlertTriangle,
   Database,
@@ -36,10 +30,16 @@ import {
   Zap,
   HardDrive,
   ShieldAlert,
+  ShieldCheck,
   TestTube,
   Download,
   Loader2,
+  PlayCircle,
+  Terminal,
+  UploadCloud,
 } from "lucide-react";
+import { CommunicationsCard } from "@/components/admin/communications-card";
+import { NotificationRulesCard } from "@/components/admin/notification-rules-card";
 
 interface SystemStats {
   database: {
@@ -80,6 +80,86 @@ interface ResetDialogState {
   reason: string;
 }
 
+interface SmokeTestLog {
+  runId: string | null;
+  path: string | null;
+  content: string;
+}
+
+interface SmokeTestStatus {
+  running: boolean;
+  runId: string | null;
+  startedAt: string | null;
+  exitCode: number | null;
+  lastRunId: string | null;
+  lastFinishedAt: string | null;
+  lastExitCode: number | null;
+  logPath: string | null;
+  lastLogPath: string | null;
+  log: SmokeTestLog;
+  reportPath: string | null;
+}
+
+interface SmokeRunResponse {
+  message: string;
+  runId: string;
+  logPath: string | null;
+  startedAt: string;
+}
+
+type StaffRowStatus = "created" | "updated" | "skipped" | "would_create" | "would_update";
+
+interface StaffAccountRowResult {
+  status: StaffRowStatus;
+  username: string;
+  mobile: string;
+  defaultPassword?: string;
+  reason?: string;
+}
+
+interface StaffImportDetail {
+  district: string;
+  ddoCode: string;
+  rowNumber: number;
+  da?: StaffAccountRowResult;
+  dtdo?: StaffAccountRowResult;
+}
+
+interface StaffImportSummary {
+  districts: number;
+  accountsAttempted: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  wouldCreate: number;
+  wouldUpdate: number;
+}
+
+interface StaffImportResponse {
+  message: string;
+  dryRun: boolean;
+  summary: StaffImportSummary;
+  errors: string[];
+  details: StaffImportDetail[];
+  passwordFormat: string;
+}
+
+const STAFF_STATUS_LABELS: Record<StaffRowStatus, string> = {
+  created: "Created",
+  updated: "Updated",
+  skipped: "Skipped",
+  would_create: "Would create",
+  would_update: "Would update",
+};
+
+const STAFF_STATUS_CLASSES: Record<StaffRowStatus, string> = {
+  created: "bg-emerald-100 text-emerald-800 border-emerald-200",
+  updated: "bg-sky-100 text-sky-800 border-sky-200",
+  skipped: "bg-red-100 text-red-800 border-red-200",
+  would_create: "bg-slate-100 text-slate-700 border-slate-300",
+  would_update: "bg-amber-100 text-amber-800 border-amber-200",
+};
+
 export default function SuperAdminConsole() {
   const { toast } = useToast();
   const [resetDialog, setResetDialog] = useState<ResetDialogState>({
@@ -89,7 +169,10 @@ export default function SuperAdminConsole() {
     reason: "",
   });
   const [seedCount, setSeedCount] = useState(10);
-  const [seedScenario, setSeedScenario] = useState("pending_da_review");
+  const [staffCsvName, setStaffCsvName] = useState("");
+  const [staffCsvText, setStaffCsvText] = useState("");
+  const [staffDryRun, setStaffDryRun] = useState(true);
+  const [staffImportResult, setStaffImportResult] = useState<StaffImportResponse | null>(null);
 
   // Fetch system statistics
   const { data: stats, isLoading: statsLoading, refetch: refetchStats } = useQuery<SystemStats>({
@@ -102,6 +185,43 @@ export default function SuperAdminConsole() {
     isDefault: boolean;
   }>({
     queryKey: ["/api/admin/settings/payment/test-mode"],
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/admin/settings/payment/test-mode");
+      return response.json();
+    },
+  });
+
+  const { data: captchaData, isLoading: captchaLoading, refetch: refetchCaptcha } = useQuery<{
+    enabled: boolean;
+  }>({
+    queryKey: ["/api/admin/settings/auth/captcha"],
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/admin/settings/auth/captcha");
+      return response.json();
+    },
+  });
+
+  // Fetch ClamAV scanning status
+  const {
+    data: clamavStatus,
+    isLoading: clamavLoading,
+    refetch: refetchClamav,
+  } = useQuery<{
+    enabled: boolean;
+    source: "env" | "db";
+    defaultEnabled: boolean;
+  }>({
+    queryKey: ["/api/admin/settings/security/clamav"],
+  });
+
+  const {
+    data: smokeStatus,
+    isLoading: smokeStatusLoading,
+    refetch: refetchSmokeStatus,
+  } = useQuery<SmokeTestStatus>({
+    queryKey: ["/api/admin/smoke-test/status"],
+    refetchInterval: (query) =>
+      query.state.data?.running ? 4000 : false,
   });
 
   // Reset mutation
@@ -136,12 +256,11 @@ export default function SuperAdminConsole() {
 
   // Seed data mutation
   const seedMutation = useMutation({
-    mutationFn: async ({ type, count, scenario }: {
-      type: "applications" | "users" | "scenario";
+    mutationFn: async ({ type, count }: {
+      type: "applications" | "users";
       count?: number;
-      scenario?: string;
     }) => {
-      const response = await apiRequest("POST", `/api/admin/seed/${type}`, { count, scenario });
+      const response = await apiRequest("POST", `/api/admin/seed/${type}`, { count });
       return response.json() as Promise<{ success: boolean; message: string }>;
     },
     onSuccess: (data) => {
@@ -184,6 +303,107 @@ export default function SuperAdminConsole() {
     },
   });
 
+  const toggleCaptchaMutation = useMutation({
+    mutationFn: async (enabled: boolean) => {
+      await apiRequest("POST", "/api/admin/settings/auth/captcha/toggle", { enabled });
+      return enabled;
+    },
+    onSuccess: (_data, enabled) => {
+      toast({
+        title: enabled ? "Captcha enabled" : "Captcha disabled",
+        description: enabled
+          ? "Users must solve a math captcha before logging in."
+          : "Captcha has been disabled for this environment (useful during demos).",
+      });
+      refetchCaptcha();
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Failed to update captcha setting",
+        description: error.message || "An error occurred",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const toggleClamavMutation = useMutation({
+    mutationFn: async (enabled: boolean) => {
+      await apiRequest("POST", "/api/admin/settings/security/clamav/toggle", { enabled });
+      return enabled;
+    },
+    onSuccess: (_data, enabled) => {
+      toast({
+        title: enabled ? "Antivirus scanning enabled" : "Antivirus scanning disabled",
+        description: enabled
+          ? "All uploaded documents (including S3/MinIO storage) will be scanned by ClamAV."
+          : "Uploads will skip antivirus scanning until you re-enable it.",
+      });
+      refetchClamav();
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Failed to update antivirus setting",
+        description: error.message || "An error occurred",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const smokeTestMutation = useMutation({
+    mutationFn: async () => {
+      const response = await apiRequest("POST", "/api/admin/smoke-test/run");
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.message || "Failed to start smoke test");
+      }
+      return payload as SmokeRunResponse;
+    },
+    onSuccess: (data) => {
+      toast({
+        title: "Smoke test started",
+        description: `Run ${data.runId} is running in the background.`,
+      });
+      refetchSmokeStatus();
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Smoke test did not start",
+        description: error?.message || "Please review the server logs.",
+        variant: "destructive",
+      });
+      refetchSmokeStatus();
+    },
+  });
+
+  const staffImportMutation = useMutation({
+    mutationFn: async ({ csvText, dryRun }: { csvText: string; dryRun: boolean }) => {
+      const response = await apiRequest("POST", "/api/admin/district-staff/import", {
+        csv: csvText,
+        dryRun,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.message || "Failed to process district staff manifest");
+      }
+      return payload as StaffImportResponse;
+    },
+    onSuccess: (data) => {
+      setStaffImportResult(data);
+      toast({
+        title: data.dryRun ? "Dry-run completed" : "District staff updated",
+        description: data.message,
+      });
+      refetchStats();
+    },
+    onError: (error: any) => {
+      toast({
+        title: "District staff import failed",
+        description: error?.message || "Unable to process the CSV manifest",
+        variant: "destructive",
+      });
+    },
+  });
+
   const handleResetClick = (operation: ResetOperation) => {
     setResetDialog({ open: true, operation, confirmationText: "", reason: "" });
   };
@@ -216,6 +436,72 @@ export default function SuperAdminConsole() {
       confirmationText: resetDialog.confirmationText,
       reason: resetDialog.reason,
     });
+  };
+
+  const handleStaffCsvChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    if (!file) {
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (loadEvent) => {
+      const text = typeof loadEvent.target?.result === "string" ? loadEvent.target.result : "";
+      setStaffCsvText(text);
+      setStaffCsvName(file.name);
+      setStaffImportResult(null);
+      input.value = "";
+    };
+    reader.onerror = () => {
+      toast({
+        title: "Failed to read file",
+        description: "Please try again with a valid CSV file.",
+        variant: "destructive",
+      });
+    };
+    reader.readAsText(file);
+  };
+
+  const handleRunStaffImport = () => {
+    if (!staffCsvText.trim()) {
+      toast({
+        title: "CSV required",
+        description: "Upload the district staff CSV manifest before running the seeder.",
+        variant: "destructive",
+      });
+      return;
+    }
+    staffImportMutation.mutate({ csvText: staffCsvText, dryRun: staffDryRun });
+  };
+
+  const renderStaffStatusBadge = (status: StaffRowStatus) => (
+    <Badge
+      className={`text-[11px] font-semibold ${STAFF_STATUS_CLASSES[status]}`}
+      variant="outline"
+    >
+      {STAFF_STATUS_LABELS[status]}
+    </Badge>
+  );
+
+  const renderStaffAccountCell = (account?: StaffAccountRowResult) => {
+    if (!account) {
+      return <span className="text-xs text-muted-foreground">—</span>;
+    }
+    return (
+      <div className="space-y-1">
+        {renderStaffStatusBadge(account.status)}
+        <p className="font-mono text-xs break-all">
+          {account.username || "—"} · {account.mobile || "—"}
+        </p>
+        {account.reason ? (
+          <p className="text-xs text-destructive">{account.reason}</p>
+        ) : account.defaultPassword ? (
+          <p className="text-xs text-muted-foreground">
+            Default PW: <code>{account.defaultPassword}</code>
+          </p>
+        ) : null}
+      </div>
+    );
   };
 
   const resetOperations: Array<{
@@ -361,6 +647,51 @@ export default function SuperAdminConsole() {
     ? `${(stats.environment || '').toUpperCase()} (OVERRIDE)`
     : stats?.environment?.toUpperCase();
 
+  const formatTimestamp = (value?: string | null) => {
+    if (!value) return "—";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return value;
+    }
+    return parsed.toLocaleString();
+  };
+
+  const smokeBadgeVariant = smokeStatus?.running
+    ? "default"
+    : smokeStatus?.lastExitCode === 0 || !smokeStatus?.lastRunId
+      ? "outline"
+      : "destructive";
+
+  const smokeStatusLabel = smokeStatus?.running
+    ? "Running"
+    : smokeStatus?.lastExitCode === 0
+      ? "Idle · Last run passed"
+      : smokeStatus?.lastRunId
+        ? "Idle · Last run failed"
+        : "Idle";
+
+  const smokeLogValue = smokeStatusLoading
+    ? "Loading smoke-test log..."
+    : smokeStatus?.log?.content?.length
+      ? smokeStatus.log.content
+      : "No smoke-test output yet. Trigger the harness to capture a run.";
+
+  const lastRunSummary = smokeStatus?.lastRunId
+    ? `${smokeStatus.lastExitCode === 0 ? "Passed" : `Failed (exit ${smokeStatus.lastExitCode ?? "?"})`} • ${formatTimestamp(smokeStatus.lastFinishedAt)}`
+    : "No completed run yet";
+
+  const smokeButtonDisabled = Boolean(smokeStatus?.running || smokeTestMutation.isPending || smokeStatusLoading);
+  const staffCsvRowCount = staffCsvText
+    ? Math.max(
+        staffCsvText
+          .split(/\r?\n/)
+          .filter((line) => line.trim().length > 0)
+          .length - 1,
+        0,
+      )
+    : 0;
+  const canRunStaffImport = Boolean(staffCsvText.trim()) && !staffImportMutation.isPending;
+
   return (
     <div className="container mx-auto p-6 max-w-7xl">
       {/* Header */}
@@ -472,6 +803,60 @@ export default function SuperAdminConsole() {
           </CardContent>
         </Card>
 
+        {/* Captcha Settings */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-primary" />
+              <CardTitle>Login Captcha</CardTitle>
+            </div>
+            <CardDescription>
+              Toggle the captcha challenge on the public login page
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between p-4 border rounded-lg">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold">Captcha Requirement</h3>
+                  {!captchaData?.enabled && (
+                    <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+                      Testing
+                    </Badge>
+                  )}
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  {captchaData?.enabled
+                    ? "Owners and officers must solve a quick math question before logging in."
+                    : "Captcha has been disabled for this environment (useful for demos or automation)."}
+                </p>
+                {!captchaData?.enabled && (
+                  <p className="text-xs text-muted-foreground">
+                    Remember to re-enable captcha before going live.
+                  </p>
+                )}
+              </div>
+              <Button
+                variant={captchaData?.enabled ? "destructive" : "default"}
+                onClick={() => toggleCaptchaMutation.mutate(!captchaData?.enabled)}
+                disabled={captchaLoading || toggleCaptchaMutation.isPending}
+                data-testid="button-toggle-captcha"
+              >
+                {toggleCaptchaMutation.isPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Updating...
+                  </>
+                ) : (
+                  <>
+                    {captchaData?.enabled ? "Disable" : "Enable"}
+                  </>
+                )}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
         {/* Reset Operations */}
         <Card className="lg:col-span-2">
           <CardHeader>
@@ -562,8 +947,331 @@ export default function SuperAdminConsole() {
           </CardContent>
         </Card>
 
-        {/* Test Data Generation */}
+        <CommunicationsCard />
+        <NotificationRulesCard />
+
+        {/* Security Settings */}
         <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-primary" />
+              <CardTitle>Security Settings</CardTitle>
+            </div>
+            <CardDescription>Control ClamAV antivirus scanning for uploaded documents</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between p-4 border rounded-lg">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <h3 className="font-semibold">ClamAV Upload Scanning</h3>
+                  {clamavStatus?.enabled ? (
+                    <Badge variant="outline" className="bg-emerald-50 text-emerald-700 border-emerald-300">
+                      Active
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="bg-slate-100 text-slate-700 border-slate-300">
+                      Disabled
+                    </Badge>
+                  )}
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  {clamavStatus?.enabled
+                    ? "All uploaded documents (local or S3/MinIO) are scanned before they enter the workflow."
+                    : "Uploads bypass antivirus scanning. Enable this before accepting production documents."}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Source:{" "}
+                  {clamavStatus?.source === "db"
+                    ? "Admin console override"
+                    : "Environment default (.env)"}
+                </p>
+              </div>
+              <Button
+                variant={clamavStatus?.enabled ? "destructive" : "default"}
+                onClick={() => toggleClamavMutation.mutate(!clamavStatus?.enabled)}
+                disabled={clamavLoading || toggleClamavMutation.isPending || !clamavStatus}
+                data-testid="button-toggle-clamav"
+              >
+                {toggleClamavMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Updating...
+                  </>
+                ) : (
+                  <>{clamavStatus?.enabled ? "Disable" : "Enable"}</>
+                )}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Note: Scanning adds a small read + scan step per document (typically a few hundred ms for PDFs) and
+              does not impact the payment or submission pipeline.
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* District Staff Seeder */}
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <UploadCloud className="w-5 h-5 text-primary" />
+              <CardTitle>District Staff Accounts</CardTitle>
+            </div>
+            <CardDescription>
+              Upload the CSV manifest to create or refresh the 15 DA/DTDO account pairs per district.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+              <div>
+                <Label htmlFor="district-staff-csv">Select CSV manifest</Label>
+                <Input
+                  id="district-staff-csv"
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={handleStaffCsvChange}
+                  disabled={staffImportMutation.isPending}
+                  className="mt-1"
+                  data-testid="input-district-staff-csv"
+                />
+                <p className="text-xs text-muted-foreground mt-2">
+                  Template lives on this VM under <code>seed_data/district-staff-accounts.csv</code>.
+                </p>
+                {staffCsvName && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Loaded <strong>{staffCsvName}</strong>
+                    {staffCsvRowCount > 0 ? ` · ${staffCsvRowCount} district rows` : ""}
+                  </p>
+                )}
+              </div>
+              <div className="p-3 border rounded-lg space-y-2">
+                <Label htmlFor="district-staff-dry-run" className="text-xs text-muted-foreground">
+                  Import mode
+                </Label>
+                <div className="flex items-center gap-3">
+                  <Switch
+                    id="district-staff-dry-run"
+                    checked={staffDryRun}
+                    onCheckedChange={(checked) => setStaffDryRun(checked)}
+                    disabled={staffImportMutation.isPending}
+                  />
+                  <div>
+                    <p className="text-sm font-medium">
+                      {staffDryRun ? "Dry-run (no DB writes)" : "Apply to database"}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {staffDryRun
+                        ? "Validates the CSV and shows what would change."
+                        : "Creates/updates DA & DTDO users immediately."}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={handleRunStaffImport}
+                disabled={!canRunStaffImport}
+                data-testid="button-import-district-staff"
+              >
+                {staffImportMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <UploadCloud className="w-4 h-4 mr-2" />
+                    {staffDryRun ? "Preview Manifest" : "Import Accounts"}
+                  </>
+                )}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setStaffImportResult(null)}
+                disabled={!staffImportResult || staffImportMutation.isPending}
+              >
+                Clear result
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Password format: <code>da</code>/<code>dtdo</code> + first 3 letters of the district + <code>@2025</code>.
+              Share the CSV with IT so they can rotate passwords after onboarding.
+            </p>
+            {staffImportResult && (
+              <div className="space-y-4 border rounded-lg p-4">
+                <div className="space-y-1">
+                  <p className="font-semibold text-sm">{staffImportResult.message}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Mode: {staffImportResult.dryRun ? "Dry-run" : "Applied"} · Password schema:{" "}
+                    <code>{staffImportResult.passwordFormat}</code>
+                  </p>
+                </div>
+                <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6 text-sm">
+                  <div className="p-3 bg-muted rounded">
+                    <p className="text-xs text-muted-foreground">District rows</p>
+                    <p className="text-lg font-semibold">{staffImportResult.summary.districts}</p>
+                  </div>
+                  <div className="p-3 bg-muted rounded">
+                    <p className="text-xs text-muted-foreground">Accounts touched</p>
+                    <p className="text-lg font-semibold">{staffImportResult.summary.accountsAttempted}</p>
+                  </div>
+                  <div className="p-3 bg-muted rounded">
+                    <p className="text-xs text-muted-foreground">{staffImportResult.dryRun ? "Would create" : "Created"}</p>
+                    <p className="text-lg font-semibold">
+                      {staffImportResult.dryRun
+                        ? staffImportResult.summary.wouldCreate
+                        : staffImportResult.summary.created}
+                    </p>
+                  </div>
+                  <div className="p-3 bg-muted rounded">
+                    <p className="text-xs text-muted-foreground">{staffImportResult.dryRun ? "Would update" : "Updated"}</p>
+                    <p className="text-lg font-semibold">
+                      {staffImportResult.dryRun
+                        ? staffImportResult.summary.wouldUpdate
+                        : staffImportResult.summary.updated}
+                    </p>
+                  </div>
+                  <div className="p-3 bg-muted rounded">
+                    <p className="text-xs text-muted-foreground">Skipped</p>
+                    <p className="text-lg font-semibold">{staffImportResult.summary.skipped}</p>
+                  </div>
+                </div>
+                {staffImportResult.errors?.length > 0 && (
+                  <div className="bg-destructive/10 text-destructive text-xs p-3 rounded space-y-1">
+                    <p className="font-semibold">Parse warnings</p>
+                    <ul className="list-disc ml-4 space-y-0.5">
+                      {staffImportResult.errors.map((error) => (
+                        <li key={error}>{error}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div className="overflow-auto border rounded">
+                  <table className="min-w-[640px] w-full text-sm">
+                    <thead className="bg-muted/50">
+                      <tr>
+                        <th className="text-left text-xs font-semibold uppercase tracking-wide p-2">District / DDO</th>
+                        <th className="text-left text-xs font-semibold uppercase tracking-wide p-2">Dealing Assistant</th>
+                        <th className="text-left text-xs font-semibold uppercase tracking-wide p-2">DTDO</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {staffImportResult.details.map((detail) => (
+                        <tr key={`${detail.rowNumber}-${detail.ddoCode}`} className="border-t">
+                          <td className="p-2 align-top">
+                            <p className="font-medium">{detail.district}</p>
+                            <p className="text-xs text-muted-foreground">DDO: {detail.ddoCode}</p>
+                          </td>
+                          <td className="p-2 align-top">{renderStaffAccountCell(detail.da)}</td>
+                          <td className="p-2 align-top">{renderStaffAccountCell(detail.dtdo)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Smoke Test Harness */}
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <PlayCircle className="w-5 h-5 text-primary" />
+              <CardTitle>Smoke Test Harness</CardTitle>
+            </div>
+            <CardDescription>
+              Trigger the CLI smoke script on this VM and watch the live log from the console.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p className="text-sm text-muted-foreground">Current status</p>
+                <div className="flex flex-wrap items-center gap-3">
+                  <Badge variant={smokeBadgeVariant}>{smokeStatusLabel}</Badge>
+                  <span className="text-sm text-muted-foreground">
+                    {smokeStatus?.running
+                      ? `Started ${formatTimestamp(smokeStatus?.startedAt)}`
+                      : smokeStatus?.lastFinishedAt
+                        ? `Last run finished ${formatTimestamp(smokeStatus?.lastFinishedAt)}`
+                        : "No runs triggered yet"}
+                  </span>
+                </div>
+              </div>
+              <Button
+                onClick={() => smokeTestMutation.mutate()}
+                disabled={smokeButtonDisabled}
+                data-testid="button-run-smoke-test"
+              >
+                {smokeStatus?.running ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Running...
+                  </>
+                ) : smokeTestMutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    Starting...
+                  </>
+                ) : (
+                  <>
+                    <PlayCircle className="w-4 h-4 mr-2" />
+                    Run Smoke Test
+                  </>
+                )}
+              </Button>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="p-3 border rounded-lg">
+                <p className="text-xs text-muted-foreground">Active run ID</p>
+                <p className="font-mono text-sm break-all">
+                  {smokeStatus?.runId || "—"}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Log file:{" "}
+                  {smokeStatus?.log?.path ? <code>{smokeStatus.log.path}</code> : "—"}
+                </p>
+              </div>
+              <div className="p-3 border rounded-lg">
+                <p className="text-xs text-muted-foreground">Last run</p>
+                <p className="text-sm font-semibold">{lastRunSummary}</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {smokeStatus?.lastRunId ? `Run ID ${smokeStatus.lastRunId}` : "No historical data"}
+                </p>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Terminal className="w-4 h-4 text-muted-foreground" />
+                <Label className="text-sm font-medium">Live log</Label>
+              </div>
+              <Textarea
+                readOnly
+                spellCheck={false}
+                className="font-mono text-xs min-h-[220px]"
+                value={smokeLogValue}
+              />
+              <p className="text-xs text-muted-foreground">
+                Output mirrors <code>docs/smoke-reports/&lt;runId&gt;.log</code>. Full reports live under{" "}
+                <code>docs/smoke-reports/&lt;runId&gt;/report.json</code> on this VM.
+              </p>
+              {smokeStatus?.reportPath && (
+                <p className="text-xs text-muted-foreground">
+                  Latest report: <code>{smokeStatus.reportPath}</code>
+                </p>
+              )}
+            </div>
+              <p className="text-xs text-muted-foreground">
+                The harness reuses <code>scripts/run-smoke.sh</code> with the configured <code>SMOKE_* credentials</code>,
+                and each run now wipes the previous smoke applications/files for that owner so you always start from a clean slate.
+              </p>
+          </CardContent>
+        </Card>
+
+        {/* Test Data Generation */}
+        <Card className="lg:col-span-2">
           <CardHeader>
             <div className="flex items-center gap-2">
               <TestTube className="w-5 h-5 text-primary" />
@@ -614,62 +1322,6 @@ export default function SuperAdminConsole() {
                 Generate Test Users (All Roles)
               </Button>
             </div>
-          </CardContent>
-        </Card>
-
-        {/* Load Scenarios */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Zap className="w-5 h-5 text-primary" />
-              <CardTitle>Load Scenario</CardTitle>
-            </div>
-            <CardDescription>Quick setups for testing specific workflows</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <Label htmlFor="scenario">Select Scenario</Label>
-              <Select value={seedScenario} onValueChange={setSeedScenario}>
-                <SelectTrigger className="mt-1" data-testid="select-scenario">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="pending_da_review">
-                    Pending DA Review (10 apps)
-                  </SelectItem>
-                  <SelectItem value="inspection_backlog">
-                    Inspection Backlog (15 apps)
-                  </SelectItem>
-                  <SelectItem value="payment_pending">
-                    Payment Pending (8 apps)
-                  </SelectItem>
-                  <SelectItem value="objections_raised">
-                    Objections Raised (5 apps)
-                  </SelectItem>
-                  <SelectItem value="complete_workflow">
-                    Complete Workflow (20 apps, mixed)
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <Button
-              onClick={() => seedMutation.mutate({ type: "scenario", scenario: seedScenario })}
-              disabled={seedMutation.isPending}
-              className="w-full"
-              data-testid="button-load-scenario"
-            >
-              {seedMutation.isPending ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Loading...
-                </>
-              ) : (
-                <>
-                  <Download className="w-4 h-4 mr-2" />
-                  Load Scenario
-                </>
-              )}
-            </Button>
           </CardContent>
         </Card>
       </div>

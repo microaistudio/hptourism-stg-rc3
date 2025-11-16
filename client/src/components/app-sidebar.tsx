@@ -1,4 +1,5 @@
 import { useLocation } from "wouter";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Sidebar,
@@ -25,6 +26,31 @@ export function AppSidebar() {
 
   const user = userData?.user;
   const navigation = getNavigationForRole(user?.role || 'property_owner');
+  const { data: daInspections } = useQuery<{ reportSubmitted: boolean }[]>({
+    queryKey: ["/api/da/inspections"],
+    enabled: user?.role === "dealing_assistant",
+  });
+  const pendingInspectionCount =
+    user?.role === "dealing_assistant"
+      ? (daInspections ?? []).filter((order) => !order.reportSubmitted).length
+      : 0;
+  const navigationSections = useMemo(() => {
+    if (user?.role !== "dealing_assistant" || pendingInspectionCount === 0) {
+      return navigation;
+    }
+    return navigation.map((section) => ({
+      ...section,
+      items: section.items.map((item) => {
+        if (item.url === "/da/inspections") {
+          return {
+            ...item,
+            badge: pendingInspectionCount > 99 ? "99+" : String(pendingInspectionCount),
+          };
+        }
+        return item;
+      }),
+    }));
+  }, [navigation, pendingInspectionCount, user?.role]);
 
   const getUserInitials = (name: string) => {
     return name
@@ -64,7 +90,7 @@ export function AppSidebar() {
       </SidebarHeader>
 
       <SidebarContent>
-        {navigation.map((section) => (
+        {navigationSections.map((section) => (
           <SidebarGroup key={section.title}>
             <SidebarGroupLabel>{section.title}</SidebarGroupLabel>
             <SidebarGroupContent>

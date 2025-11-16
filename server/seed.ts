@@ -14,35 +14,37 @@ async function seed() {
 
   try {
     // Check if admin user already exists
+    const adminMobile = '9999999999';
+    const adminPassword = 'admin123';
+    const hashedAdminPassword = await bcrypt.hash(adminPassword, 10);
+
     const existingAdmin = await db.select()
       .from(users)
-      .where(eq(users.mobile, '9999999999'))
+      .where(eq(users.mobile, adminMobile))
       .limit(1);
 
     if (existingAdmin.length > 0) {
-      console.log('✅ Admin user already exists (mobile: 9999999999)');
+      console.log(`✅ Admin user already exists (mobile: ${adminMobile})`);
       
-      // Update to ensure role is admin
+      // Update to ensure role, status, and password are correct
       await db.update(users)
-        .set({ role: 'admin', isActive: true })
-        .where(eq(users.mobile, '9999999999'));
+        .set({ role: 'admin', isActive: true, password: hashedAdminPassword })
+        .where(eq(users.mobile, adminMobile));
       
-      console.log('✅ Admin role verified and updated');
+      console.log('✅ Admin credentials verified/updated');
     } else {
       // Create default admin user
-      const hashedPassword = await bcrypt.hash('admin123', 10);
-      
       await db.insert(users).values({
-        mobile: '9999999999',
-        password: hashedPassword,
+        mobile: adminMobile,
+        password: hashedAdminPassword,
         fullName: 'System Administrator',
         role: 'admin',
         isActive: true,
       });
       
       console.log('✅ Admin user created successfully');
-      console.log('   Mobile: 9999999999');
-      console.log('   Password: admin123');
+      console.log(`   Mobile: ${adminMobile}`);
+      console.log(`   Password: ${adminPassword}`);
       console.log('   ⚠️  IMPORTANT: Change this password in production!');
     }
 
@@ -84,26 +86,28 @@ async function seed() {
     // Create super_admin account for system maintenance operations
     console.log('👑 Creating super admin account...');
     
+    const superAdminMobile = '9999999998';
+    const superAdminPassword = 'ulan@2025';
+    const hashedSuperAdminPassword = await bcrypt.hash(superAdminPassword, 10);
+
     const existingSuperAdmin = await db.select()
       .from(users)
-      .where(eq(users.mobile, '9999999998'))
+      .where(eq(users.mobile, superAdminMobile))
       .limit(1);
 
     if (existingSuperAdmin.length > 0) {
-      console.log('✅ Super admin user already exists (mobile: 9999999998)');
+      console.log(`✅ Super admin user already exists (mobile: ${superAdminMobile})`);
       
-      // Update to ensure role is super_admin
+      // Update to ensure role, status, and password are correct
       await db.update(users)
-        .set({ role: 'super_admin', isActive: true })
-        .where(eq(users.mobile, '9999999998'));
+        .set({ role: 'super_admin', isActive: true, password: hashedSuperAdminPassword })
+        .where(eq(users.mobile, superAdminMobile));
       
-      console.log('✅ Super admin role verified and updated');
+      console.log('✅ Super admin credentials verified/updated');
     } else {
       // Create super admin user
-      const hashedSuperAdminPassword = await bcrypt.hash('SuperAdmin@2025', 10);
-      
       await db.insert(users).values({
-        mobile: '9999999998',
+        mobile: superAdminMobile,
         email: 'superadmin@himachaltourism.gov.in',
         password: hashedSuperAdminPassword,
         fullName: 'Super Administrator',
@@ -112,9 +116,9 @@ async function seed() {
       });
       
       console.log('✅ Super admin user created successfully');
-      console.log('   Mobile: 9999999998');
+      console.log(`   Mobile: ${superAdminMobile}`);
       console.log('   Email: superadmin@himachaltourism.gov.in');
-      console.log('   Password: SuperAdmin@2025');
+      console.log(`   Password: ${superAdminPassword}`);
       console.log('   ⚠️  IMPORTANT: This account has full system access including reset operations!');
       console.log('   ⚠️  Change this password immediately after first login!');
     }

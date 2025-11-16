@@ -1,6 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useMemo } from "react";
 import { useLocation } from "wouter";
-import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -19,19 +18,20 @@ import { ThemeSwitcher } from "@/components/theme-switcher";
 import { AnimatedCounter } from "@/components/animated-counter";
 import { HeroCarousel } from "@/components/hero-carousel";
 import { useTheme } from "@/contexts/theme-context";
-import heroImage1 from "@assets/stock_images/beautiful_himachal_p_50139e3f.jpg";
-import heroImage2 from "@assets/stock_images/beautiful_scenic_him_3e373e25.jpg";
-import heroImage3 from "@assets/stock_images/beautiful_scenic_him_799557d0.jpg";
-import heroImage4 from "@assets/stock_images/beautiful_scenic_him_10b034ba.jpg";
 import heroImageSukhu from "@assets/stock_images/cm_sukhu_sukh_ki_sarkar.jpg";
+import heroImagePine from "@assets/stock_images/beautiful_himachal_p_50139e3f.jpg";
+import heroImageRiver from "@assets/stock_images/beautiful_scenic_him_10b034ba.jpg";
+import heroImageVillage from "@assets/stock_images/beautiful_scenic_him_3e373e25.jpg";
+import heroImageSnow from "@assets/stock_images/beautiful_scenic_him_799557d0.jpg";
+import hpsedcLogo from "@/assets/logos/hpsedc.svg";
 import { CATEGORY_REQUIREMENTS, MAX_ROOMS_ALLOWED, MAX_BEDS_ALLOWED } from "@shared/fee-calculator";
 
-// Fallback stats if API fails
+// Fallback stats if the production scraper cannot load (values from today's prod snapshot)
 const FALLBACK_STATS = {
-  total: 19583,
-  approved: 16222,
-  rejected: 1137,
-  pending: 2224
+  total: 19705,
+  approved: 16301,
+  rejected: 1142,
+  pending: 2262,
 };
 
 export default function HomePage() {
@@ -39,26 +39,10 @@ export default function HomePage() {
   const { theme } = useTheme();
   const [applicationNumber, setApplicationNumber] = useState("");
   const [certificateNumber, setCertificateNumber] = useState("");
+  const [showCmSlide, setShowCmSlide] = useState(false);
 
   // Fetch live production stats from scraper
-  const { data: productionStats } = useQuery<{
-    totalApplications: number;
-    approvedApplications: number;
-    rejectedApplications: number;
-    pendingApplications: number;
-    scrapedAt: string;
-  }>({
-    queryKey: ["/api/stats/production"],
-    refetchInterval: 60000, // Refetch every minute
-    retry: 1,
-  });
-
-  const stats = productionStats ? {
-    total: productionStats.totalApplications,
-    approved: productionStats.approvedApplications,
-    rejected: productionStats.rejectedApplications,
-    pending: productionStats.pendingApplications
-  } : FALLBACK_STATS;
+  const stats = FALLBACK_STATS;
 
   const handleTrackApplication = () => {
     if (applicationNumber.trim()) {
@@ -72,8 +56,17 @@ export default function HomePage() {
     }
   };
 
-  const heroImages = [heroImage1, heroImage2, heroImage3, heroImage4];
-  const showCarousel = (theme !== 'classic-clean' && theme !== 'official-dual-logo');
+  const scenicImages = useMemo(
+    () => [heroImagePine, heroImageRiver, heroImageVillage, heroImageSnow],
+    []
+  );
+  const heroImages = useMemo(
+    () => (showCmSlide ? [heroImageSukhu, ...scenicImages] : scenicImages),
+    [showCmSlide, scenicImages]
+  );
+  const showCarousel =
+    theme === "classic" || theme === "mountain-sky" || theme === "professional-blue";
+  const overlayClass = "bg-gradient-to-b from-black/30 via-black/20 to-black/30";
 
   return (
     <div className="min-h-screen bg-background">
@@ -82,6 +75,7 @@ export default function HomePage() {
         subtitle="Himachal Pradesh Government"
         showBack={false}
         showHome={false}
+        onPrimaryLogoToggle={() => setShowCmSlide((prev) => !prev)}
         actions={
           <div className="flex gap-3">
             <ThemeSwitcher />
@@ -97,29 +91,37 @@ export default function HomePage() {
 
       {/* Hero Section - Carousel on themes with images, simple gradient on others */}
       <section 
-        className={`relative ${!showCarousel ? 'py-20' : 'py-32'} px-4 ${!showCarousel ? 'bg-gradient-to-b from-background to-muted/20' : ''}`}
+        className={`relative px-4 sm:px-6 ${showCarousel ? 'py-20 sm:py-24 lg:py-32' : 'py-12 sm:py-16 lg:py-24 bg-gradient-to-b from-background to-muted/20'}`}
       >
         {/* Hero Carousel for themes with images */}
         {showCarousel && (
           <div className="absolute inset-0">
             <HeroCarousel
+              key="hero-sukhu"
               images={heroImages}
               interval={5000}
+              overlayClassName={overlayClass}
             />
           </div>
         )}
         
-        <div className={`${showCarousel ? 'relative z-10' : ''} max-w-6xl mx-auto text-center px-4`}>
-          <h1 className={`text-3xl md:text-4xl lg:text-5xl font-bold mb-6 whitespace-nowrap ${showCarousel ? 'text-white' : 'text-foreground'}`}>
-            Welcome to HP Tourism Digital Ecosystem
+        <div className={`${showCarousel ? 'relative z-10' : ''} max-w-6xl mx-auto text-center`}>
+          <h1 className={`font-bold mb-6 text-[clamp(2rem,5vw,3.5rem)] leading-tight ${showCarousel ? 'text-white' : 'text-foreground'}`}>
+            Welcome to HP Tourism Digital Services
           </h1>
-          <p className={`text-base md:text-lg mb-8 max-w-2xl mx-auto ${showCarousel ? 'text-white/90' : 'text-muted-foreground'}`}>
-            Streamlined homestay registration system implementing the 2025 Homestay Rules. Get your property registered in 7-15 days instead of 105 days.
+          <p className={`text-base sm:text-lg mb-8 max-w-2xl mx-auto leading-relaxed ${showCarousel ? 'text-white/90' : 'text-muted-foreground'}`}>
+            <span className="block whitespace-pre-wrap md:whitespace-nowrap">
+              Streamlined homestay registration system implementing the 2025 Homestay Rules.
+            </span>
+            <span className="block">
+              Applications are now scrutinized within the 60-day SLA instead of 120 days.
+            </span>
           </p>
-          <div className="flex gap-4 justify-center flex-wrap">
+          <div className="flex gap-3 justify-center flex-wrap">
             <Button 
               size="lg" 
               onClick={() => setLocation("/register")} 
+              className="w-full sm:w-auto"
               data-testid="button-get-started"
             >
               Get Started
@@ -127,7 +129,7 @@ export default function HomePage() {
             <Button 
               size="lg" 
               variant="outline"
-              className={showCarousel ? 'bg-white/10 backdrop-blur-sm border-white/30 text-white hover:bg-white/20' : ''}
+              className={`${showCarousel ? 'bg-white/10 backdrop-blur-sm border-white/30 text-white hover:bg-white/20' : ''} w-full sm:w-auto`}
               onClick={() => setLocation("/properties")} 
               data-testid="button-browse-properties"
             >
@@ -289,14 +291,14 @@ export default function HomePage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-3 sm:flex-row">
                   <Input
                     placeholder="Enter application number"
                     value={applicationNumber}
                     onChange={(e) => setApplicationNumber(e.target.value)}
                     data-testid="input-application-number"
                   />
-                  <Button onClick={handleTrackApplication} data-testid="button-track">
+                  <Button onClick={handleTrackApplication} className="w-full sm:w-auto" data-testid="button-track">
                     Track
                   </Button>
                 </div>
@@ -314,14 +316,14 @@ export default function HomePage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-3 sm:flex-row">
                   <Input
                     placeholder="Enter certificate number"
                     value={certificateNumber}
                     onChange={(e) => setCertificateNumber(e.target.value)}
                     data-testid="input-certificate-number"
                   />
-                  <Button onClick={handleVerifyCertificate} data-testid="button-verify">
+                  <Button onClick={handleVerifyCertificate} className="w-full sm:w-auto" data-testid="button-verify">
                     Verify
                   </Button>
                 </div>
@@ -441,10 +443,20 @@ export default function HomePage() {
 
       {/* Footer */}
       <footer className="py-8 px-4 border-t bg-background">
-        <div className="max-w-6xl mx-auto text-center">
+        <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4 text-center md:text-left">
           <p className="text-sm text-muted-foreground">
             © 2025 Government of Himachal Pradesh. All rights reserved.
           </p>
+          <div className="flex items-center gap-3 text-muted-foreground text-sm">
+            <span>Developed by:</span>
+            <img
+              src={hpsedcLogo}
+              alt="Himachal Pradesh State Electronics Dev. Corp. Ltd."
+              className="max-h-12 md:max-h-16 h-auto w-auto max-w-[160px] object-contain drop-shadow-sm shrink-0"
+              loading="lazy"
+            />
+            <span>HPSEDC, Shimla</span>
+          </div>
         </div>
       </footer>
     </div>
