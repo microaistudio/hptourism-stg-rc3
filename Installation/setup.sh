@@ -23,6 +23,13 @@ NODE_PORT="${NODE_PORT:-4000}"
 SERVER_NAME="${SERVER_NAME:-staging.osipl.dev}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="/var/log/hptourism-installer"
+LOG_FILE="${LOG_DIR}/install-$(date +%Y%m%d-%H%M%S).log"
+
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Installer log: $LOG_FILE"
 
 # -------------------------------------------------------------
 # Helper functions
@@ -98,7 +105,7 @@ install_node_modules() {
 
 run_migrations_and_build() {
   echo "Running database migrations…"
-  sudo -u "$APP_USER" bash -c "cd '$APP_DIR' && npm run db:migrate"
+  sudo -u "$APP_USER" bash -c "cd '$APP_DIR' && npm run db:push"
   echo "Building production bundle…"
   sudo -u "$APP_USER" bash -c "cd '$APP_DIR' && npm run build"
 }
