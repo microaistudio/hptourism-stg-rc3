@@ -8,21 +8,6 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { NotificationPanel } from "@/components/notification-panel";
 import {
-  BarChart,
-  Bar,
-  PieChart,
-  Pie,
-  Cell,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer
-} from "recharts";
-import {
   AlertTriangle,
   CheckCircle,
   Clock,
@@ -34,11 +19,26 @@ import {
   Bell,
   ArrowRight,
   AlertCircle,
-  Timer,
   Activity,
   Search,
-  X
+  X,
+  Gauge,
+  BarChart3,
+  ShieldCheck,
+  ClipboardList,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  LineChart,
+  Line,
+} from "recharts";
 import type { HomestayApplication } from "@shared/schema";
 
 // SLA thresholds (in days)
@@ -149,7 +149,7 @@ export default function WorkflowMonitoringPage() {
             Workflow Monitoring Dashboard
           </h1>
           <p className="text-muted-foreground" data-testid="text-page-subtitle">
-            Real-time application pipeline tracking & SLA monitoring
+            Oversight console for spotting bottlenecks across the homestay pipeline
           </p>
         </div>
         <div className="flex gap-3">
@@ -167,31 +167,32 @@ export default function WorkflowMonitoringPage() {
       {/* Key Metrics Overview */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-6">
         <MetricCard
-          title="Total Applications"
-          value={stats.total}
+          title="Active Pipeline"
+          value={stats.activePipeline}
           icon={FileText}
-          trend={`+${stats.newToday} today`}
+          trend={`+${stats.newToday} received today`}
           variant="default"
         />
         <MetricCard
-          title="In Progress"
-          value={stats.inProgress}
-          icon={Clock}
-          trend={`${stats.avgProcessingTime} days avg`}
-          variant="warning"
-        />
-        <MetricCard
-          title="SLA Breaches"
-          value={slaBreaches.length}
+          title="Critical Bottlenecks"
+          value={stats.criticalBottlenecks}
           icon={AlertTriangle}
-          trend={slaBreaches.length === 0 ? "All on track" : "Needs attention"}
-          variant="destructive"
+          trend={stats.mostDelayedStage ? `Most delays: ${stats.mostDelayedStage}` : "Running smooth"}
+          variant={stats.criticalBottlenecks > 0 ? "destructive" : "default"}
         />
         <MetricCard
-          title="Completed Today"
-          value={stats.completedToday}
+          title="Avg. Processing Time"
+          value={stats.avgProcessingTime}
+          valueSuffix=" days"
+          icon={Clock}
+          trend={`Target: ${SLA_THRESHOLDS.total} days`}
+          variant="default"
+        />
+        <MetricCard
+          title="Registered Homestays"
+          value={stats.totalCertificates}
           icon={CheckCircle}
-          trend={`${stats.completionRate}% rate`}
+          trend={`+${stats.completedThisWeek} this week`}
           variant="success"
         />
       </div>
@@ -224,8 +225,8 @@ export default function WorkflowMonitoringPage() {
             onStageClick={setStatusFilter}
             activeFilter={statusFilter}
           />
-          <ApplicationsTable 
-            applications={applications} 
+          <AtRiskApplicationsTable
+            applications={applications}
             statusFilter={statusFilter}
             searchQuery={searchQuery}
             onClearFilter={() => setStatusFilter(null)}
@@ -256,12 +257,14 @@ export default function WorkflowMonitoringPage() {
 function MetricCard({
   title,
   value,
+  valueSuffix,
   icon: Icon,
   trend,
   variant = "default"
 }: {
   title: string;
   value: number;
+  valueSuffix?: string;
   icon: any;
   trend: string;
   variant?: "default" | "success" | "warning" | "destructive";
@@ -282,7 +285,10 @@ function MetricCard({
         </div>
       </CardHeader>
       <CardContent>
-        <div className="text-2xl font-bold">{value}</div>
+        <div className="text-2xl font-bold">
+          {value}
+          {valueSuffix ? <span className="text-base font-medium text-muted-foreground"> {valueSuffix}</span> : null}
+        </div>
         <p className="text-xs text-muted-foreground mt-1">{trend}</p>
       </CardContent>
     </Card>
@@ -290,28 +296,62 @@ function MetricCard({
 }
 
 // Visual Pipeline Flow Component
-function VisualPipelineFlow({ 
-  applications, 
-  onStageClick, 
-  activeFilter 
-}: { 
+function VisualPipelineFlow({
+  applications,
+  onStageClick,
+  activeFilter,
+}: {
   applications: HomestayApplication[];
   onStageClick: (status: string | null) => void;
   activeFilter: string | null;
 }) {
   const stages = [
-    { id: 'submitted', label: 'Submitted', color: 'bg-blue-500' },
-    { id: 'document_verification', label: 'Document Check', color: 'bg-purple-500' },
-    { id: 'site_inspection_scheduled', label: 'Site Inspection', color: 'bg-orange-500' },
-    { id: 'site_inspection_complete', label: 'Inspection Done', color: 'bg-teal-500' },
-    { id: 'payment_pending', label: 'Payment Pending', color: 'bg-yellow-500' },
-    { id: 'approved', label: 'Approved', color: 'bg-green-500' }
+    { id: "submission", label: "Submission", color: "bg-sky-600", statuses: ["submitted"] },
+    {
+      id: "da_scrutiny",
+      label: "DA Scrutiny",
+      color: "bg-purple-600",
+      statuses: ["document_verification", "under_scrutiny"],
+      returnedStatus: "da_send_back",
+    },
+    {
+      id: "dtdo_verification",
+      label: "DTDO Verification",
+      color: "bg-indigo-600",
+      statuses: ["forwarded_to_dtdo", "dtdo_review"],
+      returnedStatus: "dtdo_revert",
+    },
+    {
+      id: "inspection_phase",
+      label: "Inspection Phase",
+      color: "bg-orange-500",
+      statuses: ["site_inspection_scheduled", "site_inspection_complete"],
+    },
+    {
+      id: "payment_pending",
+      label: "Payment Pending",
+      color: "bg-yellow-500",
+      statuses: ["payment_pending"],
+    },
+    {
+      id: "rc_issued",
+      label: "RC Issued",
+      color: "bg-green-500",
+      statuses: ["approved"],
+    },
   ];
 
-  const stageCount = stages.map(stage => ({
-    ...stage,
-    count: applications.filter(app => app.status === stage.id).length
-  }));
+  const stageCount = stages.map((stage) => {
+    const count = applications.filter((app) => stage.statuses.includes(app.status ?? "")).length;
+    const returned = stage.returnedStatus
+      ? applications.filter((app) => app.status === stage.returnedStatus).length
+      : 0;
+    return {
+      ...stage,
+      count,
+      returned,
+    };
+  });
 
   return (
     <Card>
@@ -333,7 +373,7 @@ function VisualPipelineFlow({
                   <button
                     onClick={() => onStageClick(activeFilter === stage.id ? null : stage.id)}
                     className={`w-full ${stage.color} text-white rounded-lg p-4 text-center shadow-md hover:shadow-xl transition-shadow cursor-pointer ${
-                      activeFilter === stage.id ? 'ring-4 ring-white ring-offset-2' : ''
+                      activeFilter === stage.id ? "ring-4 ring-white ring-offset-2" : ""
                     }`}
                     data-testid={`filter-stage-${stage.id}`}
                   >
@@ -345,11 +385,12 @@ function VisualPipelineFlow({
                       {Math.round((stage.count / applications.length) * 100)}%
                     </Badge>
                   )}
-                  {activeFilter === stage.id && (
-                    <Badge variant="default" className="absolute -bottom-2 left-1/2 -translate-x-1/2 pointer-events-none">
-                      Filtered
-                    </Badge>
-                  )}
+                  {stage.returned ? (
+                    <div className="absolute -bottom-7 left-1/2 -translate-x-1/2 text-xs text-white/80 flex items-center gap-1">
+                      <span aria-hidden>↩️</span>
+                      {stage.returned} returned to applicant
+                    </div>
+                  ) : null}
                 </div>
               </div>
               {index < stageCount.length - 1 && (
@@ -364,7 +405,7 @@ function VisualPipelineFlow({
 }
 
 // Applications Table Component
-function ApplicationsTable({ 
+function AtRiskApplicationsTable({ 
   applications, 
   statusFilter, 
   searchQuery,
@@ -381,28 +422,37 @@ function ApplicationsTable({
   
   // Memoize filtered applications for performance
   const filteredApps = useMemo(() => {
-    return applications.filter(app => {
-      const matchesStatus = !statusFilter || app.status === statusFilter;
-      const matchesSearch = !searchQuery || 
-        app.propertyName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        app.applicationNumber?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        app.ownerName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        app.district?.toLowerCase().includes(searchQuery.toLowerCase());
-      return matchesStatus && matchesSearch;
-    });
+    return applications
+      .map((app) => ({ app, daysInStage: getDaysInStage(app) }))
+      .filter(({ app, daysInStage }) => {
+        if (app.status === "approved" || app.status === "rejected") return false;
+        if (daysInStage < 7) return false;
+        const matchesStatus = !statusFilter || app.status === statusFilter;
+        const matchesSearch =
+          !searchQuery ||
+          app.propertyName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          app.applicationNumber?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          app.ownerName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          app.district?.toLowerCase().includes(searchQuery.toLowerCase());
+        return matchesStatus && matchesSearch;
+      })
+      .sort((a, b) => b.daysInStage - a.daysInStage);
   }, [applications, statusFilter, searchQuery]);
 
   // Get stage label for filter badge
   const getStageLabel = (status: string) => {
     const labels: Record<string, string> = {
-      'submitted': 'Submitted',
-      'document_verification': 'Document Check',
-      'site_inspection_scheduled': 'Site Inspection',
-      'site_inspection_complete': 'Inspection Done',
-      'payment_pending': 'Payment Pending',
-      'approved': 'Approved'
+      submitted: "Submission",
+      document_verification: "DA Scrutiny",
+      under_scrutiny: "DA Scrutiny",
+      forwarded_to_dtdo: "DTDO Verification",
+      dtdo_review: "DTDO Verification",
+      site_inspection_scheduled: "Inspection Phase",
+      site_inspection_complete: "Inspection Phase",
+      payment_pending: "Payment Pending",
+      approved: "RC Issued",
     };
-    return labels[status] || status.replace(/_/g, ' ');
+    return labels[status] || status.replace(/_/g, " ");
   };
   
   return (
@@ -411,15 +461,14 @@ function ApplicationsTable({
         <div className="flex items-center justify-between gap-4">
           <div className="flex-1">
             <CardTitle className="flex items-center gap-2">
-              {statusFilter ? `${getStageLabel(statusFilter)} Applications` : 'Recent Applications'}
+              Slow Moving / At-Risk Applications
               <Badge variant="secondary">{filteredApps.length}</Badge>
             </CardTitle>
             <CardDescription>
-              {statusFilter ? 'Filtered applications' : 'Last 20 applications with SLA status'} - Click to review
+              Files stuck more than 7 days in their current stage. Click to nudge the assignee or applicant.
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
-            {/* Search Input */}
             <div className="relative w-64">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
               <Input
@@ -440,7 +489,6 @@ function ApplicationsTable({
                 </button>
               )}
             </div>
-            {/* Clear Filter Button */}
             {statusFilter && (
               <Button 
                 variant="outline" 
@@ -456,32 +504,53 @@ function ApplicationsTable({
         </div>
       </CardHeader>
       <CardContent>
+        <div className="flex justify-between text-xs text-muted-foreground uppercase font-medium tracking-wide px-2">
+          <div className="w-[25%]">Application</div>
+          <div className="w-[18%]">Current Stage</div>
+          <div className="w-[18%]">Assigned To</div>
+          <div className="w-[14%] text-right">Days in Stage</div>
+          <div className="w-[15%] text-right">Status</div>
+          <div className="w-[10%] text-right">Action</div>
+        </div>
         {filteredApps.length === 0 ? (
-          <div className="text-center py-12 text-muted-foreground">
+          <div className="text-center py-12 text-muted-foreground border rounded-lg mt-4">
             <FileText className="h-12 w-12 mx-auto mb-3 opacity-50" />
-            <p>No applications found matching your criteria</p>
+            <p>Nothing appears stuck right now.</p>
           </div>
         ) : (
-          <div className="space-y-3">
-            {filteredApps.slice(0, 20).map((app) => (
+          <div className="space-y-3 mt-4">
+            {filteredApps.slice(0, 20).map(({ app, daysInStage }) => (
               <div
                 key={app.id}
                 onClick={() => setLocation(`/applications/${app.id}`)}
                 className="flex items-center justify-between p-4 border rounded-lg hover:bg-muted/50 hover:border-primary/50 transition-colors cursor-pointer"
                 data-testid={`application-row-${app.id}`}
               >
-                <div className="flex items-center gap-4 flex-1">
-                  <div className="flex-1">
-                    <div className="font-medium">{app.propertyName}</div>
-                    <div className="text-sm text-muted-foreground">
-                      {app.applicationNumber} • {app.district}
-                    </div>
+                <div className="w-[25%]">
+                  <div className="font-medium">{app.propertyName || "Unnamed Homestay"}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {app.applicationNumber || `#${app.id}`} • {app.district || "Unknown district"}
                   </div>
-                  <Badge variant="outline" className="capitalize">
-                    {app.category}
+                </div>
+                <div className="w-[18%]">
+                  <Badge variant="secondary">{getStageLabel(app.status || "draft")}</Badge>
+                </div>
+                <div className="w-[18%]">
+                  <p className="text-sm">{app.assignedToName || app.assignedTo || `DA ${app.district ?? ""}`}</p>
+                  <p className="text-xs text-muted-foreground">Owner: {app.ownerName || "Unknown"}</p>
+                </div>
+                <div className="w-[14%] text-right">
+                  <span className={daysInStage > 14 ? "text-destructive font-semibold" : "font-medium"}>
+                    {daysInStage} days
+                  </span>
+                </div>
+                <div className="w-[15%] text-right">
+                  <Badge variant={isWaitingOnApplicant(app.status) ? "outline" : "warning"}>
+                    {isWaitingOnApplicant(app.status) ? "Waiting on applicant" : "Pending officer"}
                   </Badge>
-                  <StatusBadge status={app.status || 'draft'} />
-                  <SLAIndicator app={app} />
+                </div>
+                <div className="w-[10%] text-right">
+                  <Badge variant="ghost">{app.status || "Draft"}</Badge>
                 </div>
               </div>
             ))}
@@ -542,6 +611,19 @@ function SLAIndicator({ app }: { app: HomestayApplication }) {
     </Badge>
   );
 }
+
+const applicantStatuses = new Set(["da_send_back", "dtdo_revert"]);
+
+const getDaysInStage = (application: HomestayApplication) => {
+  const anchor = application.updatedAt || application.statusUpdatedAt || application.submittedAt;
+  if (!anchor) return 0;
+  return Math.floor((Date.now() - new Date(anchor).getTime()) / (1000 * 60 * 60 * 24));
+};
+
+const isWaitingOnApplicant = (status?: string | null) => {
+  if (!status) return false;
+  return applicantStatuses.has(status);
+};
 
 // Bottlenecks View
 function BottlenecksView({
@@ -818,33 +900,62 @@ function OfficerWorkloadView({ applications }: { applications: HomestayApplicati
 function calculatePipelineStats(applications: HomestayApplication[]) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  const activeApps = applications.filter(
+    (app) => app.status !== "approved" && app.status !== "rejected",
+  );
+  const newToday = applications.filter(
+    (app) => app.submittedAt && new Date(app.submittedAt) >= today,
+  );
+  const approvalsThisWeek = applications.filter(
+    (app) => app.approvedAt && new Date(app.approvedAt) >= weekAgo,
+  );
+
+  const bottleneckByStage = activeApps.reduce<Record<string, number>>((acc, app) => {
+    if (!app.submittedAt) {
+      return acc;
+    }
+    const days = Math.floor((now.getTime() - new Date(app.submittedAt).getTime()) / (1000 * 60 * 60 * 24));
+    if (days > 7) {
+      const key = app.status ?? "unknown";
+      acc[key] = (acc[key] ?? 0) + 1;
+    }
+    return acc;
+  }, {});
+
+  const criticalBottlenecks = Object.values(bottleneckByStage).reduce((sum, value) => sum + value, 0);
+  const mostDelayedStageEntry = Object.entries(bottleneckByStage).sort((a, b) => b[1] - a[1])[0];
+  const stageLabels: Record<string, string> = {
+    submitted: "Submission",
+    document_verification: "DA Scrutiny",
+    under_scrutiny: "DA Scrutiny",
+    forwarded_to_dtdo: "DTDO Verification",
+    dtdo_review: "DTDO Verification",
+    site_inspection_scheduled: "Inspection Phase",
+    site_inspection_complete: "Inspection Phase",
+    payment_pending: "Payment Pending",
+    approved: "RC Issued",
+  };
+
+  const approvedApps = applications.filter((app) => app.status === "approved");
+  const completedApps = applications.filter((app) => app.submittedAt && app.approvedAt);
+  const avgProcessingTimeRaw =
+    completedApps.reduce((sum, app) => {
+      const days = Math.floor(
+        (new Date(app.approvedAt!).getTime() - new Date(app.submittedAt!).getTime()) / (1000 * 60 * 60 * 24),
+      );
+      return sum + days;
+    }, 0) / Math.max(completedApps.length, 1);
 
   return {
-    total: applications.length,
-    inProgress: applications.filter(app => 
-      app.status !== 'approved' && app.status !== 'rejected'
-    ).length,
-    completedToday: applications.filter(app => 
-      app.approvedAt && new Date(app.approvedAt) >= today
-    ).length,
-    newToday: applications.filter(app => 
-      app.submittedAt && new Date(app.submittedAt) >= today
-    ).length,
-    avgProcessingTime: Math.round(
-      applications
-        .filter(app => app.submittedAt && app.approvedAt)
-        .reduce((sum, app) => {
-          const days = Math.floor(
-            (new Date(app.approvedAt!).getTime() - new Date(app.submittedAt!).getTime()) / 
-            (1000 * 60 * 60 * 24)
-          );
-          return sum + days;
-        }, 0) / Math.max(applications.filter(app => app.approvedAt).length, 1)
-    ),
-    completionRate: Math.round(
-      (applications.filter(app => app.status === 'approved').length / 
-      Math.max(applications.length, 1)) * 100
-    )
+    activePipeline: activeApps.length,
+    newToday: newToday.length,
+    criticalBottlenecks,
+    mostDelayedStage: mostDelayedStageEntry ? stageLabels[mostDelayedStageEntry[0]] ?? "Unknown stage" : "",
+    avgProcessingTime: Math.max(Math.round(isFinite(avgProcessingTimeRaw) ? avgProcessingTimeRaw : 0), 0),
+    totalCertificates: approvedApps.length,
+    completedThisWeek: approvalsThisWeek.length,
   };
 }
 

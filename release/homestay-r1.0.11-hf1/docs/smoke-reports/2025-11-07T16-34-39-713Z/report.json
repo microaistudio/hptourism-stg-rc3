@@ -1,0 +1,202 @@
+{
+  "startedAt": "2025-11-07T16:34:39.713Z",
+  "reports": [
+    {
+      "id": "gold-mc-new",
+      "label": "Gold MC New",
+      "steps": [
+        {
+          "name": "OwnerSubmit",
+          "status": "success",
+          "startedAt": "2025-11-07T16:34:39.989Z",
+          "finishedAt": "2025-11-07T16:34:40.024Z"
+        },
+        {
+          "name": "DAStartScrutiny",
+          "status": "success",
+          "startedAt": "2025-11-07T16:34:40.024Z",
+          "finishedAt": "2025-11-07T16:34:40.037Z"
+        },
+        {
+          "name": "DAForward",
+          "status": "success",
+          "startedAt": "2025-11-07T16:34:40.288Z",
+          "finishedAt": "2025-11-07T16:34:40.300Z"
+        },
+        {
+          "name": "DTDOAccept",
+          "status": "failed",
+          "startedAt": "2025-11-07T16:34:40.551Z",
+          "finishedAt": "2025-11-07T16:34:40.562Z",
+          "detail": "DTDO accept failed for d8746e03-64fe-4c73-a8b8-b042f2d10a78: 403 {\"message\":\"You can only process applications from your district\"}"
+        },
+        {
+          "name": "DTDOScheduleInspection",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOApprove",
+          "status": "pending"
+        },
+        {
+          "name": "Certificate",
+          "status": "pending"
+        }
+      ],
+      "applicationNumber": "HP-HS-2025-000006",
+      "error": "DTDO accept failed for d8746e03-64fe-4c73-a8b8-b042f2d10a78: 403 {\"message\":\"You can only process applications from your district\"}"
+    },
+    {
+      "id": "diamond-tcp-new",
+      "label": "Diamond TCP New",
+      "steps": [
+        {
+          "name": "OwnerSubmit",
+          "status": "failed",
+          "startedAt": "2025-11-07T16:34:40.563Z",
+          "finishedAt": "2025-11-07T16:34:40.571Z",
+          "detail": "Failed to submit application for Diamond TCP New: Conflict"
+        },
+        {
+          "name": "DAStartScrutiny",
+          "status": "pending"
+        },
+        {
+          "name": "DAForward",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOAccept",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOScheduleInspection",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOApprove",
+          "status": "pending"
+        },
+        {
+          "name": "Certificate",
+          "status": "pending"
+        }
+      ],
+      "error": "Failed to submit application for Diamond TCP New: Conflict"
+    },
+    {
+      "id": "silver-gp-add-rooms",
+      "label": "Silver GP Add Rooms",
+      "steps": [
+        {
+          "name": "OwnerSubmit",
+          "status": "failed",
+          "startedAt": "2025-11-07T16:34:40.571Z",
+          "finishedAt": "2025-11-07T16:34:40.584Z",
+          "detail": "Failed to submit application for Silver GP Add Rooms: Conflict"
+        },
+        {
+          "name": "DAStartScrutiny",
+          "status": "pending"
+        },
+        {
+          "name": "DAForward",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOAccept",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOScheduleInspection",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOApprove",
+          "status": "pending"
+        },
+        {
+          "name": "Certificate",
+          "status": "pending"
+        }
+      ],
+      "error": "Failed to submit application for Silver GP Add Rooms: Conflict"
+    },
+    {
+      "id": "gold-mc-delete-rooms",
+      "label": "Gold MC Delete Rooms",
+      "steps": [
+        {
+          "name": "OwnerSubmit",
+          "status": "failed",
+          "startedAt": "2025-11-07T16:34:40.585Z",
+          "finishedAt": "2025-11-07T16:34:40.595Z",
+          "detail": "Failed to submit application for Gold MC Delete Rooms: Conflict"
+        },
+        {
+          "name": "DAStartScrutiny",
+          "status": "pending"
+        },
+        {
+          "name": "DAForward",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOAccept",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOScheduleInspection",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOApprove",
+          "status": "pending"
+        },
+        {
+          "name": "Certificate",
+          "status": "pending"
+        }
+      ],
+      "error": "Failed to submit application for Gold MC Delete Rooms: Conflict"
+    },
+    {
+      "id": "silver-gp-renewal",
+      "label": "Silver GP Renewal",
+      "steps": [
+        {
+          "name": "OwnerSubmit",
+          "status": "failed",
+          "startedAt": "2025-11-07T16:34:40.595Z",
+          "finishedAt": "2025-11-07T16:34:40.603Z",
+          "detail": "Failed to submit application for Silver GP Renewal: Conflict"
+        },
+        {
+          "name": "DAStartScrutiny",
+          "status": "pending"
+        },
+        {
+          "name": "DAForward",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOAccept",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOScheduleInspection",
+          "status": "pending"
+        },
+        {
+          "name": "DTDOApprove",
+          "status": "pending"
+        },
+        {
+          "name": "Certificate",
+          "status": "pending"
+        }
+      ],
+      "error": "Failed to submit application for Silver GP Renewal: Conflict"
+    }
+  ]
+}

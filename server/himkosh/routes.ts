@@ -1,15 +1,19 @@
 import { Router, type Request } from 'express';
 import { db } from '../db';
-import { himkoshTransactions, homestayApplications, ddoCodes, systemSettings, users } from '../../shared/schema';
+import { himkoshTransactions, homestayApplications, systemSettings, users } from '../../shared/schema';
 import { HimKoshCrypto, buildRequestString, parseResponseString, buildVerificationString } from './crypto';
-import { getHimKoshConfig } from './config';
+import { resolveHimkoshGatewayConfig } from './gatewayConfig';
 import { desc, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { config as appConfig } from '@shared/config';
 import { ensureDistrictCodeOnApplicationNumber } from '@shared/applicationNumber';
 import { logApplicationAction } from '../audit';
+import { deriveDistrictRoutingLabel } from '@shared/districtRouting';
+import { logger, logPaymentTrace } from '../logger';
+import { resolveDistrictDdo } from "./ddo";
 
 const router = Router();
+const himkoshLogger = logger.child({ module: "himkosh" });
 
 let portalBaseColumnEnsured = false;
 const ensurePortalBaseUrlColumn = async () => {
@@ -21,63 +25,14 @@ const ensurePortalBaseUrlColumn = async () => {
       sql`ALTER TABLE "himkosh_transactions" ADD COLUMN IF NOT EXISTS "portal_base_url" text`,
     );
     portalBaseColumnEnsured = true;
-    console.info('[himkosh] Ensured portal_base_url column exists on himkosh_transactions');
+    himkoshLogger.info("Ensured portal_base_url column exists on himkosh_transactions");
   } catch (error) {
-    console.error('[himkosh] Failed to ensure portal_base_url column:', error);
+    himkoshLogger.error({ err: error }, "Failed to ensure portal_base_url column");
   }
 };
 
 void ensurePortalBaseUrlColumn();
 
-const normalizeDistrictForMatch = (value?: string | null) => {
-  if (!value) return [];
-  const cleaned = value
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/\b(division|sub-division|subdivision|hq|office|district|development|tourism|ddo|dto|dt|section|unit|range|circle|zone|serving|for|the|at|and)\b/g, " ")
-    .replace(/[^a-z\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!cleaned) {
-    return [];
-  }
-
-  const tokens = cleaned
-    .split(" ")
-    .map((token) => token.trim())
-    .filter((token) => token.length > 2);
-
-  return Array.from(new Set(tokens));
-};
-
-const resolveDistrictDdo = async (district?: string | null) => {
-  if (!district) {
-    return undefined;
-  }
-
-  const [exact] = await db
-    .select()
-    .from(ddoCodes)
-    .where(eq(ddoCodes.district, district))
-    .limit(1);
-
-  if (exact) {
-    return exact;
-  }
-
-  const allCodes = await db.select().from(ddoCodes);
-  const districtTokens = normalizeDistrictForMatch(district);
-
-  if (districtTokens.length === 0) {
-    return undefined;
-  }
-
-  return allCodes.find((code) => {
-    const codeTokens = normalizeDistrictForMatch(code.district);
-    return codeTokens.some((token) => districtTokens.includes(token));
-  });
-};
 const crypto = new HimKoshCrypto();
 
 const stripTrailingSlash = (value: string) => value.replace(/\/+$/, '');
@@ -366,18 +321,31 @@ router.post('/initiate', async (req, res) => {
       });
     }
 
-    const config = getHimKoshConfig();
+    const { config } = await resolveHimkoshGatewayConfig();
 
-    // Look up DDO code based on application's district
+    // Look up DDO code based on application's district/tehsil routing
     let ddoCode = config.ddo; // Default/fallback DDO
-    if (application.district) {
-      const ddoMapping = await resolveDistrictDdo(application.district);
+    const routedDistrict =
+      deriveDistrictRoutingLabel(application.district, application.tehsil) ?? application.district;
+    if (routedDistrict) {
+      const ddoMapping = await resolveDistrictDdo(routedDistrict);
       
       if (ddoMapping) {
         ddoCode = ddoMapping.ddoCode;
-        console.log(`[himkosh] Using district-specific DDO: ${ddoCode} for district: ${application.district}`);
+        himkoshLogger.info(
+          {
+            ddoCode,
+            routedDistrict,
+            originalDistrict: application.district,
+            applicationId: application.id,
+          },
+          "[himkosh] Using district-specific DDO",
+        );
       } else {
-        console.log(`[himkosh] No DDO mapping found for district: ${application.district}, using fallback: ${config.ddo}`);
+        himkoshLogger.info(
+          { routedDistrict, fallbackDdo: config.ddo, applicationId: application.id },
+          "[himkosh] No DDO mapping found; using fallback",
+        );
       }
     }
 
@@ -414,7 +382,10 @@ router.post('/initiate', async (req, res) => {
     const gatewayAmount = isTestMode ? 1 : actualAmount;
     
     if (isTestMode) {
-      console.log(`[himkosh] 🧪 TEST PAYMENT MODE ACTIVE - Sending ₹1 to gateway instead of ₹${actualAmount}`);
+      himkoshLogger.info(
+        { applicationId: application.id, actualAmount },
+        "[himkosh] Test payment mode active - overriding amount to ₹1",
+      );
     }
 
     // Get current date in DD-MM-YYYY format (as per HP Government code)
@@ -438,11 +409,14 @@ router.post('/initiate', async (req, res) => {
     }
 
     if (trimmedPortalBase) {
-      console.log('[himkosh] Using dynamic callback URL derived from request:', callbackUrl);
+      himkoshLogger.info({ callbackUrl }, "[himkosh] Using dynamic callback URL derived from request");
     } else if (callbackUrl) {
-      console.log('[himkosh] Using configured callback URL:', callbackUrl);
+      himkoshLogger.info({ callbackUrl }, "[himkosh] Using configured callback URL");
     } else {
-      console.warn('[himkosh] No callback URL resolved; HimKosh response redirects may fail.');
+      himkoshLogger.warn(
+        { applicationId: application.id },
+        "[himkosh] No callback URL resolved; HimKosh response redirects may fail",
+      );
     }
 
     // Build request parameters
@@ -504,7 +478,7 @@ router.post('/initiate', async (req, res) => {
     const encryptedData = await crypto.encrypt(requestStringWithChecksum);
 
     // Debug: Log values to identify which field is too long
-    console.log('[himkosh] Transaction values:', {
+    logPaymentTrace("[himkosh] Transaction values", {
       merchantCode: config.merchantCode,
       merchantCodeLen: config.merchantCode?.length,
       deptId: config.deptId,
@@ -518,13 +492,14 @@ router.post('/initiate', async (req, res) => {
     });
 
     // Debug: Log encryption details
-    console.log('[himkosh-encryption] CORE string (for checksum):', coreString);
-    console.log('[himkosh-encryption] FULL string (before checksum):', fullString);
-    console.log('[himkosh-encryption] Checksum calculated on CORE:', checksum);
-    console.log('[himkosh-encryption] Full string WITH checksum (what we encrypt):', requestStringWithChecksum);
-    console.log('[himkosh-encryption] Full string length:', requestStringWithChecksum.length);
-    console.log('[himkosh-encryption] Encrypted data:', encryptedData);
-    console.log('[himkosh-encryption] Encrypted length:', encryptedData.length);
+    logPaymentTrace("[himkosh-encryption] Payload preview", {
+      coreString,
+      fullString,
+      checksum,
+      requestStringWithChecksum,
+      requestStringLength: requestStringWithChecksum.length,
+      encryptedLength: encryptedData.length,
+    });
 
     // Save transaction to database (store gateway amount that was actually sent)
     await ensurePortalBaseUrlColumn();
@@ -568,11 +543,14 @@ router.post('/initiate', async (req, res) => {
         : 'Payment initiated successfully.',
     };
     
-    console.log('[himkosh] Response isConfigured:', config.isConfigured);
-    console.log('[himkosh] Response isTestMode:', isTestMode);
+    logPaymentTrace("[himkosh] Response metadata", {
+      isConfigured: config.isConfigured,
+      isTestMode,
+      appRefNo,
+    });
     res.json(response);
   } catch (error) {
-    console.error('HimKosh initiation error:', error);
+    himkoshLogger.error({ err: error, route: req.path }, "HimKosh initiation error");
     res.status(500).json({ 
       error: 'Failed to initiate payment',
       details: error instanceof Error ? error.message : 'Unknown error'
@@ -617,7 +595,7 @@ router.get('/callback', (_req, res) => {
  */
 router.post('/callback', async (req, res) => {
   try {
-    const config = getHimKoshConfig();
+    const { config } = await resolveHimkoshGatewayConfig();
     const { encdata } = req.body;
 
     if (!encdata) {
@@ -629,7 +607,10 @@ router.post('/callback', async (req, res) => {
 
     const checksumMatch = decryptedData.match(/\|checksum=([0-9a-fA-F]+)/i);
     if (!checksumMatch || checksumMatch.index === undefined) {
-      console.error('HimKosh callback: checksum token missing', decryptedData);
+      himkoshLogger.error(
+        { decryptedData },
+        "HimKosh callback: checksum token missing",
+      );
       return res.status(400).send('Invalid checksum payload');
     }
 
@@ -639,11 +620,10 @@ router.post('/callback', async (req, res) => {
     const parsedResponse = parseResponseString(decryptedData);
 
     if (!isValid) {
-      console.error('HimKosh callback: Checksum verification failed', {
-        dataWithoutChecksum,
-        receivedChecksum,
-        parsedResponse,
-      });
+      himkoshLogger.error(
+        { dataWithoutChecksum, receivedChecksum, parsedResponse },
+        "HimKosh callback: Checksum verification failed",
+      );
       return res.status(400).send('Invalid checksum');
     }
 
@@ -655,7 +635,10 @@ router.post('/callback', async (req, res) => {
       .limit(1);
 
     if (!transaction) {
-      console.error('HimKosh callback: Transaction not found:', parsedResponse.appRefNo);
+      himkoshLogger.error(
+        { appRefNo: parsedResponse.appRefNo },
+        "HimKosh callback: Transaction not found",
+      );
       return res.status(404).send('Transaction not found');
     }
 
@@ -692,8 +675,10 @@ router.post('/callback', async (req, res) => {
       const certificateNumber = `HP-HST-${year}-${randomSuffix}`;
 
       const issueDate = new Date();
-      const expiryDate = new Date();
+      const expiryDate = new Date(issueDate);
       expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+      const formatTimelineDate = (value: Date) =>
+        value.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 
       await db
         .update(homestayApplications)
@@ -727,12 +712,15 @@ router.post('/callback', async (req, res) => {
           action: "certificate_issued",
           previousStatus: "approved",
           newStatus: "approved",
-          feedback: `Certificate number ${certificateNumber} issued automatically.`,
+          feedback: `Certificate ${certificateNumber} issued on ${formatTimelineDate(issueDate)} (valid till ${formatTimelineDate(
+            expiryDate,
+          )}).`,
         });
       } else {
-        console.warn("[timeline] Unable to resolve actor for HimKosh payment success", {
-          applicationId: transaction.applicationId,
-        });
+        himkoshLogger.warn(
+          { applicationId: transaction.applicationId },
+          "[timeline] Unable to resolve actor for HimKosh payment success",
+        );
       }
     }
 
@@ -775,7 +763,7 @@ router.post('/callback', async (req, res) => {
 
     res.status(200).send(html);
   } catch (error) {
-    console.error('HimKosh callback error:', error);
+    himkoshLogger.error({ err: error, route: req.path }, "HimKosh callback error");
     res.status(500).send('Payment processing failed');
   }
 });
@@ -787,8 +775,6 @@ router.post('/callback', async (req, res) => {
 router.post('/verify/:appRefNo', async (req, res) => {
   try {
     const { appRefNo } = req.params;
-    const config = getHimKoshConfig();
-
     // Build verification request
     const verificationString = buildVerificationString({
       appRefNo,
@@ -845,7 +831,7 @@ router.post('/verify/:appRefNo', async (req, res) => {
       data: verificationData,
     });
   } catch (error) {
-    console.error('HimKosh verification error:', error);
+    himkoshLogger.error({ err: error, route: req.path, appRefNo: req.params?.appRefNo }, "HimKosh verification error");
     res.status(500).json({ 
       error: 'Verification failed',
       details: error instanceof Error ? error.message : 'Unknown error'
@@ -859,14 +845,30 @@ router.post('/verify/:appRefNo', async (req, res) => {
  */
 router.get('/transactions', async (req, res) => {
   try {
+    const limitParam = parseInt(String(req.query?.limit ?? ""), 10);
+    const offsetParam = parseInt(String(req.query?.offset ?? ""), 10);
+    const limit = Number.isFinite(limitParam) ? Math.min(Math.max(limitParam, 1), 200) : 50;
+    const offset = Number.isFinite(offsetParam) ? Math.max(offsetParam, 0) : 0;
+
+    const [countResult] = await db
+      .select({ count: sql<string>`count(*)` })
+      .from(himkoshTransactions);
+
     const transactions = await db
       .select()
       .from(himkoshTransactions)
-      .orderBy(himkoshTransactions.createdAt);
+      .orderBy(desc(himkoshTransactions.createdAt))
+      .limit(limit)
+      .offset(offset);
 
-    res.json(transactions);
+    res.json({
+      transactions,
+      total: Number(countResult?.count ?? 0),
+      limit,
+      offset,
+    });
   } catch (error) {
-    console.error('Error fetching transactions:', error);
+    himkoshLogger.error({ err: error, route: req.path }, "Error fetching transactions");
     res.status(500).json({ error: 'Failed to fetch transactions' });
   }
 });
@@ -891,7 +893,7 @@ router.get('/transaction/:appRefNo', async (req, res) => {
 
     res.json(transaction);
   } catch (error) {
-    console.error('Error fetching transaction:', error);
+    himkoshLogger.error({ err: error, route: req.path, appRefNo: req.params?.appRefNo }, "Error fetching transaction");
     res.status(500).json({ error: 'Failed to fetch transaction' });
   }
 });
@@ -951,7 +953,7 @@ router.get('/application/:applicationId/transactions', async (req, res) => {
 
     res.json({ transactions });
   } catch (error) {
-    console.error('Error fetching application transactions:', error);
+    himkoshLogger.error({ err: error, route: req.path, applicationId: req.params?.applicationId }, "Error fetching application transactions");
     res.status(500).json({ error: 'Failed to fetch transactions' });
   }
 });
@@ -1032,7 +1034,7 @@ router.post('/application/:applicationId/reset', async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.error('Error resetting HimKosh transaction:', error);
+    himkoshLogger.error({ err: error, route: req.path, applicationId: req.params?.applicationId }, "Error resetting HimKosh transaction");
     res.status(500).json({ error: 'Failed to reset transaction' });
   }
 });
@@ -1041,8 +1043,8 @@ router.post('/application/:applicationId/reset', async (req, res) => {
  * GET /api/himkosh/config/status
  * Check HimKosh configuration status
  */
-router.get('/config/status', (req, res) => {
-  const config = getHimKoshConfig();
+router.get('/config/status', async (req, res) => {
+  const { config } = await resolveHimkoshGatewayConfig();
   res.json({
     configured: config.isConfigured,
     merchantCode: config.merchantCode,
@@ -1075,12 +1077,14 @@ router.post('/test-callback-url', async (req, res) => {
       return res.status(404).json({ error: 'Application not found' });
     }
 
-    const config = getHimKoshConfig();
+    const { config } = await resolveHimkoshGatewayConfig();
 
     // Look up DDO code
     let ddoCode = config.ddo;
     if (application.district) {
-      const ddoMapping = await resolveDistrictDdo(application.district);
+      const routedDistrict =
+        deriveDistrictRoutingLabel(application.district, application.tehsil) ?? application.district;
+      const ddoMapping = await resolveDistrictDdo(routedDistrict);
       
       if (ddoMapping) {
         ddoCode = ddoMapping.ddoCode;
@@ -1131,10 +1135,12 @@ router.post('/test-callback-url', async (req, res) => {
     // Encrypt
     const encrypted = await crypto.encrypt(fullStringWithChecksum);
 
-    console.log('[himkosh-test] Testing callback URL:', callbackUrl);
-    console.log('[himkosh-test] CORE string (for checksum):', coreString);
-    console.log('[himkosh-test] FULL string (before checksum):', fullString);
-    console.log('[himkosh-test] Checksum (on CORE only):', checksumCalc);
+    logPaymentTrace("[himkosh-test] Callback dry-run", {
+      callbackUrl,
+      coreString,
+      fullString,
+      checksum: checksumCalc,
+    });
 
     res.json({
       success: true,
@@ -1149,7 +1155,7 @@ router.post('/test-callback-url', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('[himkosh-test] Error:', error);
+    himkoshLogger.error({ err: error, route: req.path }, "[himkosh-test] Error generating payload");
     res.status(500).json({ error: 'Failed to generate test data' });
   }
 });

@@ -3,15 +3,22 @@ import { useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { 
-  Home as HomeIcon, 
-  Clock, 
-  FileText, 
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Home as HomeIcon,
+  Clock,
+  FileText,
   CheckCircle,
   Search,
   ShieldCheck,
   TrendingUp,
-  Award
+  Award,
+  ChevronDown,
 } from "lucide-react";
 import { NavigationHeader } from "@/components/navigation-header";
 import { ThemeSwitcher } from "@/components/theme-switcher";
@@ -40,6 +47,12 @@ export default function HomePage() {
   const [applicationNumber, setApplicationNumber] = useState("");
   const [certificateNumber, setCertificateNumber] = useState("");
   const [showCmSlide, setShowCmSlide] = useState(false);
+  const handleScrollTo = (anchor: string) => {
+    const el = document.getElementById(anchor);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
 
   // Fetch live production stats from scraper
   const stats = FALLBACK_STATS;
@@ -79,8 +92,47 @@ export default function HomePage() {
         actions={
           <div className="flex gap-3">
             <ThemeSwitcher />
-            <Button variant="outline" onClick={() => setLocation("/login")} data-testid="button-login">
-              Sign In
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" className="hidden md:flex items-center gap-1">
+                  Applications <ChevronDown className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuItem onClick={() => handleScrollTo("stats")}>
+                  Application Status
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleScrollTo("tracking-section")}>
+                  Application Tracking
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => handleScrollTo("tracking-section")}>
+                  Check Certificates
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => alert("Checklist coming soon")}>
+                  Procedure & Checklist
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" className="hidden md:flex items-center gap-1">
+                  Login <ChevronDown className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-40">
+                <DropdownMenuItem onClick={() => setLocation("/login")}>
+                  Owner Login
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setLocation("/login?role=officer")}>
+                  Officer Login
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button variant="ghost" className="hidden md:inline-flex" onClick={() => alert("Contact info coming soon")}>
+              Contact
+            </Button>
+            <Button variant="outline" onClick={() => setLocation("/sandbox/landing")}>
+              Sandbox
             </Button>
             <Button onClick={() => setLocation("/register")} data-testid="button-register">
               Register
@@ -140,7 +192,7 @@ export default function HomePage() {
       </section>
 
       {/* Live Statistics Dashboard */}
-      <section className="py-12 px-4 bg-muted/30">
+      <section className="py-12 px-4 bg-muted/30" id="stats">
         <div className="max-w-6xl mx-auto">
           <h2 className="text-2xl font-bold text-center mb-8">Live Portal Statistics</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -277,7 +329,7 @@ export default function HomePage() {
       </section>
 
       {/* Application Tracking & Certificate Verification */}
-      <section className="py-12 px-4 bg-muted/30">
+      <section className="py-12 px-4 bg-muted/30" id="tracking-section">
         <div className="max-w-6xl mx-auto">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             <Card className="shadow-md border">

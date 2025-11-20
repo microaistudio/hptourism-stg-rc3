@@ -3,5 +3,11 @@ dist
 .DS_Store
 server/public
 vite.config.ts.*
-*.tar.gzserver/himkosh/echallan.key
+*.tar.gz
+server/himkosh/echallan.key
 .pm2
+local-object-storage/
+tmp/
+attached_assets/
+docs/smoke-reports/
+logs/

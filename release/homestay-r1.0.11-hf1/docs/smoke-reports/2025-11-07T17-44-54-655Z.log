@@ -1,0 +1,17 @@
+[2025-11-07T17:44:54.656Z] Smoke test 2025-11-07T17-44-54-655Z triggered from admin console.
+[2025-11-07T17:44:54.672Z] [smoke-cleanup] Owners: 1, applications removed: 1, local files deleted: 0
+[2025-11-07T17:44:54Z] Starting smoke test run 2025-11-07T17-44-54-655Z...
+
+> rest-express@1.0.0 smoke
+> tsx scripts/smoke-test.ts
+
+🔐 Logging in as owner/DA/DTDO…
+✅ Sessions acquired.
+❌ Gold MC New failed: DTDO accept failed for d9666d76-69c2-4436-b6bc-28ac48396efd: 403 {"message":"You can only process applications from your district"}
+❌ Diamond TCP New failed: Failed to submit application for Diamond TCP New: Conflict
+❌ Silver GP Add Rooms failed: Failed to submit application for Silver GP Add Rooms: Conflict
+❌ Gold MC Delete Rooms failed: Failed to submit application for Gold MC Delete Rooms: Conflict
+❌ Silver GP Renewal failed: Failed to submit application for Silver GP Renewal: Conflict
+📄 Smoke report written to docs/smoke-reports/2025-11-07T17-44-55-375Z/report.json
+❌ Smoke-test detected failures. See report for details.
+[2025-11-07T17:44:56.313Z] Smoke test 2025-11-07T17-44-54-655Z finished with exit code 1

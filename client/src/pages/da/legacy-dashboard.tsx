@@ -4,6 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { FileText, AlertCircle, Share2, CheckCircle, Loader2, RefreshCw, type LucideIcon } from "lucide-react";
+import { Link } from "wouter";
 import type { HomestayApplication } from "@shared/schema";
 import { isLegacyApplication } from "@shared/legacy";
 import { ApplicationPipelineRow, type PipelineApplication } from "@/components/application/application-pipeline-row";
@@ -307,17 +308,30 @@ export default function DALegacyDashboard() {
 
   return (
     <div className="container mx-auto p-6 max-w-6xl space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h1 className="text-3xl font-bold">Existing RC Registration Desk</h1>
           <p className="text-muted-foreground">
             {user?.user?.district || "District"} – Current license validation
           </p>
         </div>
-        <Button variant="outline" onClick={handleRefresh} className="w-fit">
-          <RefreshCw className="w-4 h-4 mr-2" />
-          Refresh
-        </Button>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="inline-flex items-center rounded-full border bg-muted/40 text-xs font-semibold">
+            <Link
+              href="/da/dashboard"
+              className="px-3 py-1.5 rounded-full text-muted-foreground hover:text-primary transition-colors"
+            >
+              Next-gen view
+            </Link>
+            <span className="px-3 py-1.5 rounded-full bg-background shadow-sm text-foreground">
+              Classic view
+            </span>
+          </div>
+          <Button variant="outline" onClick={handleRefresh} className="w-full sm:w-fit">
+            <RefreshCw className="w-4 h-4 mr-2" />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {forwardEnabled === false && (

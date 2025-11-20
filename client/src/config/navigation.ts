@@ -1,4 +1,28 @@
-import { Home, FileText, Bell, BarChart3, BarChart, Users, ClipboardList, Settings, Database, ClipboardCheck, User, Activity, MapPin, Search, Download } from "lucide-react";
+import {
+  Home,
+  FileText,
+  Bell,
+  BarChart3,
+  BarChart,
+  Users,
+  ClipboardList,
+  Settings,
+  Database,
+  ClipboardCheck,
+  User,
+  Activity,
+  MapPin,
+  Search,
+  Download,
+  Shield,
+  RefreshCw,
+  CreditCard,
+  MessageSquare,
+  Lock,
+  FileArchive,
+  TestTube,
+  Server,
+} from "lucide-react";
 import { LucideIcon } from "lucide-react";
 
 export interface NavItem {
@@ -31,7 +55,7 @@ export const ownerNavigation: NavSection[] = [
     ],
   },
   {
-    title: "Current License Holders",
+    title: "Current Homestay/B&B License Holders",
     items: [
       {
         title: "Existing RC Registration",
@@ -133,6 +157,19 @@ export const superAdminNavigation: NavSection[] = [
     ],
   },
   {
+    title: "Super Console",
+    items: [
+      { title: "System Status", url: "/admin/super-console#system-overview", icon: Database },
+      { title: "Reset & Seeds", url: "/admin/super-console#reset-zone", icon: RefreshCw },
+      { title: "Payments", url: "/admin/super-console#payment-settings", icon: CreditCard },
+      { title: "Communications", url: "/admin/super-console#communications", icon: MessageSquare },
+      { title: "Security", url: "/admin/super-console#security", icon: Shield },
+      { title: "District Staff", url: "/admin/super-console#staff-tools", icon: Users },
+      { title: "Smoke Tests", url: "/admin/super-console#smoke-tests", icon: Server },
+      { title: "Test Data", url: "/admin/super-console#test-data", icon: TestTube },
+    ],
+  },
+  {
     title: "Analytics",
     items: [
       {
@@ -187,7 +224,7 @@ export const daNavigation: NavSection[] = [
     ],
   },
   {
-    title: "Current License Holders",
+    title: "Current Homestay/B&B License Holders",
     items: [
       {
         title: "Existing RC Registration",
@@ -231,7 +268,7 @@ export const dtdoNavigation: NavSection[] = [
     ],
   },
   {
-    title: "Current License Holders",
+    title: "Current Homestay/B&B License Holders",
     items: [
       {
         title: "Existing RC Queue",

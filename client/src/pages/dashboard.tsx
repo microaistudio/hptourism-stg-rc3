@@ -1,19 +1,89 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Plus, FileText, Clock, CheckCircle2, XCircle, AlertCircle, RefreshCw, CreditCard, Download } from "lucide-react";
+import { Plus, FileText, Clock, CheckCircle2, XCircle, AlertCircle, RefreshCw, CreditCard, Download, Copy } from "lucide-react";
 import type { User, HomestayApplication } from "@shared/schema";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { cn } from "@/lib/utils";
+import { ServiceCenterPanel } from "@/components/dashboard/service-center";
 
 type FilterType = 'all' | 'draft' | 'pending' | 'approved' | 'rejected' | 'sent_back' | 'payment_pending' | 'pending_review' | 'inspection';
+
+const ownerProgressMilestones = [
+  { id: "da_review", label: "With Dealing Assistant" },
+  { id: "forwarded_dtdo", label: "Forwarded to DTDO" },
+  { id: "inspection_scheduled", label: "Inspection Scheduled" },
+  { id: "inspection_completed", label: "Inspection Completed" },
+  { id: "payment_pending", label: "Payment Pending" },
+  { id: "certificate", label: "Registration Approved" },
+] as const;
+
+const statusToMilestoneIndex: Record<string, number> = {
+  draft: 0,
+  submitted: 0,
+  district_review: 0,
+  sent_back_for_corrections: 0,
+  reverted_to_applicant: 0,
+  state_review: 1,
+  reverted_by_dtdo: 1,
+  inspection_scheduled: 2,
+  inspection_completed: 3,
+  payment_pending: 4,
+  verified_for_payment: 4,
+  approved: 5,
+  rejected: 5,
+};
+
+const progressSummaryMap: Record<string, string> = {
+  draft: "Complete the draft to submit your application.",
+  submitted: "Your application is with the Dealing Assistant for review.",
+  district_review: "Your application is with the Dealing Assistant for review.",
+  state_review: "Your application is with the DTDO for decision.",
+  sent_back_for_corrections: "Action required: update the application with the requested corrections.",
+  reverted_to_applicant: "Action required: update the application with the requested corrections.",
+  reverted_by_dtdo: "DTDO requested revisions — please review the remarks.",
+  inspection_scheduled: "The inspection has been scheduled. Keep an eye on notifications.",
+  inspection_completed: "Inspection finished. Awaiting final payment instructions.",
+  payment_pending: "Complete the payment to receive your registration certificate.",
+  verified_for_payment: "Payment verified — certificate will unlock shortly.",
+  approved: "Certificate is ready for download.",
+  rejected: "Application closed. Contact support for clarifications.",
+};
+
+const defaultProgressSummary = "We'll keep this tracker updated and notify you when action is needed.";
+
+const getOwnerProgressState = (app: HomestayApplication) => {
+  const status = app.status;
+  let stageIndex = status ? statusToMilestoneIndex[status] ?? 0 : 0;
+  if (app.siteInspectionCompletedDate) {
+    stageIndex = Math.max(stageIndex, 3);
+  } else if (app.siteInspectionScheduledDate) {
+    stageIndex = Math.max(stageIndex, 2);
+  }
+  if (app.status === "payment_pending" || app.status === "verified_for_payment") {
+    stageIndex = Math.max(stageIndex, 4);
+  }
+  if (app.approvedAt || app.status === "approved") {
+    stageIndex = Math.max(stageIndex, 5);
+  }
+  const maxStageIndex = ownerProgressMilestones.length - 1;
+  const boundedIndex = Math.min(Math.max(stageIndex, 0), maxStageIndex);
+  const summary = (status && progressSummaryMap[status]) || defaultProgressSummary;
+
+  return {
+    stageIndex: boundedIndex,
+    summary,
+  };
+};
 
 export default function Dashboard() {
   const [location, setLocation] = useLocation();
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
+  const [copiedValue, setCopiedValue] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const handleRefresh = () => {
     queryClient.invalidateQueries({ queryKey: ["/api/applications"] });
@@ -40,6 +110,18 @@ export default function Dashboard() {
   const paymentApplicationNumber = searchParams.get("appNo");
   const paymentSuccess = paymentQuery === "success" && !!paymentApplicationId;
   const paymentFailed = paymentQuery === "failed" && !!paymentApplicationId;
+  const handleCopy = async (value?: string | null) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedValue(value);
+      window.setTimeout(() => {
+        setCopiedValue((current) => (current === value ? null : current));
+      }, 1500);
+    } catch {
+      setCopiedValue(null);
+    }
+  };
 
   useEffect(() => {
     if (paymentQuery) {
@@ -70,6 +152,8 @@ export default function Dashboard() {
 
   const user = userData.user;
   const applications = applicationsData?.applications || [];
+  const primaryOwnerApplication =
+    user.role === "property_owner" && applications.length > 0 ? applications[0] : null;
   
   // Separate drafts from submitted applications
   const draftApplications = applications.filter(a => a.status === 'draft');
@@ -123,6 +207,7 @@ export default function Dashboard() {
     draft: applications.filter(a => a.status === 'draft').length,
     sentBack: applications.filter(a => a.status === 'sent_back_for_corrections' || a.status === 'reverted_to_applicant' || a.status === 'reverted_by_dtdo').length,
     paymentPending: applications.filter(a => a.status === 'payment_pending' || a.status === 'verified_for_payment').length,
+    inspectionScheduled: applications.filter(a => a.status === 'inspection_scheduled').length,
     pending: applications.filter(a => a.status === 'submitted' || a.status === 'district_review' || a.status === 'state_review' || a.status === 'inspection_scheduled' || a.status === 'inspection_completed' || a.status === 'reverted_to_applicant' || a.status === 'reverted_by_dtdo').length,
     approved: applications.filter(a => a.status === 'approved').length,
     rejected: applications.filter(a => a.status === 'rejected').length,
@@ -177,7 +262,7 @@ export default function Dashboard() {
                 Download your certificate from the application card below.
               </AlertDescription>
             </div>
-            <div className="mt-3 flex gap-2">
+            <div className="mt-3 flex flex-wrap gap-2">
               <Button
                 size="sm"
                 onClick={() => setLocation(`/applications/${paymentApplicationId}`)}
@@ -185,6 +270,14 @@ export default function Dashboard() {
               >
                 <Download className="w-4 h-4 mr-2" />
                 Download Certificate
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleCopy(paymentApplicationNumber || paymentApplicationId)}
+              >
+                <Copy className="w-4 h-4 mr-2" />
+                Copy Application #
               </Button>
             </div>
           </Alert>
@@ -200,8 +293,27 @@ export default function Dashboard() {
                 Please try again or contact support with your HimKosh reference ID.
               </AlertDescription>
             </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setLocation(`/applications/${paymentApplicationId}/payment-himkosh`)}
+              >
+                Retry Payment
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => handleCopy(paymentApplicationNumber || paymentApplicationId)}
+              >
+                <Copy className="w-4 h-4 mr-2" />
+                Copy Application #
+              </Button>
+            </div>
           </Alert>
         )}
+
+        {user.role === 'property_owner' && <ServiceCenterPanel />}
 
         <div className="flex items-center justify-between mb-6">
           <div>
@@ -230,7 +342,22 @@ export default function Dashboard() {
             </Button>
             {user.role === 'property_owner' && (
               <Button
-                onClick={() => setLocation("/applications/new")}
+                variant="secondary"
+                onClick={() => setLocation("/existing-owner")}
+                data-testid="button-existing-rc-registration"
+              >
+                Existing RC Registration
+              </Button>
+            )}
+            {user.role === 'property_owner' && (
+              <Button
+                onClick={() => {
+                  if (primaryOwnerApplication) {
+                    setLocation(`/applications/${primaryOwnerApplication.id}`);
+                    return;
+                  }
+                  setLocation("/applications/new");
+                }}
                 data-testid="button-new-application"
               >
                 <Plus className="w-4 h-4 mr-2" />
@@ -298,6 +425,41 @@ export default function Dashboard() {
               >
                 <RefreshCw className="w-4 h-4 mr-2" />
                 View and Update Application
+              </Button>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Inspection Acknowledgement Alert */}
+        {user.role === 'property_owner' && stats.inspectionScheduled > 0 && (
+          <Card className="mb-6 border border-cyan-100 bg-cyan-50">
+            <CardHeader>
+              <div className="flex items-center gap-2">
+                <Clock className="w-5 h-5 text-cyan-700" />
+                <CardTitle className="text-cyan-800">Inspection Scheduled</CardTitle>
+              </div>
+              <CardDescription>
+                {stats.inspectionScheduled > 1
+                  ? `${stats.inspectionScheduled} inspections need your acknowledgement`
+                  : "Please acknowledge the scheduled inspection so the team can visit."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-cyan-900/80 mb-3">
+                Confirming the schedule helps the district team plan their visit. Tap below to review the details.
+              </p>
+              <Button
+                className="bg-cyan-700 hover:bg-cyan-800 text-white"
+                onClick={() => {
+                  const inspectionApp = applications.find(a => a.status === 'inspection_scheduled');
+                  if (inspectionApp) {
+                    setLocation(`/applications/${inspectionApp.id}`);
+                  } else if (applications.length > 0) {
+                    setLocation(`/applications/${applications[0].id}`);
+                  }
+                }}
+              >
+                Review Schedule
               </Button>
             </CardContent>
           </Card>
@@ -503,6 +665,11 @@ export default function Dashboard() {
               <div className="space-y-3">
                 {filteredApplications.map((app) => {
                   const isHighlighted = paymentSuccess && paymentApplicationId === app.id;
+                  const progressState = getOwnerProgressState(app);
+                  const progressSummaryText =
+                    app.status === 'approved' && app.certificateNumber
+                      ? `Certificate ${app.certificateNumber} is ready for download.`
+                      : progressState.summary;
                   return (
                   <div
                     key={app.id}
@@ -531,14 +698,101 @@ export default function Dashboard() {
                           </Badge>
                         )}
                       </div>
-                      <p className="text-sm text-muted-foreground">
-                        {app.applicationNumber} • {app.district} • {app.totalRooms} rooms
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                        <span>{app.applicationNumber}</span>
+                        {app.applicationNumber && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 text-muted-foreground"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleCopy(app.applicationNumber);
+                            }}
+                            aria-label={`Copy application ${app.applicationNumber}`}
+                          >
+                            <Copy
+                              className={`h-4 w-4 ${
+                                copiedValue === app.applicationNumber ? "text-green-600" : ""
+                              }`}
+                            />
+                          </Button>
+                        )}
+                        <span>• {app.district || "District TBD"}</span>
+                        <span>• {app.totalRooms} rooms</span>
+                      </div>
+                      {app.status === 'verified_for_payment' && (
+                        <p className="text-xs text-green-600 mt-1">
+                          Payment verified — certificate will unlock shortly.
+                        </p>
+                      )}
                       {(app.status === 'sent_back_for_corrections' || app.status === 'reverted_to_applicant' || app.status === 'reverted_by_dtdo') && (app.clarificationRequested || (app as any).dtdoRemarks) && (
                         <p className="text-sm text-amber-600 mt-1">
                           <AlertCircle className="w-3 h-3 inline mr-1" />
                           {app.clarificationRequested || (app as any).dtdoRemarks}
                         </p>
+                      )}
+                      {user.role === 'property_owner' && (
+                        <div
+                          className="mt-4 rounded-2xl border bg-white px-4 py-3 shadow-sm dark:bg-card"
+                          data-testid={`progress-${app.id}`}
+                        >
+                          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                            Application Progress
+                          </div>
+                          <div className="mt-4">
+                            <div className="flex items-center gap-1">
+                              {ownerProgressMilestones.map((milestone, idx) => {
+                                const isCompleted = idx <= progressState.stageIndex;
+                                const isConnectorComplete = idx < progressState.stageIndex;
+                                const isLast = idx === ownerProgressMilestones.length - 1;
+                                return (
+                                  <Fragment key={milestone.id}>
+                                    <div
+                                      className={cn(
+                                        "flex h-5 w-5 items-center justify-center rounded-full border-2 bg-background text-[10px] font-semibold transition-colors",
+                                        isCompleted
+                                          ? "border-primary bg-primary text-white shadow-[0_0_0_4px_rgba(34,197,94,0.15)] dark:shadow-[0_0_0_4px_rgba(16,185,129,0.35)]"
+                                          : "border-muted-foreground/30 text-muted-foreground",
+                                      )}
+                                    >
+                                      {isCompleted && <span className="h-1.5 w-1.5 rounded-full bg-white" />}
+                                    </div>
+                                    {!isLast && (
+                                      <div
+                                        className={cn(
+                                          "h-[3px] flex-1 rounded-full transition-all",
+                                          isConnectorComplete
+                                            ? "bg-gradient-to-r from-emerald-200 via-emerald-300 to-emerald-500"
+                                            : "bg-muted-foreground/20",
+                                        )}
+                                      />
+                                    )}
+                                  </Fragment>
+                                );
+                              })}
+                            </div>
+                            <div
+                              className="mt-3 grid gap-2 text-center text-[10px] font-semibold uppercase tracking-wide text-muted-foreground"
+                              style={{
+                                gridTemplateColumns: `repeat(${ownerProgressMilestones.length}, minmax(0, 1fr))`,
+                              }}
+                            >
+                              {ownerProgressMilestones.map((milestone, idx) => (
+                                <span
+                                  key={`${milestone.id}-label`}
+                                  className={cn(
+                                    "leading-tight",
+                                    idx <= progressState.stageIndex ? "text-primary" : "text-muted-foreground",
+                                  )}
+                                >
+                                  {milestone.label}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                          <p className="mt-4 text-sm text-muted-foreground">{progressSummaryText}</p>
+                        </div>
                       )}
                     </div>
                     {app.status === 'draft' ? (

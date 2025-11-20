@@ -23,9 +23,16 @@ import WorkflowMonitoring from "@/pages/workflow-monitoring";
 import PaymentVerification from "@/pages/payment-verification";
 import AdminUsers from "@/pages/admin/users";
 import AdminConsole from "@/pages/admin/console";
+import AdminConsoleOld from "@/pages/admin/console-old";
 import AdminLGDImport from "@/pages/admin/lgd-import";
+import AdminAuditLog from "@/pages/admin/audit-log";
+import AdminRcApplications from "@/pages/admin/rc-applications";
+import AdminRcApplicationDetail from "@/pages/admin/rc-application-detail";
+import AdminRcApplicationCertificate from "@/pages/admin/rc-application-certificate";
+import LegacyOwnerSupport from "@/pages/admin/legacy-owner-support";
 import SuperAdminConsole from "@/pages/admin/super-admin-console";
 import SuperAdminDashboard from "@/pages/admin/super-admin-dashboard";
+import SuperAdminDashboardOld from "@/pages/admin/super-admin-dashboard-old";
 import DADashboard from "@/pages/da/dashboard";
 import DALegacyDashboard from "@/pages/da/legacy-dashboard";
 import DAApplicationDetail from "@/pages/da/application-detail";
@@ -41,6 +48,7 @@ import OfficerApplicationSearch from "@/pages/officer-application-search";
 import TestAPI from "@/pages/test-api";
 import HimKoshTest from "@/pages/himkosh-test";
 import ExistingOwnerOnboarding from "@/pages/existing-owner-onboarding";
+import SandboxLandingPage from "@/pages/sandbox/landing";
 import type { User } from "@shared/schema";
 
 interface ProtectedRouteProps {
@@ -96,6 +104,7 @@ function Router() {
       <Route path="/properties/:id" component={PublicPropertyDetail} />
       <Route path="/login" component={Login} />
       <Route path="/register" component={Register} />
+      <Route path="/sandbox/landing" component={SandboxLandingPage} />
       
       {/* Protected Routes - All wrapped in AuthLayout */}
       {/* Property Owner Routes */}
@@ -136,13 +145,37 @@ function Router() {
       <Route path="/admin/console">
         {() => <ProtectedRoute component={AdminConsole} allowedRoles={['admin', 'super_admin']} />}
       </Route>
+      <Route path="/admin/console-old">
+        {() => <ProtectedRoute component={AdminConsoleOld} allowedRoles={['admin', 'super_admin']} />}
+      </Route>
       <Route path="/admin/lgd-import">
         {() => <ProtectedRoute component={AdminLGDImport} allowedRoles={['admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/audit-log">
+        {() => <ProtectedRoute component={AdminAuditLog} allowedRoles={['admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/rc-applications">
+        {() => <ProtectedRoute component={AdminRcApplications} allowedRoles={['admin_rc', 'admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/rc-applications/:id">
+        {() => <ProtectedRoute component={AdminRcApplicationDetail} allowedRoles={['admin_rc', 'admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/rc-applications/:id/certificate">
+        {() => <ProtectedRoute component={AdminRcApplicationCertificate} allowedRoles={['admin_rc', 'admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/rc-application-certificate">
+        {() => <ProtectedRoute component={AdminRcApplicationCertificate} allowedRoles={['admin_rc', 'admin', 'super_admin']} />}
+      </Route>
+      <Route path="/admin/legacy-owner-support">
+        {() => <ProtectedRoute component={LegacyOwnerSupport} allowedRoles={['admin', 'super_admin']} />}
       </Route>
       
       {/* Super Admin Only Routes */}
       <Route path="/admin/super-dashboard">
         {() => <ProtectedRoute component={SuperAdminDashboard} allowedRoles={['super_admin']} />}
+      </Route>
+      <Route path="/admin/super-dashboard-old">
+        {() => <ProtectedRoute component={SuperAdminDashboardOld} allowedRoles={['super_admin']} />}
       </Route>
       <Route path="/admin/super-console">
         {() => <ProtectedRoute component={SuperAdminConsole} allowedRoles={['super_admin']} />}

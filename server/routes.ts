@@ -2,9 +2,24 @@ import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import session from "express-session";
 import connectPgSimple from "connect-pg-simple";
+import { Pool as PgPool } from "pg";
 import { pool, db } from "./db";
 import { storage } from "./storage";
 import { logApplicationAction } from "./audit";
+import { logger, logHttpTrace } from "./logger";
+import { authRateLimiter, uploadRateLimiter } from "./security/rateLimit";
+import { config as appConfig } from "@shared/config";
+import {
+  HIMKOSH_GATEWAY_SETTING_KEY,
+  HimkoshGatewaySettingValue,
+  resolveHimkoshGatewayConfig,
+  trimMaybe as trimHimkoshString,
+  parseOptionalNumber as parseOptionalHimkoshNumber,
+} from "./himkosh/gatewayConfig";
+import { HimKoshCrypto, buildRequestString } from "./himkosh/crypto";
+import { fetchAllDdoCodes, resolveDistrictDdo } from "./himkosh/ddo";
+import type { DbConnectionRecord } from "@shared/dbConfig";
+import { updateDbEnvFiles } from "./dbConfigManager";
 import {
   insertUserSchema,
   type User,
@@ -64,17 +79,24 @@ import {
   normalizeBooleanSetting,
   normalizeIsoDateSetting,
 } from "@shared/appSettings";
+import { deriveDistrictRoutingLabel } from "@shared/districtRouting";
 import { isLegacyApplication as isLegacyApplicationRecord } from "@shared/legacy";
 import express from "express";
-import { randomUUID, randomInt } from "crypto";
+import { randomUUID, randomInt, createHash } from "crypto";
 import path from "path";
 import fs from "fs";
 import fsPromises from "fs/promises";
 import { z } from "zod";
 import bcrypt from "bcrypt";
-import { eq, desc, ne, notInArray, and, or, sql, gte, lte, like, ilike, inArray, type AnyColumn } from "drizzle-orm";
+import { eq, desc, asc, ne, notInArray, and, or, sql, gte, lte, like, ilike, inArray, type AnyColumn } from "drizzle-orm";
 import { startScraperScheduler } from "./scraper";
 import { ObjectStorageService, OBJECT_STORAGE_MODE, LOCAL_OBJECT_DIR, LOCAL_MAX_UPLOAD_BYTES } from "./objectStorage";
+import {
+  linkDocumentToStorage,
+  buildLocalObjectKey,
+  upsertStorageMetadata,
+  markStorageObjectAccessed,
+} from "./storageManifest";
 import { differenceInCalendarDays, format, subDays } from "date-fns";
 import {
   DEFAULT_EMAIL_BODY,
@@ -83,8 +105,10 @@ import {
   sendTestEmail,
   sendTestSms,
   sendTwilioSms,
+  sendNicV2Sms,
   type EmailGatewaySettings,
   type SmsGatewaySettings,
+  type SmsGatewayV2Settings,
   type TwilioGatewaySettings,
 } from "./services/communications";
 import himkoshRoutes from "./himkosh/routes";
@@ -100,6 +124,86 @@ import "./staffManifestSync";
 
 const CORRECTION_CONSENT_TEXT =
   "I confirm that every issue highlighted by DA/DTDO has been fully addressed. I understand that my application may be rejected if the corrections remain unsatisfactory.";
+
+const routeLog = logger.child({ module: "routes" });
+const adminHimkoshCrypto = new HimKoshCrypto();
+const DB_CONNECTION_SETTING_KEY = "db_connection_settings";
+
+type DbConnectionSettingValue = DbConnectionRecord;
+
+const parseDatabaseUrlFromEnv = (): DbConnectionSettingValue | null => {
+  try {
+    const urlString = appConfig.database.url;
+    if (!urlString) {
+      return null;
+    }
+    const parsed = new URL(urlString);
+    const database = parsed.pathname.replace(/^\//, "");
+    if (!parsed.hostname || !database || !parsed.username) {
+      return null;
+    }
+    return {
+      host: parsed.hostname,
+      port: parsed.port ? Number(parsed.port) : 5432,
+      database,
+      user: decodeURIComponent(parsed.username),
+      password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+      lastAppliedAt: null,
+      lastVerifiedAt: null,
+      lastVerificationResult: null,
+      lastVerificationMessage: null,
+    };
+  } catch (error) {
+    routeLog.warn("[db-config] Failed to parse DATABASE_URL", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+};
+
+const getDbConnectionSettings = async (): Promise<DbConnectionSettingValue | null> => {
+  const [record] = await db
+    .select()
+    .from(systemSettings)
+    .where(eq(systemSettings.settingKey, DB_CONNECTION_SETTING_KEY))
+    .limit(1);
+  if (!record?.settingValue) {
+    return null;
+  }
+  return record.settingValue as DbConnectionSettingValue;
+};
+
+const saveDbConnectionSettings = async (
+  value: DbConnectionSettingValue,
+  userId: string | null,
+) => {
+  const [existing] = await db
+    .select({ key: systemSettings.settingKey })
+    .from(systemSettings)
+    .where(eq(systemSettings.settingKey, DB_CONNECTION_SETTING_KEY))
+    .limit(1);
+
+  if (existing) {
+    await db
+      .update(systemSettings)
+      .set({
+        settingValue: value,
+        updatedAt: new Date(),
+        updatedBy: userId,
+        description: "External database connection",
+        category: "infrastructure",
+      })
+      .where(eq(systemSettings.settingKey, DB_CONNECTION_SETTING_KEY));
+  } else {
+    await db.insert(systemSettings).values({
+      settingKey: DB_CONNECTION_SETTING_KEY,
+      settingValue: value,
+      updatedBy: userId,
+      description: "External database connection",
+      category: "infrastructure",
+    });
+  }
+};
 
 // Extend express-session types
 declare module 'express-session' {
@@ -120,13 +224,22 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 // Role-based middleware
 export function requireRole(...roles: string[]) {
+  const allowedRoles = roles.includes("super_admin") ? roles : [...roles, "super_admin"];
   return async (req: Request, res: Response, next: NextFunction) => {
     if (!req.session.userId) {
       return res.status(401).json({ message: "Authentication required" });
     }
     
     const user = await storage.getUser(req.session.userId);
-    if (!user || !roles.includes(user.role)) {
+    const normalizedRole = user?.role?.trim();
+    const hasRole = !!normalizedRole && allowedRoles.includes(normalizedRole);
+    routeLog.info(
+      `[auth] ${req.method} ${req.path} user=${user?.id ?? "unknown"} role=${normalizedRole ?? "none"} allowed=${allowedRoles.join(",")}`,
+    );
+    if (!user || !hasRole) {
+      routeLog.warn(
+        `[auth] Role check failed for user=${user?.id ?? "unknown"} role=${user?.role ?? "none"} required=${allowedRoles.join(",")}`,
+      );
       return res.status(403).json({ message: "Insufficient permissions" });
     }
     
@@ -351,7 +464,7 @@ type EmailGatewaySettingValue = {
   updatedBy?: string | null;
 } & Partial<EmailGatewaySecretSettings>;
 
-type SmsGatewayProvider = "nic" | "twilio";
+type SmsGatewayProvider = "nic" | "nic_v2" | "twilio";
 
 type NicSmsGatewaySettings = SmsGatewaySettings & {
   password?: string;
@@ -364,6 +477,7 @@ type TwilioSmsGatewaySettings = TwilioGatewaySettings & {
 type SmsGatewaySettingValue = {
   provider?: SmsGatewayProvider;
   nic?: NicSmsGatewaySettings;
+  nicV2?: SmsGatewayV2Settings;
   twilio?: TwilioSmsGatewaySettings;
   updatedAt?: string;
   updatedBy?: string | null;
@@ -440,6 +554,16 @@ const sanitizeSmsGateway = (value?: SmsGatewaySettingValue | null) => {
         passwordSet: Boolean(value.nic.password),
       }
     : undefined;
+  const nicV2 = value.nicV2
+    ? {
+        username: value.nicV2.username,
+        senderId: value.nicV2.senderId,
+        templateId: value.nicV2.templateId,
+        key: value.nicV2.key,
+        postUrl: value.nicV2.postUrl,
+        passwordSet: Boolean(value.nicV2.password),
+      }
+    : undefined;
   const twilio = value.twilio
     ? {
         accountSid: value.twilio.accountSid,
@@ -451,7 +575,23 @@ const sanitizeSmsGateway = (value?: SmsGatewaySettingValue | null) => {
   return {
     provider,
     nic,
+    nicV2,
     twilio,
+  };
+};
+
+const sanitizeHimkoshGatewaySetting = (value?: HimkoshGatewaySettingValue | null) => {
+  if (!value) return null;
+  return {
+    merchantCode: value.merchantCode ?? "",
+    deptId: value.deptId ?? "",
+    serviceCode: value.serviceCode ?? "",
+    ddo: value.ddo ?? "",
+    head1: value.head1 ?? "",
+    head2: value.head2 ?? "",
+    head2Amount: typeof value.head2Amount === "number" ? value.head2Amount : null,
+    returnUrl: value.returnUrl ?? "",
+    allowFallback: value.allowFallback !== false,
   };
 };
 
@@ -525,7 +665,8 @@ const notificationEventDefinitions: NotificationEventDefinition[] = [
     id: "otp",
     label: "OTP verification",
     description: "Sent when an owner requests an OTP to access or confirm submissions.",
-    defaultSmsTemplate: DEFAULT_SMS_BODY,
+    defaultSmsTemplate:
+      "{{OTP}} is your OTP for Himachal Tourism e-services portal login. - HP Tourism E-services",
     defaultEmailSubject: "Himachal Tourism OTP",
     defaultEmailBody:
       "Hello {{OWNER_NAME}},\n\n{{OTP}} is your one-time password for Himachal Tourism eServices. It expires in 10 minutes.\n\n- Tourism Department",
@@ -712,7 +853,7 @@ const deliverNotificationSms = async (mobile: string, message: string) => {
   try {
     const record = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
     if (!record) {
-      console.warn("[notifications] SMS gateway not configured");
+      routeLog.warn("[notifications] SMS gateway not configured");
       return;
     }
     const config = (record.settingValue as SmsGatewaySettingValue) ?? {};
@@ -732,7 +873,7 @@ const deliverNotificationSms = async (mobile: string, message: string) => {
         !twilioConfig.authToken ||
         (!twilioConfig.fromNumber && !twilioConfig.messagingServiceSid)
       ) {
-        console.warn("[notifications] Twilio SMS settings incomplete");
+        routeLog.warn("[notifications] Twilio SMS settings incomplete");
         return;
       }
       await sendTwilioSms(
@@ -746,16 +887,52 @@ const deliverNotificationSms = async (mobile: string, message: string) => {
       );
       return;
     }
+    if (provider === "nic_v2") {
+      const nicV2Config =
+        config.nicV2 ??
+        ({
+          username: (config as any).username,
+          password: (config as any).password,
+          senderId: (config as any).senderId,
+          templateId: (config as any).templateId,
+          key: (config as any).key,
+          postUrl: (config as any).postUrl,
+        } as SmsGatewayV2Settings);
+      if (
+        !nicV2Config ||
+        !nicV2Config.username ||
+        !nicV2Config.password ||
+        !nicV2Config.senderId ||
+        !nicV2Config.key ||
+        !nicV2Config.templateId ||
+        !nicV2Config.postUrl
+      ) {
+        routeLog.warn("[notifications] NIC V2 SMS settings incomplete");
+        return;
+      }
+      await sendNicV2Sms(
+        {
+          username: nicV2Config.username,
+          password: nicV2Config.password,
+          senderId: nicV2Config.senderId,
+          templateId: nicV2Config.templateId,
+          key: nicV2Config.key,
+          postUrl: nicV2Config.postUrl,
+        },
+        { mobile, message },
+      );
+      return;
+    }
     const nicConfig =
       config.nic ??
-      ({
-        username: (config as any).username,
-        password: (config as any).password,
-        senderId: (config as any).senderId,
-        departmentKey: (config as any).departmentKey,
-        templateId: (config as any).templateId,
-        postUrl: (config as any).postUrl,
-      } as NicSmsGatewaySettings);
+        ({
+          username: (config as any).username,
+          password: (config as any).password,
+          senderId: (config as any).senderId,
+          departmentKey: (config as any).departmentKey,
+          templateId: (config as any).templateId,
+          postUrl: (config as any).postUrl,
+        } as NicSmsGatewaySettings);
     if (
       !nicConfig ||
       !nicConfig.username ||
@@ -765,7 +942,7 @@ const deliverNotificationSms = async (mobile: string, message: string) => {
       !nicConfig.templateId ||
       !nicConfig.postUrl
     ) {
-      console.warn("[notifications] NIC SMS settings incomplete");
+      routeLog.warn("[notifications] NIC SMS settings incomplete");
       return;
     }
     await sendTestSms(
@@ -780,7 +957,7 @@ const deliverNotificationSms = async (mobile: string, message: string) => {
       { mobile, message },
     );
   } catch (error) {
-    console.error("[notifications] Failed to send SMS:", error);
+    routeLog.error("[notifications] Failed to send SMS:", error);
   }
 };
 
@@ -788,14 +965,14 @@ const deliverNotificationEmail = async (to: string, subject: string, body: strin
   try {
     const record = await getSystemSettingRecord(EMAIL_GATEWAY_SETTING_KEY);
     if (!record) {
-      console.warn("[notifications] SMTP gateway not configured");
+      routeLog.warn("[notifications] SMTP gateway not configured");
       return;
     }
     const value = (record.settingValue as EmailGatewaySettingValue) ?? {};
     const provider: EmailGatewayProvider = value.provider ?? "custom";
     const profile = getEmailProfileFromValue(value, provider) ?? extractLegacyEmailProfile(value);
     if (!profile?.host || !profile?.fromEmail || !profile?.password) {
-      console.warn("[notifications] SMTP settings incomplete");
+      routeLog.warn("[notifications] SMTP settings incomplete");
       return;
     }
     await sendTestEmail(
@@ -813,7 +990,7 @@ const deliverNotificationEmail = async (to: string, subject: string, body: strin
       },
     );
   } catch (error) {
-    console.error("[notifications] Failed to send email:", error);
+    routeLog.error("[notifications] Failed to send email:", error);
   }
 };
 
@@ -881,7 +1058,7 @@ const queueNotification = (
   options: NotificationTriggerOptions = {},
 ) => {
   triggerNotification(eventId, options).catch((error) => {
-    console.error(`[notifications] Failed to send ${eventId} notification:`, error);
+    routeLog.error(`[notifications] Failed to send ${eventId} notification:`, error);
   });
 };
 
@@ -908,7 +1085,7 @@ async function createInAppNotification({
       channels: { inapp: true },
     });
   } catch (error) {
-    console.error("[notifications] Failed to create notification", { userId, applicationId, type, error });
+    routeLog.error("[notifications] Failed to create notification", { userId, applicationId, type, error });
   }
 }
 
@@ -1014,7 +1191,7 @@ const ensurePasswordResetTable = async () => {
     `);
     passwordResetTableReady = true;
   } catch (error) {
-    console.error("[auth] Failed to ensure password_reset_challenges table", error);
+    routeLog.error("[auth] Failed to ensure password_reset_challenges table", error);
     throw error;
   }
 };
@@ -1678,7 +1855,7 @@ const CAPTCHA_FORCE_DISABLE = (() => {
   return process.env.PORT === "4000";
 })();
 
-console.info(
+routeLog.info(
   "[captcha] configuration",
   JSON.stringify({
     port: process.env.PORT,
@@ -1708,7 +1885,7 @@ const getCaptchaSetting = async () => {
     const wasEnabled = captchaSettingCache.enabled !== false;
     updateCaptchaSettingCache(false);
     if (wasEnabled) {
-      console.info("[captcha] Force-disabled via configuration/port override");
+      routeLog.info("[captcha] Force-disabled via configuration/port override");
     }
     return false;
   }
@@ -1934,6 +2111,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
     })
   );
 
+  app.use((req, _res, next) => {
+    if (req.path.startsWith("/api/admin/settings")) {
+      logHttpTrace("request", {
+        method: req.method,
+        path: req.path,
+        userId: req.session.userId ?? "none",
+      });
+    }
+    next();
+  });
+
   const getUploadPolicy = async (): Promise<UploadPolicy> => {
     try {
       const [setting] = await db
@@ -1948,7 +2136,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       return normalizeUploadPolicy(setting.settingValue);
     } catch (error) {
-      console.error("[upload-policy] Failed to fetch policy, falling back to defaults:", error);
+      routeLog.error("[upload-policy] Failed to fetch policy, falling back to defaults:", error);
       return DEFAULT_UPLOAD_POLICY;
     }
   };
@@ -1967,7 +2155,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       return normalizeCategoryEnforcementSetting(setting.settingValue);
     } catch (error) {
-      console.error("[category-enforcement] Failed to fetch setting, falling back to defaults:", error);
+      routeLog.error("[category-enforcement] Failed to fetch setting, falling back to defaults:", error);
       return DEFAULT_CATEGORY_ENFORCEMENT;
     }
   };
@@ -1986,7 +2174,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       return normalizeCategoryRateBands(setting.settingValue);
     } catch (error) {
-      console.error("[room-rate-bands] Failed to fetch setting, falling back to defaults:", error);
+      routeLog.error("[room-rate-bands] Failed to fetch setting, falling back to defaults:", error);
       return DEFAULT_CATEGORY_RATE_BANDS;
     }
   };
@@ -2003,7 +2191,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       return normalizeRoomCalcModeSetting(setting.settingValue);
     } catch (error) {
-      console.error("[room-calc-mode] Failed to fetch setting, falling back to defaults:", error);
+      routeLog.error("[room-calc-mode] Failed to fetch setting, falling back to defaults:", error);
       return DEFAULT_ROOM_CALC_MODE;
     }
   };
@@ -2014,6 +2202,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     app.put(
       "/api/local-object/upload/:objectId",
+      uploadRateLimiter,
       requireAuth,
       rawUploadMiddleware,
       async (req, res) => {
@@ -2076,9 +2265,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const targetPath = path.join(targetDir, objectId);
           await fsPromises.writeFile(targetPath, fileBuffer);
 
+          const objectKey = buildLocalObjectKey(safeType, objectId);
+          const checksumSha256 = createHash("sha256").update(fileBuffer).digest("hex");
+          await upsertStorageMetadata({
+            objectKey,
+            storageProvider: "local",
+            fileType: safeType,
+            category,
+            mimeType: normalizedMime ?? "application/octet-stream",
+            sizeBytes,
+            checksumSha256,
+            uploadedBy: req.session.userId ?? null,
+          });
+
           res.status(200).json({ success: true });
         } catch (error) {
-          console.error("Local upload error", error);
+          routeLog.error("Local upload error", error);
           res.status(500).json({ message: "Failed to store uploaded file" });
         }
       }
@@ -2096,6 +2298,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           await fsPromises.access(filePath, fs.constants.R_OK);
 
+          void markStorageObjectAccessed(buildLocalObjectKey(safeType, objectId)).catch((err) =>
+            routeLog.error("[storage-manifest] Failed to update access timestamp:", err),
+          );
+
           const mimeOverride =
             typeof req.query.mime === "string" && isValidMimeType(req.query.mime)
               ? req.query.mime
@@ -2105,7 +2311,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
               ? sanitizeDownloadFilename(req.query.filename.trim())
               : undefined;
 
-          console.log("[object-download] query", req.query, {
+          routeLog.info("[object-download] query", req.query, {
             mimeOverride,
             filenameOverride,
             fileType,
@@ -2120,12 +2326,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
           const stream = fs.createReadStream(filePath);
           stream.on("error", (err) => {
-            console.error("Stream error", err);
+            routeLog.error("Stream error", err);
             res.destroy(err);
           });
           stream.pipe(res);
         } catch (error) {
-          console.error("Local download error", error);
+          routeLog.error("Local download error", error);
           res.status(404).json({ message: "File not found" });
         }
       }
@@ -2135,7 +2341,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Auth Routes
   
   // Register
-  app.post("/api/auth/register", async (req, res) => {
+  app.post("/api/auth/register", authRateLimiter, async (req, res) => {
     try {
       // SECURITY: Force role to property_owner BEFORE validation
       // This prevents role escalation attacks via direct API calls
@@ -2169,7 +2375,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { password, ...userWithoutPassword } = user;
       res.json({ user: userWithoutPassword });
     } catch (error) {
-      console.error('[registration] Error during registration:', error);
+      routeLog.error('[registration] Error during registration:', error);
       if (error instanceof z.ZodError) {
         return res.status(400).json({ message: error.errors[0].message, errors: error.errors });
       }
@@ -2208,7 +2414,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       req.session.captchaIssuedAt = Date.now();
       res.json({ enabled: true, question, expiresInSeconds: 300 });
     } catch (error) {
-      console.error("[auth] Failed to load captcha:", error);
+      routeLog.error("[auth] Failed to load captcha:", error);
       res.status(500).json({ message: "Captcha unavailable" });
     }
   });
@@ -2269,15 +2475,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         emailOtpEnabled: otpChannels.emailEnabled,
         otpRequired,
       };
-      console.info("[auth] login options", payload);
+      routeLog.info("[auth] login options", payload);
       res.json(payload);
     } catch (error) {
-      console.error("[auth] Failed to load login options", error);
+      routeLog.error("[auth] Failed to load login options", error);
       res.status(500).json({ message: "Unable to load login options" });
     }
   });
 
-  app.post("/api/auth/login", async (req, res) => {
+  app.post("/api/auth/login", authRateLimiter, async (req, res) => {
     try {
       const authModeRaw = typeof req.body?.authMode === "string" ? req.body.authMode.trim().toLowerCase() : "password";
       const authMode: LoginAuthMode = authModeRaw === "otp" ? "otp" : "password";
@@ -2402,7 +2608,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         try {
           return await bcrypt.compare(password, candidate.password);
         } catch (error) {
-          console.warn("[auth] Failed to compare password hash", {
+          routeLog.warn("[auth] Failed to compare password hash", {
             userId: candidate.id,
             identifier: rawIdentifier,
             error,
@@ -2424,13 +2630,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
           ) {
             user = manifestUser;
             passwordMatch = true;
-            console.info("[auth] Resolved staff login via manifest fallback", {
+            routeLog.info("[auth] Resolved staff login via manifest fallback", {
               identifier: rawIdentifier,
               mobile: manifestFromIdentifier.mobile,
             });
           }
         } catch (fallbackError) {
-          console.error("[auth] Manifest fallback failed", fallbackError);
+          routeLog.error("[auth] Manifest fallback failed", fallbackError);
         }
       }
 
@@ -2457,7 +2663,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             user = updated;
           }
         } catch (updateError) {
-          console.warn("[auth] Failed to backfill staff username", updateError);
+          routeLog.warn("[auth] Failed to backfill staff username", updateError);
         }
       }
 
@@ -2472,7 +2678,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/auth/login/verify-otp", async (req, res) => {
+  app.post("/api/auth/login/verify-otp", authRateLimiter, async (req, res) => {
     try {
       const challengeId =
         typeof req.body?.challengeId === "string" ? req.body.challengeId.trim() : "";
@@ -2524,7 +2730,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const userResponse = formatUserForResponse(user);
       res.json({ user: userResponse });
     } catch (error) {
-      console.error("[auth] OTP verification failed", error);
+      routeLog.error("[auth] OTP verification failed", error);
       res.status(500).json({ message: "OTP verification failed" });
     }
   });
@@ -2540,7 +2746,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     newPassword: z.string().min(6, "New password must be at least 6 characters"),
   });
 
-  app.post("/api/auth/password-reset/request", async (req, res) => {
+  app.post("/api/auth/password-reset/request", authRateLimiter, async (req, res) => {
     try {
       const { identifier, channel: rawChannel } = passwordResetRequestSchema.parse(req.body ?? {});
       const channel: PasswordResetChannel = rawChannel === "email" ? "email" : "sms";
@@ -2574,12 +2780,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ message: error.errors[0]?.message || "Invalid request" });
       }
-      console.error("[auth] Password reset request failed", error);
+      routeLog.error("[auth] Password reset request failed", error);
       res.status(500).json({ message: "Failed to issue reset code" });
     }
   });
 
-  app.post("/api/auth/password-reset/verify", async (req, res) => {
+  app.post("/api/auth/password-reset/verify", authRateLimiter, async (req, res) => {
     try {
       const { challengeId, otp, newPassword } = passwordResetVerifySchema.parse(req.body ?? {});
 
@@ -2626,7 +2832,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ message: error.errors[0]?.message || "Invalid reset request" });
       }
-      console.error("[auth] Password reset verify failed", error);
+      routeLog.error("[auth] Password reset verify failed", error);
       res.status(500).json({ message: "Failed to update password" });
     }
   });
@@ -2676,7 +2882,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json(profile);
     } catch (error) {
-      console.error('[profile] Error fetching profile:', error);
+      routeLog.error('[profile] Error fetching profile:', error);
       res.status(500).json({ message: "Failed to fetch profile" });
     }
   });
@@ -2745,7 +2951,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: existingProfile ? "Profile updated successfully" : "Profile created successfully" 
       });
     } catch (error) {
-      console.error('[profile] Error saving profile:', error);
+      routeLog.error('[profile] Error saving profile:', error);
       if (error instanceof z.ZodError) {
         return res.status(400).json({ 
           message: error.errors[0].message, 
@@ -2813,7 +3019,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { uploadUrl, filePath } = await objectStorageService.prepareUpload(fileType);
       res.json({ uploadUrl, filePath });
     } catch (error) {
-      console.error("Error getting upload URL:", error);
+      routeLog.error("Error getting upload URL:", error);
       res.status(500).json({ message: "Failed to get upload URL" });
     }
   });
@@ -2853,7 +3059,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         const stream = fs.createReadStream(diskPath);
         stream.on("error", (err) => {
-          console.error("[object-storage:view] stream error", err);
+          routeLog.error("[object-storage:view] stream error", err);
           res.destroy(err);
         });
 
@@ -2877,7 +3083,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Redirect to the signed URL (GCS / external storage)
       res.redirect(viewURL);
     } catch (error) {
-      console.error("Error getting view URL:", error);
+      routeLog.error("Error getting view URL:", error);
       res.status(500).json({ message: "Failed to get view URL" });
     }
   });
@@ -2887,7 +3093,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const policy = await getUploadPolicy();
       res.json(policy);
     } catch (error) {
-      console.error("[upload-policy] Failed to fetch policy:", error);
+      routeLog.error("[upload-policy] Failed to fetch policy:", error);
       res.status(500).json({ message: "Failed to fetch upload policy" });
     }
   });
@@ -2897,7 +3103,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const setting = await getCategoryEnforcementSetting();
       res.json(setting);
     } catch (error) {
-      console.error("[category-enforcement] Failed to fetch setting:", error);
+      routeLog.error("[category-enforcement] Failed to fetch setting:", error);
       res.status(500).json({ message: "Failed to fetch category enforcement setting" });
     }
   });
@@ -2907,7 +3113,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const setting = await getRoomRateBandsSetting();
       res.json(setting);
     } catch (error) {
-      console.error("[room-rate-bands] Failed to fetch setting:", error);
+      routeLog.error("[room-rate-bands] Failed to fetch setting:", error);
       res.status(500).json({ message: "Failed to fetch rate band setting" });
     }
   });
@@ -2917,7 +3123,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const setting = await getRoomCalcModeSetting();
       res.json(setting);
     } catch (error) {
-      console.error("[room-calc-mode] Failed to fetch setting:", error);
+      routeLog.error("[room-calc-mode] Failed to fetch setting:", error);
       res.status(500).json({ message: "Failed to fetch room configuration mode" });
     }
   });
@@ -2933,6 +3139,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         category: z.enum(['diamond', 'gold', 'silver']).optional(),
         address: z.string().optional(),
         district: z.string().optional(),
+        tehsil: z.string().optional(),
+        tehsilOther: z.string().optional(),
+        block: z.string().optional(),
+        blockOther: z.string().optional(),
+        gramPanchayat: z.string().optional(),
+        gramPanchayatOther: z.string().optional(),
+        urbanBody: z.string().optional(),
+        urbanBodyOther: z.string().optional(),
+        ward: z.string().optional(),
         pincode: z.string().optional(),
         locationType: z.enum(['mc', 'tcp', 'gp']).optional(),
         telephone: z.string().optional(),
@@ -3036,7 +3251,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: "Draft saved successfully. You can continue editing anytime." 
       });
     } catch (error) {
-      console.error("Draft save error:", error);
+      routeLog.error("Draft save error:", error);
       res.status(500).json({ message: "Failed to save draft" });
     }
   });
@@ -3065,6 +3280,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
         category: z.enum(['diamond', 'gold', 'silver']).optional(),
         address: z.string().optional(),
         district: z.string().optional(),
+        tehsil: z.string().optional(),
+        tehsilOther: z.string().optional(),
+        block: z.string().optional(),
+        blockOther: z.string().optional(),
+        gramPanchayat: z.string().optional(),
+        gramPanchayatOther: z.string().optional(),
+        urbanBody: z.string().optional(),
+        urbanBodyOther: z.string().optional(),
+        ward: z.string().optional(),
         pincode: z.string().optional(),
         locationType: z.enum(['mc', 'tcp', 'gp']).optional(),
         telephone: z.string().optional(),
@@ -3154,7 +3378,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: "Draft updated successfully" 
       });
     } catch (error) {
-      console.error("Draft update error:", error);
+      routeLog.error("Draft update error:", error);
       res.status(500).json({ message: "Failed to update draft" });
     }
   });
@@ -3403,7 +3627,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         tehsilOther: resolvedTehsilOther,
       } = resolveTehsilFields(rawTehsilInput, rawTehsilOtherInput);
 
-      console.log('[applications:create] incoming address', {
+      routeLog.info('[applications:create] incoming address', {
         district: validatedData.district,
         tehsil: validatedData.tehsil,
         tehsilOther: validatedData.tehsilOther,
@@ -3414,7 +3638,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         urbanBody: validatedData.urbanBody,
       });
 
-      console.log('[applications:create] tehsil normalization', {
+      routeLog.info('[applications:create] tehsil normalization', {
         district: validatedData.district,
         tehsilValueRaw: typeof rawTehsilInput === 'string' ? rawTehsilInput : null,
         tehsilOtherValueRaw: typeof rawTehsilOtherInput === 'string' ? rawTehsilOtherInput : null,
@@ -3422,12 +3646,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
         resolvedTehsilOther,
       });
 
+      const routedDistrictLabel =
+        deriveDistrictRoutingLabel(validatedData.district, resolvedTehsilValue) ??
+        validatedData.district;
+
       const applicationPayload: any = removeUndefined({
         propertyName: validatedData.propertyName,
         category: validatedData.category,
         totalRooms,
         address: validatedData.address,
-        district: validatedData.district,
+        district: routedDistrictLabel,
         block: validatedData.block || null,
         blockOther: validatedData.blockOther || null,
         gramPanchayat: validatedData.gramPanchayat || null,
@@ -3536,7 +3764,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (normalizedDocuments && normalizedDocuments.length > 0) {
         await storage.deleteDocumentsByApplication(application.id);
         for (const doc of normalizedDocuments) {
-          await storage.createDocument({
+          const createdDoc = await storage.createDocument({
             applicationId: application.id,
             documentType: doc.documentType,
             fileName: doc.fileName,
@@ -3544,6 +3772,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             fileSize: doc.fileSize,
             mimeType: doc.mimeType,
           });
+          await linkDocumentToStorage(createdDoc);
         }
       }
       const ownerForNotification = await storage.getUser(application.userId);
@@ -3563,10 +3792,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ application });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        console.error("Validation error:", error.errors);
+        routeLog.error("Validation error:", error.errors);
         return res.status(400).json({ message: error.errors[0].message });
       }
-      console.error("Application creation error:", error);
+      routeLog.error("Application creation error:", error);
       res.status(500).json({ message: "Failed to create application" });
     }
   });
@@ -3592,7 +3821,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const summaries = await Promise.all(baseApplications.map((app) => buildServiceSummary(app)));
       res.json({ applications: summaries });
     } catch (error) {
-      console.error("[service-center] Failed to fetch eligibility list", error);
+      routeLog.error("[service-center] Failed to fetch eligibility list", error);
       res.status(500).json({ message: "Failed to load service center data" });
     }
   });
@@ -3767,7 +3996,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error instanceof Error && error.message.toLowerCase().includes("room")) {
         return res.status(400).json({ message: error.message });
       }
-      console.error("[service-center] Failed to create request", error);
+      routeLog.error("[service-center] Failed to create request", error);
       res.status(500).json({ message: "Failed to create service request" });
     }
   });
@@ -3779,7 +4008,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         minIssueDate: cutoff.toISOString(),
       });
     } catch (error) {
-      console.error("[existing-owners] Failed to load intake settings:", error);
+      routeLog.error("[existing-owners] Failed to load intake settings:", error);
       res.status(500).json({ message: "Unable to load onboarding settings" });
     }
   });
@@ -3792,7 +4021,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         application,
       });
     } catch (error) {
-      console.error("[existing-owners] Failed to load active onboarding request:", error);
+      routeLog.error("[existing-owners] Failed to load active onboarding request:", error);
       res.status(500).json({ message: "Unable to load active onboarding request" });
     }
   });
@@ -3839,7 +4068,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const now = new Date();
-      const applicationNumber = generateLegacyApplicationNumber(payload.district);
+      const routedLegacyDistrict =
+        deriveDistrictRoutingLabel(payload.district, payload.tehsil) ?? payload.district;
+      const applicationNumber = generateLegacyApplicationNumber(routedLegacyDistrict);
       const sanitizedGuardian = trimOptionalString(payload.guardianName);
       const sanitizedNotes = trimOptionalString(payload.notes);
       const derivedAreaSqm = Math.max(50, payload.totalRooms * 30);
@@ -3858,7 +4089,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           doubleBedRooms: 0,
           familySuites: 0,
           attachedWashrooms: payload.totalRooms,
-          district: trimRequiredString(payload.district),
+          district: trimRequiredString(routedLegacyDistrict),
           tehsil: trimRequiredString(payload.tehsil),
           block: null,
           gramPanchayat: null,
@@ -3929,10 +4160,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }));
 
       if (certificateDocuments.length > 0) {
-        await db.insert(documents).values(certificateDocuments);
+        const insertedCertificateDocs = await db
+          .insert(documents)
+          .values(certificateDocuments)
+          .returning();
+        for (const doc of insertedCertificateDocs) {
+          await linkDocumentToStorage(doc);
+        }
       }
       if (identityProofDocuments.length > 0) {
-        await db.insert(documents).values(identityProofDocuments);
+        const insertedIdentityDocs = await db
+          .insert(documents)
+          .values(identityProofDocuments)
+          .returning();
+        for (const doc of insertedIdentityDocs) {
+          await linkDocumentToStorage(doc);
+        }
       }
 
       res.status(201).json({
@@ -3944,7 +4187,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         },
       });
     } catch (error) {
-      console.error("[existing-owners] Failed to capture onboarding request:", error);
+      routeLog.error("[existing-owners] Failed to capture onboarding request:", error);
       if (isPgUniqueViolation(error, "homestay_applications_certificate_number_key")) {
         const certificateNumber =
           typeof req.body?.rcNumber === "string" ? req.body.rcNumber : undefined;
@@ -3966,6 +4209,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid input", errors: error.flatten() });
       }
       res.status(500).json({ message: "Failed to submit onboarding request" });
+    }
+  });
+
+  app.get("/api/applications/primary", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId!;
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      if (user.role !== "property_owner") {
+        return res.json({ application: null });
+      }
+      const applications = await storage.getApplicationsByUser(userId);
+      const application = applications[0] ?? null;
+      res.json({ application });
+    } catch (error) {
+      logger.error({ err: error, route: req.path }, "[applications] Failed to fetch primary application");
+      res.status(500).json({ message: "Unable to load application overview" });
     }
   });
 
@@ -4060,7 +4322,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json(applications);
     } catch (error) {
-      console.error('[workflow-monitoring] Error fetching all applications:', error);
+      routeLog.error('[workflow-monitoring] Error fetching all applications:', error);
       res.status(500).json({ message: "Failed to fetch applications for monitoring" });
     }
   });
@@ -4183,7 +4445,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ results });
     } catch (error) {
-      console.error('[application-search] Error searching applications:', error);
+      routeLog.error('[application-search] Error searching applications:', error);
       res.status(500).json({ message: "Failed to search applications" });
     }
   });
@@ -4490,6 +4752,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
           normalizedUpdate.tehsilOther = tehsilOther;
         }
       }
+      const routedDistrictForUpdate = deriveDistrictRoutingLabel(
+        typeof normalizedUpdate.district === "string" ? normalizedUpdate.district : application.district,
+        typeof normalizedUpdate.tehsil === "string" ? normalizedUpdate.tehsil : application.tehsil,
+      );
+      if (routedDistrictForUpdate) {
+        normalizedUpdate.district = routedDistrictForUpdate;
+      }
       for (const field of decimalFields) {
         const value = normalizedUpdate[field as keyof typeof normalizedUpdate];
         if (typeof value === 'number') {
@@ -4572,7 +4841,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (normalizedDocuments) {
         await storage.deleteDocumentsByApplication(id);
         for (const doc of normalizedDocuments) {
-          await storage.createDocument({
+          const createdDoc = await storage.createDocument({
             applicationId: id,
             documentType: doc.documentType,
             fileName: doc.fileName,
@@ -4580,6 +4849,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             fileSize: doc.fileSize,
             mimeType: doc.mimeType,
           });
+          await linkDocumentToStorage(createdDoc);
         }
       }
       
@@ -4588,7 +4858,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ message: error.errors[0].message });
       }
-      console.error("Error updating application:", error);
+      routeLog.error("Error updating application:", error);
       res.status(500).json({ message: "Failed to update application" });
     }
   });
@@ -4701,7 +4971,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ application: updated, message: "Application sent back to applicant" });
     } catch (error) {
-      console.error("Send back error:", error);
+      routeLog.error("Send back error:", error);
       res.status(500).json({ message: "Failed to send back application" });
     }
   });
@@ -4755,7 +5025,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ application: updated, message: "Site inspection scheduled" });
     } catch (error) {
-      console.error("Move to inspection error:", error);
+      routeLog.error("Move to inspection error:", error);
       res.status(500).json({ message: "Failed to schedule inspection" });
     }
   });
@@ -4836,7 +5106,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ application: updated, message: "Inspection completed successfully" });
     } catch (error) {
-      console.error("Complete inspection error:", error);
+      routeLog.error("Complete inspection error:", error);
       res.status(500).json({ message: "Failed to complete inspection" });
     }
   });
@@ -4884,7 +5154,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ timeline });
     } catch (error) {
-      console.error("[timeline] Failed to fetch timeline:", error);
+      routeLog.error("[timeline] Failed to fetch timeline:", error);
       res.status(500).json({ message: "Failed to fetch timeline" });
     }
   });
@@ -4930,7 +5200,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ timeline });
     } catch (error) {
-      console.error("[dtdo timeline] Failed to fetch timeline:", error);
+      routeLog.error("[dtdo timeline] Failed to fetch timeline:", error);
       res.status(500).json({ message: "Failed to fetch timeline" });
     }
   });
@@ -5010,7 +5280,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           : null,
       });
     } catch (error) {
-      console.error("[inspection] Failed to fetch inspection report:", error);
+      routeLog.error("[inspection] Failed to fetch inspection report:", error);
       res.status(500).json({ message: "Failed to fetch inspection report" });
     }
   });
@@ -5071,7 +5341,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           errors: error.errors,
         });
       }
-      console.error("[staff-profile] Failed to update profile:", error);
+      routeLog.error("[staff-profile] Failed to update profile:", error);
       res.status(500).json({ message: "Failed to update profile" });
     }
   };
@@ -5104,7 +5374,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Password changed successfully" });
     } catch (error) {
-      console.error("[staff-profile] Failed to change password:", error);
+      routeLog.error("[staff-profile] Failed to change password:", error);
       res.status(500).json({ message: "Failed to change password" });
     }
   };
@@ -5166,7 +5436,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json(applicationsWithOwner);
     } catch (error) {
-      console.error("[da] Failed to fetch applications:", error);
+      routeLog.error("[da] Failed to fetch applications:", error);
       res.status(500).json({ message: "Failed to fetch applications" });
     }
   });
@@ -5217,7 +5487,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         correctionHistory,
       });
     } catch (error) {
-      console.error("[da] Failed to fetch application details:", error);
+      routeLog.error("[da] Failed to fetch application details:", error);
       res.status(500).json({ message: "Failed to fetch application details" });
     }
   });
@@ -5246,7 +5516,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json({ message: "Application is now under scrutiny" });
     } catch (error) {
-      console.error("[da] Failed to start scrutiny:", error);
+      routeLog.error("[da] Failed to start scrutiny:", error);
       res.status(500).json({ message: "Failed to start scrutiny" });
     }
   });
@@ -5284,7 +5554,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json({ message: "Scrutiny progress saved successfully" });
     } catch (error) {
-      console.error("[da] Failed to save scrutiny progress:", error);
+      routeLog.error("[da] Failed to save scrutiny progress:", error);
       res.status(500).json({ message: "Failed to save scrutiny progress" });
     }
   });
@@ -5354,7 +5624,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json({ message: "Application forwarded to DTDO successfully" });
     } catch (error) {
-      console.error("[da] Failed to forward to DTDO:", error);
+      routeLog.error("[da] Failed to forward to DTDO:", error);
       res.status(500).json({ message: "Failed to forward application" });
     }
   });
@@ -5396,7 +5666,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json({ message: "Application sent back to applicant successfully" });
     } catch (error) {
-      console.error("[da] Failed to send back application:", error);
+      routeLog.error("[da] Failed to send back application:", error);
       res.status(500).json({ message: "Failed to send back application" });
     }
   });
@@ -5481,7 +5751,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           application: updated ?? { ...application, ...updates },
         });
       } catch (error) {
-        console.error("[legacy] Failed to verify application:", error);
+        routeLog.error("[legacy] Failed to verify application:", error);
         res.status(500).json({ message: "Failed to verify legacy request" });
       }
     },
@@ -5502,7 +5772,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const forwardEnabled = await getLegacyForwardEnabled();
         res.json({ forwardEnabled });
       } catch (error) {
-        console.error("[legacy] Failed to load settings", error);
+        routeLog.error("[legacy] Failed to load settings", error);
         res.status(500).json({ message: "Failed to load legacy settings" });
       }
     },
@@ -5587,7 +5857,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json(applicationsWithDetails);
     } catch (error) {
-      console.error("[dtdo] Failed to fetch applications:", error);
+      routeLog.error("[dtdo] Failed to fetch applications:", error);
       res.status(500).json({ message: "Failed to fetch applications" });
     }
   });
@@ -5648,7 +5918,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         correctionHistory,
       });
     } catch (error) {
-      console.error("[dtdo] Failed to fetch application details:", error);
+      routeLog.error("[dtdo] Failed to fetch application details:", error);
       res.status(500).json({ message: "Failed to fetch application details" });
     }
   });
@@ -5698,7 +5968,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Application accepted. Proceed to schedule inspection.", applicationId: req.params.id });
     } catch (error) {
-      console.error("[dtdo] Failed to accept application:", error);
+      routeLog.error("[dtdo] Failed to accept application:", error);
       res.status(500).json({ message: "Failed to accept application" });
     }
   });
@@ -5736,7 +6006,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Application rejected successfully" });
     } catch (error) {
-      console.error("[dtdo] Failed to reject application:", error);
+      routeLog.error("[dtdo] Failed to reject application:", error);
       res.status(500).json({ message: "Failed to reject application" });
     }
   });
@@ -5788,7 +6058,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Application reverted to applicant successfully" });
     } catch (error) {
-      console.error("[dtdo] Failed to revert application:", error);
+      routeLog.error("[dtdo] Failed to revert application:", error);
       res.status(500).json({ message: "Failed to revert application" });
     }
   });
@@ -5843,7 +6113,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         mobile: da.mobile,
       }));
 
-      console.log("[dtdo] available-das", {
+      routeLog.info("[dtdo] available-das", {
         officer: user.username,
         district: user.district,
         manifestMatches: manifestEntries.map((entry) => entry.da.username),
@@ -5852,7 +6122,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ das });
     } catch (error) {
-      console.error("[dtdo] Failed to fetch DAs:", error);
+      routeLog.error("[dtdo] Failed to fetch DAs:", error);
       res.status(500).json({ message: "Failed to fetch available DAs" });
     }
   });
@@ -5910,7 +6180,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           status: 'scheduled',
         })
         .returning();
-      console.log("[dtdo] inspection scheduled", {
+      routeLog.info("[dtdo] inspection scheduled", {
         applicationId,
         applicationNumber: application.applicationNumber,
         assignedDa: assignedDaUser.username,
@@ -5965,7 +6235,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Inspection scheduled successfully", inspectionOrder: newInspectionOrder[0] });
     } catch (error) {
-      console.error("[dtdo] Failed to schedule inspection:", error);
+      routeLog.error("[dtdo] Failed to schedule inspection:", error);
       res.status(500).json({ message: "Failed to schedule inspection" });
     }
   });
@@ -6033,7 +6303,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         acknowledgedAt: ackAction.length ? ackAction[0].createdAt : null,
       });
     } catch (error) {
-      console.error("[owner] Failed to fetch inspection schedule:", error);
+      routeLog.error("[owner] Failed to fetch inspection schedule:", error);
       res.status(500).json({ message: "Failed to fetch inspection schedule" });
     }
   });
@@ -6103,7 +6373,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         acknowledgedAt: ackRecord?.createdAt ?? new Date(),
       });
     } catch (error) {
-      console.error("[owner] Failed to acknowledge inspection schedule:", error);
+      routeLog.error("[owner] Failed to acknowledge inspection schedule:", error);
       res.status(500).json({ message: "Failed to acknowledge inspection schedule" });
     }
   });
@@ -6170,7 +6440,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         } : null,
       });
     } catch (error) {
-      console.error("[dtdo] Failed to fetch inspection report:", error);
+      routeLog.error("[dtdo] Failed to fetch inspection report:", error);
       res.status(500).json({ message: "Failed to fetch inspection report" });
     }
   });
@@ -6227,7 +6497,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Inspection report approved successfully" });
     } catch (error) {
-      console.error("[dtdo] Failed to approve inspection report:", error);
+      routeLog.error("[dtdo] Failed to approve inspection report:", error);
       res.status(500).json({ message: "Failed to approve inspection report" });
     }
   });
@@ -6281,7 +6551,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Application rejected successfully" });
     } catch (error) {
-      console.error("[dtdo] Failed to reject inspection report:", error);
+      routeLog.error("[dtdo] Failed to reject inspection report:", error);
       res.status(500).json({ message: "Failed to reject inspection report" });
     }
   });
@@ -6342,7 +6612,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ message: "Objections raised successfully. Application will require re-inspection." });
     } catch (error) {
-      console.error("[dtdo] Failed to raise objections:", error);
+      routeLog.error("[dtdo] Failed to raise objections:", error);
       res.status(500).json({ message: "Failed to raise objections" });
     }
   });
@@ -6367,7 +6637,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .from(inspectionOrders)
         .where(eq(inspectionOrders.assignedTo, userId))
         .orderBy(desc(inspectionOrders.createdAt));
-      console.log("[da] inspections query", {
+      routeLog.info("[da] inspections query", {
         userId,
         username: user?.username,
         count: inspectionOrdersData.length,
@@ -6410,7 +6680,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json(enrichedOrders);
     } catch (error) {
-      console.error("[da] Failed to fetch inspections:", error);
+      routeLog.error("[da] Failed to fetch inspections:", error);
       res.status(500).json({ message: "Failed to fetch inspections" });
     }
   });
@@ -6467,7 +6737,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         existingReport: existingReport.length > 0 ? existingReport[0] : null,
       });
     } catch (error) {
-      console.error("[da] Failed to fetch inspection details:", error);
+      routeLog.error("[da] Failed to fetch inspection details:", error);
       res.status(500).json({ message: "Failed to fetch inspection details" });
     }
   });
@@ -6613,6 +6883,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ? "recommended"
             : "completed";
 
+      // Auto-create acknowledgement if owner never clicked it, so downstream stages are not blocked.
+      const ackExists = await db
+        .select({ id: applicationActions.id })
+        .from(applicationActions)
+        .where(
+          and(
+            eq(applicationActions.applicationId, order[0].applicationId),
+            eq(applicationActions.action, "inspection_acknowledged"),
+          ),
+        )
+        .limit(1);
+      if (ackExists.length === 0) {
+        await db.insert(applicationActions).values({
+          applicationId: order[0].applicationId,
+          officerId: currentApplication?.userId ?? null,
+          action: "inspection_acknowledged",
+          previousStatus: currentApplication?.status ?? null,
+          newStatus: currentApplication?.status ?? null,
+          feedback: "Auto-acknowledged after inspection completion.",
+        });
+      }
+
       await storage.updateApplication(order[0].applicationId, {
         status: "inspection_under_review",
         currentStage: "inspection_completed",
@@ -6638,7 +6930,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         message: "Inspection report submitted successfully",
       });
     } catch (error) {
-      console.error("[da] Failed to submit inspection report:", error);
+      routeLog.error("[da] Failed to submit inspection report:", error);
       res.status(500).json({ message: "Failed to submit inspection report" });
     }
   });
@@ -6713,13 +7005,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const certificateNumber = `HP-HST-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 100000)).padStart(5, '0')}`;
+      const issueDate = new Date();
+      const expiryDate = new Date(issueDate);
+      expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+      const formatTimelineDate = (value: Date) =>
+        value.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
       
       await storage.updateApplication(payment.applicationId, {
         status: "approved",
         certificateNumber,
-        certificateIssuedDate: new Date(),
-        certificateExpiryDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year from now
-        approvedAt: new Date(),
+        certificateIssuedDate: issueDate,
+        certificateExpiryDate: expiryDate,
+        approvedAt: issueDate,
       });
       await logApplicationAction({
         applicationId: payment.applicationId,
@@ -6735,7 +7032,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         action: "certificate_issued",
         previousStatus: "approved",
         newStatus: "approved",
-        feedback: `Certificate number ${certificateNumber} issued.`,
+        feedback: `Certificate ${certificateNumber} issued on ${formatTimelineDate(issueDate)} (valid till ${formatTimelineDate(
+          expiryDate,
+        )}).`,
       });
 
       res.json({ 
@@ -6744,7 +7043,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         applicationId: payment.applicationId
       });
     } catch (error) {
-      console.error('Payment confirmation error:', error);
+      routeLog.error('Payment confirmation error:', error);
       res.status(500).json({ message: "Failed to confirm payment" });
     }
   });
@@ -6767,7 +7066,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ pendingPayments: paymentsWithApps.filter(p => p.payment !== null) });
     } catch (error) {
-      console.error('Pending payments fetch error:', error);
+      routeLog.error('Pending payments fetch error:', error);
       res.status(500).json({ message: "Failed to fetch pending payments" });
     }
   });
@@ -6792,7 +7091,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const stats = await storage.getLatestProductionStats();
       res.json({ stats });
     } catch (error) {
-      console.error('Production stats error:', error);
+      routeLog.error('Production stats error:', error);
       res.status(500).json({ message: "Failed to fetch production stats" });
     }
   });
@@ -6891,7 +7190,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         recentApplications,
       });
     } catch (error) {
-      console.error('Analytics error:', error);
+      routeLog.error('Analytics error:', error);
       res.status(500).json({ message: "Failed to fetch analytics data" });
     }
   });
@@ -7372,7 +7671,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       });
     } catch (error: any) {
-      console.error("Seed error:", error);
+      routeLog.error("Seed error:", error);
       res.status(500).json({ 
         success: false,
         message: "Failed to seed database", 
@@ -7506,18 +7805,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ============================================
   
   // Get all users (admin only)
-  app.get("/api/admin/users", requireRole('admin'), async (req, res) => {
+  app.get("/api/admin/users", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const users = await storage.getAllUsers();
       res.json({ users });
     } catch (error) {
-      console.error("Failed to fetch users:", error);
+      routeLog.error("Failed to fetch users:", error);
       res.status(500).json({ message: "Failed to fetch users" });
     }
   });
 
   // Update user (admin only)
-  app.patch("/api/admin/users/:id", requireRole('admin'), async (req, res) => {
+  app.patch("/api/admin/users/:id", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { id } = req.params;
       const { 
@@ -7633,13 +7932,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json({ user: updatedUser });
     } catch (error) {
-      console.error("Failed to update user:", error);
+      routeLog.error("Failed to update user:", error);
       res.status(500).json({ message: "Failed to update user" });
     }
   });
 
   // Toggle user status (admin only)
-  app.patch("/api/admin/users/:id/status", requireRole('admin'), async (req, res) => {
+  app.patch("/api/admin/users/:id/status", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { id } = req.params;
       const { isActive } = req.body;
@@ -7663,7 +7962,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const updatedUser = await storage.updateUser(id, { isActive });
       res.json({ user: updatedUser });
     } catch (error) {
-      console.error("Failed to update user status:", error);
+      routeLog.error("Failed to update user status:", error);
       res.status(500).json({ message: "Failed to update user status" });
     }
   });
@@ -7758,14 +8057,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .values(userData)
         .returning();
 
-      console.log(`[admin] Created new user: ${userData.fullName} (${role}) - ${mobile}`);
+      routeLog.info(`[admin] Created new user: ${userData.fullName} (${role}) - ${mobile}`);
 
       res.json({ 
         user: newUser,
         message: "User created successfully" 
       });
     } catch (error) {
-      console.error("Failed to create user:", error);
+      routeLog.error("Failed to create user:", error);
       res.status(500).json({ message: "Failed to create user" });
     }
   });
@@ -7840,7 +8139,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ applications });
     } catch (error) {
-      console.error("[admin-rc] Failed to fetch legacy applications:", error);
+      routeLog.error("[admin-rc] Failed to fetch legacy applications:", error);
       res.status(500).json({ message: "Failed to load legacy applications" });
     }
   });
@@ -7875,7 +8174,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         documents: docList,
       });
     } catch (error) {
-      console.error("[admin-rc] Failed to fetch application:", error);
+      routeLog.error("[admin-rc] Failed to fetch application:", error);
       res.status(500).json({ message: "Failed to load application" });
     }
   });
@@ -8022,13 +8321,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         documents: docList,
       });
     } catch (error) {
-      console.error("[admin-rc] Failed to update legacy application:", error);
+      routeLog.error("[admin-rc] Failed to update legacy application:", error);
       res.status(500).json({ message: "Failed to update legacy application" });
     }
   });
 
   // RESET DATABASE - Clear all test data (admin only)
-  app.post("/api/admin/reset-db", requireRole('admin'), async (req, res) => {
+  app.post("/api/admin/reset-db", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { 
         preserveDdoCodes = false,
@@ -8037,7 +8336,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         preserveStateOfficers = false,
         preserveLgdData = false
       } = req.body;
-      console.log("[admin] Starting database reset...", { 
+      routeLog.info("[admin] Starting database reset...", { 
         preserveDdoCodes,
         preservePropertyOwners,
         preserveDistrictOfficers,
@@ -8049,10 +8348,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const safeDelete = async (table: any, tableName: string) => {
         try {
           await db.delete(table);
-          console.log(`[admin] ✓ Deleted all ${tableName}`);
+          routeLog.info(`[admin] ✓ Deleted all ${tableName}`);
         } catch (error: any) {
           if (error.code === '42P01') { // Table doesn't exist
-            console.log(`[admin] ⊙ Skipped ${tableName} (table doesn't exist yet)`);
+            routeLog.info(`[admin] ⊙ Skipped ${tableName} (table doesn't exist yet)`);
           } else {
             throw error; // Re-throw other errors
           }
@@ -8109,13 +8408,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!preserveDdoCodes) {
         await db.delete(ddoCodes);
         ddoCodesStatus = "deleted";
-        console.log(`[admin] ✓ Deleted all DDO codes`);
+        routeLog.info(`[admin] ✓ Deleted all DDO codes`);
       } else {
-        console.log(`[admin] ⊙ Preserved DDO codes (configuration data)`);
+        routeLog.info(`[admin] ⊙ Preserved DDO codes (configuration data)`);
       }
       
       // 15b. System Settings (always preserved - configuration data)
-      console.log(`[admin] ⊙ Preserved system settings (configuration data)`);
+      routeLog.info(`[admin] ⊙ Preserved system settings (configuration data)`);
       
       // 15c. LGD Master Data (optional - configuration data for Himachal Pradesh hierarchy)
       let lgdDataStatus = "preserved (configuration data)";
@@ -8127,9 +8426,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         await db.delete(lgdTehsils);
         await db.delete(lgdDistricts);
         lgdDataStatus = "deleted";
-        console.log(`[admin] ✓ Deleted all LGD master data`);
+        routeLog.info(`[admin] ✓ Deleted all LGD master data`);
       } else {
-        console.log(`[admin] ⊙ Preserved LGD master data (configuration data)`);
+        routeLog.info(`[admin] ⊙ Preserved LGD master data (configuration data)`);
       }
       
       // 16. Build list of roles to preserve
@@ -8147,7 +8446,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         rolesToPreserve.push('state_officer');
       }
       
-      console.log(`[admin] Roles to preserve:`, rolesToPreserve);
+      routeLog.info(`[admin] Roles to preserve:`, rolesToPreserve);
       
       // Delete user profiles for users whose roles are NOT in rolesToPreserve
       // Use a subquery to delete profiles based on user role
@@ -8157,7 +8456,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         )
         .returning();
       
-      console.log(`[admin] ✓ Deleted ${deletedProfiles.length} user profiles for non-preserved roles`);
+      routeLog.info(`[admin] ✓ Deleted ${deletedProfiles.length} user profiles for non-preserved roles`);
       
       // 17. Users (delete based on preservation settings)
       const deletedUsers = await db.delete(users)
@@ -8174,13 +8473,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return acc;
       }, {} as Record<string, number>);
       
-      console.log(`[admin] ✓ Deleted ${deletedUsers.length} users (preserved ${preservedUsers.length} accounts)`);
+      routeLog.info(`[admin] ✓ Deleted ${deletedUsers.length} users (preserved ${preservedUsers.length} accounts)`);
       
       // TODO: Delete uploaded files from object storage
       // This would require listing and deleting files from GCS bucket
       // For now, we'll just clear database records
       
-      console.log("[admin] ✅ Database reset complete");
+      routeLog.info("[admin] ✅ Database reset complete");
       
       res.json({ 
         message: "Database reset successful", 
@@ -8215,7 +8514,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       });
     } catch (error) {
-      console.error("[admin] ❌ Database reset failed:", error);
+      routeLog.error("[admin] ❌ Database reset failed:", error);
       res.status(500).json({ 
         message: "Failed to reset database",
         error: error instanceof Error ? error.message : String(error)
@@ -8287,7 +8586,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         },
       });
     } catch (error) {
-      console.error("[admin] Failed to fetch dashboard stats:", error);
+      routeLog.error("[admin] Failed to fetch dashboard stats:", error);
       res.status(500).json({ message: "Failed to fetch dashboard statistics" });
     }
   });
@@ -8372,7 +8671,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         superConsoleOverride,
       });
     } catch (error) {
-      console.error("[admin] Failed to fetch stats:", error);
+      routeLog.error("[admin] Failed to fetch stats:", error);
       res.status(500).json({ message: "Failed to fetch system statistics" });
     }
   });
@@ -8399,7 +8698,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ enabled, environment: process.env.NODE_ENV || 'development' });
     } catch (error) {
-      console.error('[admin] Failed to fetch super console setting:', error);
+      routeLog.error('[admin] Failed to fetch super console setting:', error);
       res.status(500).json({ message: 'Failed to fetch super console setting' });
     }
   });
@@ -8432,7 +8731,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           .where(eq(systemSettings.settingKey, 'admin_super_console_enabled'))
           .returning();
 
-        console.log(`[admin] Super console override ${enabled ? 'enabled' : 'disabled'}`);
+        routeLog.info(`[admin] Super console override ${enabled ? 'enabled' : 'disabled'}`);
         res.json(updated);
       } else {
         const [created] = await db
@@ -8446,11 +8745,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
           })
           .returning();
 
-        console.log(`[admin] Super console override ${enabled ? 'enabled' : 'disabled'}`);
+        routeLog.info(`[admin] Super console override ${enabled ? 'enabled' : 'disabled'}`);
         res.json(created);
       }
     } catch (error) {
-      console.error('[admin] Failed to toggle super console:', error);
+      routeLog.error('[admin] Failed to toggle super console:', error);
       res.status(500).json({ message: 'Failed to toggle super console' });
     }
   });
@@ -8460,7 +8759,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ========================================
 
   // Get a specific system setting by key
-  app.get("/api/admin/settings/:key", requireRole('admin'), async (req, res) => {
+  app.get("/api/admin/settings/:key", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { key } = req.params;
       
@@ -8476,13 +8775,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       res.json(setting);
     } catch (error) {
-      console.error("[admin] Failed to fetch setting:", error);
+      logger.error({ err: error, route: req.path, key: req.params?.key }, "[admin] Failed to fetch setting");
       res.status(500).json({ message: "Failed to fetch setting" });
     }
   });
 
   // Update or create a system setting
-  app.put("/api/admin/settings/:key", requireRole('admin'), async (req, res) => {
+  app.put("/api/admin/settings/:key", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { key } = req.params;
       const { settingValue, description } = req.body;
@@ -8512,7 +8811,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           .where(eq(systemSettings.settingKey, key))
           .returning();
         
-        console.log(`[admin] Updated setting: ${key}`);
+        logger.info({ settingKey: key, userId }, "[admin] Updated setting");
         res.json(updated);
       } else {
         // Create new setting
@@ -8527,18 +8826,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
           })
           .returning();
         
-        console.log(`[admin] Created setting: ${key}`);
+        logger.info({ settingKey: key, userId }, "[admin] Created setting");
         res.json(created);
       }
     } catch (error) {
-      console.error("[admin] Failed to update setting:", error);
+      logger.error({ err: error, route: req.path, key: req.params?.key }, "[admin] Failed to update setting");
       res.status(500).json({ message: "Failed to update setting" });
     }
   });
 
   // Get test payment mode status (specific endpoint for convenience)
-  app.get("/api/admin/settings/payment/test-mode", requireRole('admin'), async (req, res) => {
+  app.get("/api/admin/settings/payment/test-mode", async (req, res) => {
     try {
+      if (!req.session.userId) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      const user = await storage.getUser(req.session.userId);
+      const role = user?.role?.trim();
+      if (!user || !role || (role !== "admin" && role !== "super_admin")) {
+        logger.warn(
+          { userId: user?.id ?? null, role: user?.role ?? null, route: req.path },
+          "[auth] Admin/Super guard failed",
+        );
+        return res.status(403).json({ message: "Insufficient permissions" });
+      }
+      logger.info(
+        { userId: user.id, role, route: req.path, method: req.method },
+        "[admin] Guard granted payment test-mode fetch",
+      );
+
       const [setting] = await db
         .select()
         .from(systemSettings)
@@ -8553,16 +8869,33 @@ export async function registerRoutes(app: Express): Promise<Server> {
         res.json({ enabled: value.enabled, isDefault: false });
       }
     } catch (error) {
-      console.error("[admin] Failed to fetch test payment mode:", error);
+      logger.error({ err: error, route: req.path }, "[admin] Failed to fetch test payment mode");
       res.status(500).json({ message: "Failed to fetch test payment mode" });
     }
   });
 
   // Toggle test payment mode
-  app.post("/api/admin/settings/payment/test-mode/toggle", requireRole('admin'), async (req, res) => {
+  app.post("/api/admin/settings/payment/test-mode/toggle", async (req, res) => {
     try {
+      if (!req.session.userId) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
+      const user = await storage.getUser(req.session.userId);
+      const role = user?.role?.trim();
+      if (!user || !role || (role !== "admin" && role !== "super_admin")) {
+        logger.warn(
+          { userId: user?.id ?? null, role: user?.role ?? null, route: req.path },
+          "[auth] Admin/Super guard failed",
+        );
+        return res.status(403).json({ message: "Insufficient permissions" });
+      }
+
       const { enabled } = req.body;
-      const userId = req.session.userId || null;
+      const userId = user.id;
+      logger.info(
+        { userId, role, enabled },
+        "[admin] Requested test-mode toggle",
+      );
       
       if (typeof enabled !== 'boolean') {
         return res.status(400).json({ message: "enabled must be a boolean" });
@@ -8587,7 +8920,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           .where(eq(systemSettings.settingKey, 'payment_test_mode'))
           .returning();
         
-        console.log(`[admin] Test payment mode ${enabled ? 'enabled' : 'disabled'}`);
+        logger.info({ userId, enabled }, "[admin] Test payment mode updated");
         res.json(updated);
       } else {
         // Create new
@@ -8602,27 +8935,226 @@ export async function registerRoutes(app: Express): Promise<Server> {
           })
           .returning();
         
-        console.log(`[admin] Test payment mode ${enabled ? 'enabled' : 'disabled'}`);
+        logger.info({ userId, enabled }, "[admin] Test payment mode created");
         res.json(created);
       }
     } catch (error) {
-      console.error("[admin] Failed to toggle test payment mode:", error);
+      logger.error({ err: error, route: req.path }, "[admin] Failed to toggle test payment mode");
       res.status(500).json({ message: "Failed to toggle test payment mode" });
     }
   });
 
+  app.get("/api/admin/payments/himkosh", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const { config: effectiveConfig, overrides, record } = await resolveHimkoshGatewayConfig();
+      res.json({
+        effective: effectiveConfig,
+        overrides: sanitizeHimkoshGatewaySetting(overrides),
+        source: record ? "database" : "env",
+        updatedAt: record?.updatedAt,
+        updatedBy: record?.updatedBy,
+      });
+    } catch (error) {
+      logger.error({ err: error, route: req.path }, "[admin] Failed to fetch HimKosh config");
+      res.status(500).json({ message: "Failed to fetch HimKosh config" });
+    }
+  });
+
+  app.put("/api/admin/payments/himkosh", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const userId = req.session?.userId ?? null;
+      const payload: HimkoshGatewaySettingValue = {
+        merchantCode: trimHimkoshString(req.body?.merchantCode),
+        deptId: trimHimkoshString(req.body?.deptId),
+        serviceCode: trimHimkoshString(req.body?.serviceCode),
+        ddo: trimHimkoshString(req.body?.ddo),
+        head1: trimHimkoshString(req.body?.head1),
+        head2: trimHimkoshString(req.body?.head2),
+        head2Amount: parseOptionalHimkoshNumber(req.body?.head2Amount),
+        returnUrl: trimHimkoshString(req.body?.returnUrl),
+        allowFallback: req.body?.allowFallback !== false,
+      };
+
+      if (!payload.merchantCode || !payload.deptId || !payload.serviceCode || !payload.ddo || !payload.head1) {
+        return res.status(400).json({
+          message: "Merchant code, Dept ID, Service code, DDO, and Head of Account are required",
+        });
+      }
+
+      const existing = await getSystemSettingRecord(HIMKOSH_GATEWAY_SETTING_KEY);
+      if (existing) {
+        await db
+          .update(systemSettings)
+          .set({
+            settingValue: payload,
+            updatedBy: userId,
+            updatedAt: new Date(),
+            description: "HimKosh gateway configuration",
+            category: "payment",
+          })
+          .where(eq(systemSettings.settingKey, HIMKOSH_GATEWAY_SETTING_KEY));
+      } else {
+        await db.insert(systemSettings).values({
+          settingKey: HIMKOSH_GATEWAY_SETTING_KEY,
+          settingValue: payload,
+          description: "HimKosh gateway configuration",
+          category: "payment",
+          updatedBy: userId,
+        });
+      }
+
+      logger.info({ userId }, "[admin] Updated HimKosh gateway config");
+      res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error, route: req.path }, "[admin] Failed to update HimKosh config");
+      res.status(500).json({ message: "Failed to update HimKosh config" });
+    }
+  });
+
+  app.delete("/api/admin/payments/himkosh", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const existing = await getSystemSettingRecord(HIMKOSH_GATEWAY_SETTING_KEY);
+      if (!existing) {
+        return res.status(404).json({ message: "No HimKosh override found" });
+      }
+      await db.delete(systemSettings).where(eq(systemSettings.settingKey, HIMKOSH_GATEWAY_SETTING_KEY));
+      logger.info({ settingKey: HIMKOSH_GATEWAY_SETTING_KEY, userId: req.session?.userId ?? null }, "[admin] Cleared HimKosh gateway config override");
+      res.json({ success: true });
+    } catch (error) {
+      logger.error({ err: error, route: req.path }, "[admin] Failed to clear HimKosh config");
+      res.status(500).json({ message: "Failed to clear HimKosh config" });
+    }
+  });
+
+  app.get("/api/admin/payments/himkosh/ddo-codes", requireRole('admin', 'super_admin'), async (_req, res) => {
+    try {
+      const codes = await fetchAllDdoCodes();
+      res.json({ codes });
+    } catch (error) {
+      logger.error({ err: error }, "[admin] Failed to load DDO codes");
+      res.status(500).json({ message: "Failed to load DDO codes" });
+    }
+  });
+
+  app.post("/api/admin/payments/himkosh/transactions/clear", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const rawConfirm = typeof req.body?.confirmationText === "string" ? req.body.confirmationText : "";
+      const normalized = rawConfirm.trim().toUpperCase();
+      if (normalized !== "CLEAR HIMKOSH LOG") {
+        return res.status(400).json({ message: "Type CLEAR HIMKOSH LOG to confirm" });
+      }
+
+      const deleted = await db.delete(himkoshTransactions).returning({ id: himkoshTransactions.id });
+      logger.warn(
+        { userId: req.session?.userId ?? null, deleted: deleted.length },
+        "[admin] Cleared HimKosh transaction log",
+      );
+
+      res.json({ success: true, deleted: deleted.length });
+    } catch (error) {
+      logger.error({ err: error }, "[admin] Failed to clear HimKosh transactions");
+      res.status(500).json({ message: "Failed to clear HimKosh transactions" });
+    }
+  });
+
+  app.post("/api/admin/payments/himkosh/ddo-test", requireRole('admin', 'super_admin'), async (req, res) => {
+    try {
+      const rawDistrict = typeof req.body?.district === "string" ? req.body.district.trim() : "";
+      const rawTehsil = typeof req.body?.tehsil === "string" ? req.body.tehsil.trim() : "";
+      const manualDdo = trimHimkoshString(req.body?.manualDdo);
+      const tenderBy =
+        typeof req.body?.tenderBy === "string" && req.body.tenderBy.trim().length
+          ? req.body.tenderBy.trim()
+          : "Test Applicant";
+      const requestedAmount = Number(req.body?.amount ?? 1);
+      const totalAmount = Number.isFinite(requestedAmount) && requestedAmount > 0 ? Math.round(requestedAmount) : 1;
+
+      const { config } = await resolveHimkoshGatewayConfig();
+      const head1 = config.heads?.registrationFee;
+      if (!config.merchantCode || !config.deptId || !config.serviceCode || !head1) {
+        return res.status(400).json({ message: "HimKosh gateway is not fully configured" });
+      }
+
+      const routedDistrict =
+        deriveDistrictRoutingLabel(rawDistrict || undefined, rawTehsil || undefined) ?? (rawDistrict || null);
+      const mapped = routedDistrict ? await resolveDistrictDdo(routedDistrict) : undefined;
+      const fallbackDdo = config.ddo;
+
+      const ddoToUse = manualDdo || mapped?.ddoCode || fallbackDdo;
+      if (!ddoToUse) {
+        return res.status(400).json({ message: "No DDO code available. Provide a manual override to test." });
+      }
+
+      const now = new Date();
+      const periodDate = `${String(now.getDate()).padStart(2, "0")}-${String(now.getMonth() + 1).padStart(2, "0")}-${now.getFullYear()}`;
+      const deptRefNo = `TEST-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(
+        now.getDate(),
+      ).padStart(2, "0")}-${now.getTime().toString().slice(-4)}`;
+      const appRefNo = `HPT${now.getTime()}`.slice(0, 20);
+
+      const payloadParams = {
+        deptId: config.deptId,
+        deptRefNo,
+        totalAmount,
+        tenderBy,
+        appRefNo,
+        head1,
+        amount1: totalAmount,
+        head2: config.heads?.secondaryHead || undefined,
+        amount2: config.heads?.secondaryHeadAmount ?? undefined,
+        ddo: ddoToUse,
+        periodFrom: periodDate,
+        periodTo: periodDate,
+        serviceCode: config.serviceCode,
+        returnUrl: config.returnUrl,
+      };
+
+      const { coreString, fullString } = buildRequestString(payloadParams);
+      const checksum = HimKoshCrypto.generateChecksum(coreString);
+      const payloadWithChecksum = `${fullString}|checkSum=${checksum}`;
+      const encrypted = await adminHimkoshCrypto.encrypt(payloadWithChecksum);
+
+      res.json({
+        success: true,
+        requestedDistrict: rawDistrict || null,
+        requestedTehsil: rawTehsil || null,
+        routedDistrict,
+        mapping: mapped
+          ? {
+              district: mapped.district,
+              ddoCode: mapped.ddoCode,
+              treasuryCode: mapped.treasuryCode,
+            }
+          : null,
+        ddoUsed: ddoToUse,
+        ddoSource: manualDdo ? "manual_override" : mapped ? "district_mapping" : "default_config",
+        payload: {
+          params: payloadParams,
+          coreString,
+          fullString,
+          checksum,
+          encrypted,
+          paymentUrl: `${config.paymentUrl}?encdata=${encodeURIComponent(encrypted)}&merchant_code=${config.merchantCode}`,
+        },
+      });
+    } catch (error) {
+      logger.error({ err: error }, "[admin] Failed to run HimKosh DDO test");
+      res.status(500).json({ message: "Failed to run HimKosh DDO test" });
+    }
+  });
+
   // Captcha settings
-  app.get("/api/admin/settings/auth/captcha", requireRole('admin'), async (_req, res) => {
+  app.get("/api/admin/settings/auth/captcha", requireRole('admin', 'super_admin'), async (_req, res) => {
     try {
       const enabled = await getCaptchaSetting();
       res.json({ enabled });
     } catch (error) {
-      console.error("[admin] Failed to fetch captcha setting:", error);
+      routeLog.error("[admin] Failed to fetch captcha setting:", error);
       res.status(500).json({ message: "Failed to fetch captcha setting" });
     }
   });
 
-  app.post("/api/admin/settings/auth/captcha/toggle", requireRole('admin'), async (req, res) => {
+  app.post("/api/admin/settings/auth/captcha/toggle", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { enabled } = req.body;
       if (typeof enabled !== "boolean") {
@@ -8656,11 +9188,162 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       updateCaptchaSettingCache(enabled);
-      console.log(`[admin] Captcha requirement ${enabled ? "enabled" : "disabled"}`);
+      routeLog.info(`[admin] Captcha requirement ${enabled ? "enabled" : "disabled"}`);
       res.json({ enabled });
     } catch (error) {
-      console.error("[admin] Failed to toggle captcha setting:", error);
+      routeLog.error("[admin] Failed to toggle captcha setting:", error);
       res.status(500).json({ message: "Failed to update captcha setting" });
+    }
+  });
+
+  app.get("/api/admin/db/config", requireRole('super_admin'), async (_req, res) => {
+    try {
+      const stored = await getDbConnectionSettings();
+      const fallback = stored ?? parseDatabaseUrlFromEnv();
+      if (!fallback) {
+        return res.json({
+          settings: null,
+          hasPassword: false,
+          metadata: {},
+          source: "none",
+        });
+      }
+
+      const { password, ...settings } = fallback;
+      res.json({
+        settings,
+        hasPassword: Boolean(stored?.password ?? password),
+        metadata: {
+          lastAppliedAt: stored?.lastAppliedAt ?? null,
+          lastVerifiedAt: stored?.lastVerifiedAt ?? null,
+          lastVerificationResult: stored?.lastVerificationResult ?? null,
+          lastVerificationMessage: stored?.lastVerificationMessage ?? null,
+        },
+        source: stored ? "stored" : "env",
+      });
+    } catch (error) {
+      routeLog.error("[admin] Failed to fetch DB config:", error);
+      res.status(500).json({ message: "Failed to fetch database configuration" });
+    }
+  });
+
+  app.post("/api/admin/db/config/test", requireRole('super_admin'), async (req, res) => {
+    let tempPool: PgPool | null = null;
+    try {
+      const stored = await getDbConnectionSettings();
+      const fallback = stored ?? parseDatabaseUrlFromEnv();
+      const input = req.body?.settings ?? {};
+      const host = typeof input.host === "string" && input.host.trim() ? input.host.trim() : fallback?.host;
+      const database = typeof input.database === "string" && input.database.trim()
+        ? input.database.trim()
+        : fallback?.database;
+      const user = typeof input.user === "string" && input.user.trim() ? input.user.trim() : fallback?.user;
+      const passwordInput = typeof input.password === "string" ? input.password.trim() : undefined;
+      const password = passwordInput || fallback?.password;
+      const portValue = input.port ?? fallback?.port ?? 5432;
+      const port = Number(portValue);
+
+      if (!host || !database || !user || !password || Number.isNaN(port) || port <= 0) {
+        return res.status(400).json({ message: "Host, port, database, user, and password are required" });
+      }
+
+      tempPool = new PgPool({
+        host,
+        port,
+        database,
+        user,
+        password,
+        max: 1,
+        connectionTimeoutMillis: 5000,
+      });
+      const startedAt = Date.now();
+      const result = await tempPool.query("SELECT version() AS version, NOW() AS server_time");
+      await tempPool.end();
+      tempPool = null;
+
+      if (stored) {
+        await saveDbConnectionSettings(
+          {
+            ...stored,
+            lastVerifiedAt: new Date().toISOString(),
+            lastVerificationResult: "success",
+            lastVerificationMessage: null,
+          },
+          req.session.userId ?? null,
+        );
+      }
+
+      const row = result.rows[0] ?? {};
+      res.json({
+        success: true,
+        version: row.version ?? "",
+        serverTime: row.server_time ?? null,
+        latencyMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      if (tempPool) {
+        await tempPool.end();
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const stored = await getDbConnectionSettings();
+      if (stored) {
+        await saveDbConnectionSettings(
+          {
+            ...stored,
+            lastVerifiedAt: new Date().toISOString(),
+            lastVerificationResult: "failure",
+            lastVerificationMessage: message,
+          },
+          req.session.userId ?? null,
+        );
+      }
+      res.status(400).json({ message });
+    }
+  });
+
+  app.put("/api/admin/db/config", requireRole('super_admin'), async (req, res) => {
+    try {
+      const existing = await getDbConnectionSettings();
+      const host = typeof req.body?.host === "string" ? req.body.host.trim() : "";
+      const database = typeof req.body?.database === "string" ? req.body.database.trim() : "";
+      const user = typeof req.body?.user === "string" ? req.body.user.trim() : "";
+      const portInput = req.body?.port ?? existing?.port ?? 5432;
+      const port = Number(portInput);
+      const passwordInput = typeof req.body?.password === "string" ? req.body.password.trim() : "";
+      const password = passwordInput || existing?.password;
+      const applyEnv = Boolean(req.body?.applyEnv);
+
+      if (!host || !database || !user || !password || Number.isNaN(port) || port <= 0) {
+        return res.status(400).json({ message: "Host, port, database, user, and password are required" });
+      }
+
+      const nextValue: DbConnectionSettingValue = {
+        host,
+        port,
+        database,
+        user,
+        password,
+        lastAppliedAt: applyEnv ? new Date().toISOString() : existing?.lastAppliedAt ?? null,
+        lastVerifiedAt: existing?.lastVerifiedAt ?? null,
+        lastVerificationResult: existing?.lastVerificationResult ?? null,
+        lastVerificationMessage: existing?.lastVerificationMessage ?? null,
+      };
+
+      await saveDbConnectionSettings(nextValue, req.session.userId ?? null);
+      if (applyEnv) {
+        updateDbEnvFiles(nextValue);
+      }
+
+      res.json({
+        success: true,
+        applied: applyEnv,
+        message: applyEnv
+          ? "Configuration saved and environment files updated. Restart the service to apply changes."
+          : "Configuration saved.",
+      });
+    } catch (error) {
+      routeLog.error("[admin] Failed to update DB config:", error);
+      res.status(500).json({ message: "Failed to update database configuration" });
     }
   });
 
@@ -8671,7 +9354,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const smsRecord = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
       const emailSettings = formatGatewaySetting(emailRecord, sanitizeEmailGateway);
       const smsSettings = formatGatewaySetting(smsRecord, sanitizeSmsGateway);
-      console.log("[comm-settings] sms provider:", smsSettings?.provider, {
+      routeLog.info("[comm-settings] sms provider:", smsSettings?.provider, {
         nic: smsSettings?.nic ? { passwordSet: smsSettings.nic.passwordSet } : null,
         twilio: smsSettings?.twilio ? { authTokenSet: smsSettings.twilio.authTokenSet } : null,
       });
@@ -8680,7 +9363,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         sms: smsSettings,
       });
     } catch (error) {
-      console.error("[admin] Failed to fetch communications settings:", error);
+      routeLog.error("[admin] Failed to fetch communications settings:", error);
       res.status(500).json({ message: "Failed to fetch communications settings" });
     }
   });
@@ -8767,27 +9450,34 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      console.log("[admin] Updated SMTP gateway settings");
+      routeLog.info("[admin] Updated SMTP gateway settings");
       res.json({ success: true });
     } catch (error) {
-      console.error("[admin] Failed to update SMTP config:", error);
+      routeLog.error("[admin] Failed to update SMTP config:", error);
       res.status(500).json({ message: "Failed to update SMTP settings" });
     }
   });
 
   app.put("/api/admin/communications/sms", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
-      const providerInput = req.body?.provider === "twilio" ? "twilio" : "nic";
+      const providerInput =
+        req.body?.provider === "twilio"
+          ? "twilio"
+          : req.body?.provider === "nic_v2"
+            ? "nic_v2"
+            : "nic";
       const userId = req.session.userId || null;
       const existing = await getSystemSettingRecord(SMS_GATEWAY_SETTING_KEY);
       const existingValue: SmsGatewaySettingValue = (existing?.settingValue as SmsGatewaySettingValue) ?? {};
 
       const nicPayload = req.body?.nic ?? req.body;
+      const nicV2Payload = req.body?.nicV2 ?? req.body;
       const twilioPayload = req.body?.twilio ?? req.body;
 
       const nextValue: SmsGatewaySettingValue = {
         provider: providerInput,
         nic: existingValue.nic,
+        nicV2: existingValue.nicV2,
         twilio: existingValue.twilio,
       };
 
@@ -8819,6 +9509,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
         };
 
         nextValue.nic = nicConfig;
+      } else if (providerInput === "nic_v2") {
+        const username = trimOptionalString(nicV2Payload?.username) ?? undefined;
+        const senderId = trimOptionalString(nicV2Payload?.senderId) ?? undefined;
+        const templateId = trimOptionalString(nicV2Payload?.templateId) ?? undefined;
+        const key = trimOptionalString(nicV2Payload?.key) ?? undefined;
+        const postUrl = trimOptionalString(nicV2Payload?.postUrl) ?? undefined;
+        const passwordInput = trimOptionalString(nicV2Payload?.password) ?? undefined;
+
+        if (!username || !senderId || !templateId || !key) {
+          return res.status(400).json({ message: "All NIC V2 fields are required" });
+        }
+
+        const resolvedPassword = passwordInput || existingValue.nicV2?.password;
+        if (!resolvedPassword) {
+          return res.status(400).json({ message: "NIC V2 password is required" });
+        }
+
+        const nicV2Config: SmsGatewayV2Settings = {
+          username,
+          senderId,
+          templateId,
+          key,
+          postUrl: postUrl || existingValue.nicV2?.postUrl || "https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT",
+          password: resolvedPassword,
+        };
+        nextValue.nicV2 = nicV2Config;
       } else {
         const accountSid = trimOptionalString(twilioPayload?.accountSid) ?? undefined;
         const fromNumber = trimOptionalString(twilioPayload?.fromNumber) ?? undefined;
@@ -8869,10 +9585,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      console.log("[admin] Updated SMS gateway settings");
+      routeLog.info("[admin] Updated SMS gateway settings");
       res.json({ success: true });
     } catch (error) {
-      console.error("[admin] Failed to update SMS config:", error);
+      routeLog.error("[admin] Failed to update SMS config:", error);
       res.status(500).json({ message: "Failed to update SMS settings" });
     }
   });
@@ -8912,7 +9628,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ success: true, log: result.log });
     } catch (error: any) {
-      console.error("[admin] SMTP test failed:", error);
+      routeLog.error("[admin] SMTP test failed:", error);
       res.status(500).json({ message: error?.message || "Failed to send test email" });
     }
   });
@@ -8926,7 +9642,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const config = record.settingValue as SmsGatewaySettingValue;
       const provider: SmsGatewayProvider = config.provider ?? "nic";
-      console.log("[sms-test] provider:", provider);
+      routeLog.info("[sms-test] provider:", provider);
 
       const mobile = trimOptionalString(req.body?.mobile);
       const message =
@@ -8967,6 +9683,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.json({ success: result.ok, response: result.body, status: result.status });
       }
 
+      if (provider === "nic_v2") {
+        const nicV2Config =
+          config.nicV2 ??
+          ({
+            username: (config as any).username,
+            password: (config as any).password,
+            senderId: (config as any).senderId,
+            templateId: (config as any).templateId,
+            key: (config as any).key,
+            postUrl: (config as any).postUrl,
+          } as SmsGatewayV2Settings);
+
+        if (!nicV2Config || !nicV2Config.password) {
+          return res.status(400).json({ message: "NIC V2 password missing in settings" });
+        }
+        const result = await sendNicV2Sms(
+          {
+            username: nicV2Config.username,
+            password: nicV2Config.password,
+            senderId: nicV2Config.senderId,
+            templateId: nicV2Config.templateId,
+            key: nicV2Config.key,
+            postUrl: nicV2Config.postUrl,
+          },
+          { mobile, message },
+        );
+
+        return res.json({ success: result.ok, response: result.body, status: result.status });
+      }
+
       const nicConfig =
         config.nic ??
         ({
@@ -8996,7 +9742,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ success: result.ok, response: result.body, status: result.status });
     } catch (error: any) {
-      console.error("[admin] SMS test failed:", error);
+      routeLog.error("[admin] SMS test failed:", error);
       res.status(500).json({ message: error?.message || "Failed to send test SMS" });
     }
   });
@@ -9007,7 +9753,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const payload = buildNotificationResponse(record);
       res.json(payload);
     } catch (error) {
-      console.error("[admin] Failed to load notification rules:", error);
+      routeLog.error("[admin] Failed to load notification rules:", error);
       res.status(500).json({ message: "Failed to load notification settings" });
     }
   });
@@ -9065,7 +9811,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ success: true });
     } catch (error) {
-      console.error("[admin] Failed to save notification rules:", error);
+      routeLog.error("[admin] Failed to save notification rules:", error);
       res.status(500).json({ message: "Failed to save notification settings" });
     }
   });
@@ -9075,7 +9821,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ========================================
 
   // Execute SQL query (for development/testing)
-  app.post("/api/admin/db-console/execute", requireRole('admin'), async (req, res) => {
+  app.post("/api/admin/db-console/execute", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { query: sqlQuery } = req.body;
       
@@ -9100,7 +9846,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const isExplain = trimmedQuery.startsWith('explain');
       const isReadOnly = isSelect || isShow || isDescribe || isExplain;
 
-      console.log(`[db-console] Executing ${isReadOnly ? 'READ' : 'WRITE'} query:`, sqlQuery.substring(0, 100));
+      routeLog.info(`[db-console] Executing ${isReadOnly ? 'READ' : 'WRITE'} query:`, sqlQuery.substring(0, 100));
 
       // Execute the query
       const result = await db.execute(sql.raw(sqlQuery));
@@ -9126,10 +9872,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         query: sqlQuery
       };
 
-      console.log(`[db-console] Query returned ${rows.length} row(s)`);
+      routeLog.info(`[db-console] Query returned ${rows.length} row(s)`);
       res.json(response);
     } catch (error) {
-      console.error("[db-console] Query execution failed:", error);
+      routeLog.error("[db-console] Query execution failed:", error);
       res.status(500).json({ 
         success: false,
         message: "Query execution failed",
@@ -9139,7 +9885,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Get list of all tables
-  app.get("/api/admin/db-console/tables", requireRole('admin'), async (req, res) => {
+  app.get("/api/admin/db-console/tables", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const environment = process.env.NODE_ENV || 'development';
       if (environment === 'production') {
@@ -9160,13 +9906,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ tables: result });
     } catch (error) {
-      console.error("[db-console] Failed to fetch tables:", error);
+      routeLog.error("[db-console] Failed to fetch tables:", error);
       res.status(500).json({ message: "Failed to fetch tables" });
     }
   });
 
   // Get table schema/structure
-  app.get("/api/admin/db-console/table/:tableName/schema", requireRole('admin'), async (req, res) => {
+  app.get("/api/admin/db-console/table/:tableName/schema", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { tableName } = req.params;
       
@@ -9193,7 +9939,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       res.json({ schema: result });
     } catch (error) {
-      console.error("[db-console] Failed to fetch table schema:", error);
+      routeLog.error("[db-console] Failed to fetch table schema:", error);
       res.status(500).json({ message: "Failed to fetch table schema" });
     }
   });
@@ -9226,7 +9972,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         });
       }
 
-      console.log(`[super-admin] Reset operation: ${operation}, reason: ${reason}`);
+      routeLog.info(`[super-admin] Reset operation: ${operation}, reason: ${reason}`);
 
       let deletedCounts: any = {};
 
@@ -9301,7 +10047,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         deletedCounts,
       });
     } catch (error) {
-      console.error("[super-admin] Reset failed:", error);
+      routeLog.error("[super-admin] Reset failed:", error);
       res.status(500).json({ message: "Reset operation failed" });
     }
   });
@@ -9312,7 +10058,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const { type } = req.params;
       const { count = 10, scenario } = req.body;
 
-      console.log(`[super-admin] Seeding data: ${type}, count: ${count}, scenario: ${scenario}`);
+      routeLog.info(`[super-admin] Seeding data: ${type}, count: ${count}, scenario: ${scenario}`);
 
       // Get current user
       const currentUser = await storage.getUser(req.session.userId!);
@@ -9396,13 +10142,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
           return res.status(400).json({ message: "Invalid seed type" });
       }
     } catch (error) {
-      console.error("[super-admin] Seed failed:", error);
+      routeLog.error("[super-admin] Seed failed:", error);
       res.status(500).json({ message: "Failed to generate test data" });
     }
   });
 
   // LGD Master Data Import Endpoint
-  app.post("/api/admin/lgd/import", requireRole('admin'), async (req, res) => {
+  app.post("/api/admin/lgd/import", requireRole('admin', 'super_admin'), async (req, res) => {
     try {
       const { csvData, dataType } = req.body;
       
@@ -9538,7 +10284,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const pincode = values[5];
 
           if (!defaultDistrict) {
-            console.warn("[LGD] No districts available; skipping urban body import");
+            routeLog.warn("[LGD] No districts available; skipping urban body import");
             break;
           }
 
@@ -9572,18 +10318,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
 
     } catch (error) {
-      console.error("[admin] LGD import failed:", error);
+      routeLog.error("[admin] LGD import failed:", error);
       res.status(500).json({ message: "Failed to import LGD data", error: String(error) });
     }
   });
 
   // HimKosh Payment Gateway Routes
   app.use("/api/himkosh", himkoshRoutes);
-  console.log('[himkosh] Payment gateway routes registered');
+  routeLog.info('[himkosh] Payment gateway routes registered');
 
   // Start production stats scraper (runs on boot and hourly)
   startScraperScheduler();
-  console.log('[scraper] Production stats scraper initialized');
+  routeLog.info('[scraper] Production stats scraper initialized');
 
   const httpServer = createServer(app);
   return httpServer;

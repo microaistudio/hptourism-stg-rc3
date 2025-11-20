@@ -30,7 +30,7 @@ type EmailGatewayResponse = {
   updatedBy?: string | null;
 } | null;
 
-type SmsGatewayMode = "nic" | "twilio";
+type SmsGatewayMode = "nic" | "nic_v2" | "twilio";
 
 type SmsGatewayResponse = {
   provider?: SmsGatewayMode;
@@ -39,6 +39,14 @@ type SmsGatewayResponse = {
     senderId?: string;
     departmentKey?: string;
     templateId?: string;
+    postUrl?: string;
+    passwordSet?: boolean;
+  };
+  nicV2?: {
+    username?: string;
+    senderId?: string;
+    templateId?: string;
+    key?: string;
     postUrl?: string;
     passwordSet?: boolean;
   };
@@ -82,6 +90,14 @@ type SmsFormState = {
     templateId: string;
     postUrl: string;
   };
+  nicV2: {
+    username: string;
+    password: string;
+    senderId: string;
+    templateId: string;
+    key: string;
+    postUrl: string;
+  };
   twilio: {
     accountSid: string;
     authToken: string;
@@ -94,7 +110,30 @@ type SmsFormState = {
 
 const DEFAULT_SMS_TEMPLATE_ID = "1007739248479536901";
 const DEFAULT_SMS_MESSAGE =
-  "123456 is your OTP for Himachal Tourism e-services portal registration. - Tourism Department";
+  "{#var#} is your OTP for Himachal Tourism e-services portal login. - HP Tourism E-services";
+
+const SAMPLE_SMS_VARIABLES: Record<string, string> = {
+  OTP: "123456",
+  OWNER_NAME: "Test Owner",
+  APPLICATION_ID: "HS-2025-0001",
+  INSPECTION_DATE: "25 Nov 2025",
+  REMARKS: "Sample remarks for preview",
+};
+
+const renderTestSmsMessage = (template: string) => {
+  if (!template) {
+    return "";
+  }
+  let message = template.trim();
+  // Replace NIC DLT placeholders ({#var#}) with demo OTP digits.
+  message = message.replace(/\{#var#\}/gi, SAMPLE_SMS_VARIABLES.OTP);
+  // Replace {{TOKEN}} placeholders with canned demo values.
+  message = message.replace(/{{\s*([^}]+)\s*}}/g, (_, token) => {
+    const key = token.trim().toUpperCase();
+    return SAMPLE_SMS_VARIABLES[key] ?? SAMPLE_SMS_VARIABLES.OTP;
+  });
+  return message;
+};
 
 export const CommunicationsCard = () => {
   const { toast } = useToast();
@@ -129,17 +168,26 @@ export const CommunicationsCard = () => {
       templateId: DEFAULT_SMS_TEMPLATE_ID,
       postUrl: "https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT",
     },
+    nicV2: {
+      username: "",
+      password: "",
+      senderId: "",
+      templateId: DEFAULT_SMS_TEMPLATE_ID,
+      key: "",
+      postUrl: "https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT",
+    },
     twilio: {
       accountSid: "",
       authToken: "",
       fromNumber: "",
       messagingServiceSid: "",
     },
-    testMobile: "+918091441005",
+    testMobile: "8091441005",
     testMessage: DEFAULT_SMS_MESSAGE,
   });
   const [smsSecrets, setSmsSecrets] = useState({
     nicPasswordSet: false,
+    nicV2PasswordSet: false,
     twilioAuthTokenSet: false,
   });
   const [smsTestResponse, setSmsTestResponse] = useState("");
@@ -197,6 +245,14 @@ export const CommunicationsCard = () => {
           templateId: smsSettings.nic?.templateId ?? DEFAULT_SMS_TEMPLATE_ID,
           postUrl: smsSettings.nic?.postUrl ?? prev.nic.postUrl,
         },
+        nicV2: {
+          username: smsSettings.nicV2?.username ?? "",
+          password: "",
+          senderId: smsSettings.nicV2?.senderId ?? "",
+          templateId: smsSettings.nicV2?.templateId ?? DEFAULT_SMS_TEMPLATE_ID,
+          key: smsSettings.nicV2?.key ?? "",
+          postUrl: smsSettings.nicV2?.postUrl ?? prev.nicV2.postUrl,
+        },
         twilio: {
           accountSid: smsSettings.twilio?.accountSid ?? "",
           authToken: "",
@@ -207,6 +263,7 @@ export const CommunicationsCard = () => {
       }));
       setSmsSecrets({
         nicPasswordSet: Boolean(smsSettings.nic?.passwordSet),
+        nicV2PasswordSet: Boolean(smsSettings.nicV2?.passwordSet),
         twilioAuthTokenSet: Boolean(smsSettings.twilio?.authTokenSet),
       });
     }
@@ -246,10 +303,12 @@ export const CommunicationsCard = () => {
       setSmsForm((prev) => ({
         ...prev,
         nic: { ...prev.nic, password: "" },
+        nicV2: { ...prev.nicV2, password: "" },
         twilio: { ...prev.twilio, authToken: "" },
       }));
       setSmsSecrets((prev) => ({
         nicPasswordSet: prev.nicPasswordSet || Boolean(variables?.nic?.password),
+        nicV2PasswordSet: prev.nicV2PasswordSet || Boolean(variables?.nicV2?.password),
         twilioAuthTokenSet: prev.twilioAuthTokenSet || Boolean(variables?.twilio?.authToken),
       }));
       refetch();
@@ -285,9 +344,11 @@ export const CommunicationsCard = () => {
 
   const testSmsMutation = useMutation({
     mutationFn: async () => {
+      const templateMessage = smsForm.testMessage || DEFAULT_SMS_MESSAGE;
+      const renderedMessage = renderTestSmsMessage(templateMessage);
       const response = await apiRequest("POST", "/api/admin/communications/sms/test", {
         mobile: smsForm.testMobile,
-        message: smsForm.testMessage || DEFAULT_SMS_MESSAGE,
+        message: renderedMessage,
       });
       return (await response.json()) as {
         response?: string;
@@ -321,6 +382,7 @@ export const CommunicationsCard = () => {
 
   const buildSmsPayload = () => {
     const nicPostUrl = smsForm.nic.postUrl.trim();
+    const nicV2PostUrl = smsForm.nicV2.postUrl.trim();
     const twilioFrom = smsForm.twilio.fromNumber.trim();
     const twilioMessagingSid = smsForm.twilio.messagingServiceSid.trim();
     return {
@@ -332,6 +394,14 @@ export const CommunicationsCard = () => {
         templateId: smsForm.nic.templateId.trim() || DEFAULT_SMS_TEMPLATE_ID,
         postUrl: nicPostUrl || "https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT",
         password: smsForm.nic.password || undefined,
+      },
+      nicV2: {
+        username: smsForm.nicV2.username.trim(),
+        senderId: smsForm.nicV2.senderId.trim(),
+        templateId: smsForm.nicV2.templateId.trim() || DEFAULT_SMS_TEMPLATE_ID,
+        key: smsForm.nicV2.key.trim(),
+        postUrl: nicV2PostUrl || "https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT",
+        password: smsForm.nicV2.password || undefined,
       },
       twilio: {
         accountSid: smsForm.twilio.accountSid.trim(),
@@ -415,10 +485,11 @@ export const CommunicationsCard = () => {
                   <SelectTrigger>
                     <SelectValue placeholder="Select provider" />
                   </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="nic">NIC MSDG (Production)</SelectItem>
-                    <SelectItem value="twilio">Twilio (Cloud fallback)</SelectItem>
-                  </SelectContent>
+                <SelectContent>
+                  <SelectItem value="nic">NIC MSDG (Production)</SelectItem>
+                  <SelectItem value="nic_v2">NIC MSDG (Hash Gateway)</SelectItem>
+                  <SelectItem value="twilio">Twilio (Cloud fallback)</SelectItem>
+                </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground mt-1">
                   Use Twilio for E2E testing outside the state network. Switch back to NIC before going live.
@@ -490,14 +561,110 @@ export const CommunicationsCard = () => {
                       }
                       placeholder={DEFAULT_SMS_TEMPLATE_ID}
                       disabled={disabled || saveSmsMutation.isPending}
+                  />
+                </div>
+                <div>
+                  <Label>Gateway URL</Label>
+                  <Input
+                    value={smsForm.nic.postUrl}
+                      onChange={(e) =>
+                        setSmsForm((prev) => ({ ...prev, nic: { ...prev.nic, postUrl: e.target.value } }))
+                      }
+                      placeholder="https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT"
+                      disabled={disabled || saveSmsMutation.isPending}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {smsForm.provider === "nic_v2" && (
+                <div className="space-y-3 rounded-lg border p-3 bg-muted/20">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label>Username</Label>
+                      <Input
+                        value={smsForm.nicV2.username}
+                        onChange={(e) =>
+                          setSmsForm((prev) => ({
+                            ...prev,
+                            nicV2: { ...prev.nicV2, username: e.target.value },
+                          }))
+                        }
+                        placeholder="hpgovt-TACA"
+                        disabled={disabled || saveSmsMutation.isPending}
+                      />
+                    </div>
+                    <div>
+                      <Label>
+                        Password {smsSecrets.nicV2PasswordSet && "(leave blank to keep current)"}
+                      </Label>
+                      <Input
+                        type="password"
+                        value={smsForm.nicV2.password}
+                        onChange={(e) =>
+                          setSmsForm((prev) => ({
+                            ...prev,
+                            nicV2: { ...prev.nicV2, password: e.target.value },
+                          }))
+                        }
+                        placeholder="Encrypted password"
+                        disabled={disabled || saveSmsMutation.isPending}
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label>Sender ID</Label>
+                      <Input
+                        value={smsForm.nicV2.senderId}
+                        onChange={(e) =>
+                          setSmsForm((prev) => ({
+                            ...prev,
+                            nicV2: { ...prev.nicV2, senderId: e.target.value },
+                          }))
+                        }
+                        placeholder="hpgovt"
+                        disabled={disabled || saveSmsMutation.isPending}
+                      />
+                    </div>
+                    <div>
+                      <Label>Template ID</Label>
+                      <Input
+                        value={smsForm.nicV2.templateId}
+                        onChange={(e) =>
+                          setSmsForm((prev) => ({
+                            ...prev,
+                            nicV2: { ...prev.nicV2, templateId: e.target.value },
+                          }))
+                        }
+                        placeholder={DEFAULT_SMS_TEMPLATE_ID}
+                        disabled={disabled || saveSmsMutation.isPending}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label>Generated Hash Key</Label>
+                    <Input
+                      value={smsForm.nicV2.key}
+                      onChange={(e) =>
+                        setSmsForm((prev) => ({
+                          ...prev,
+                          nicV2: { ...prev.nicV2, key: e.target.value },
+                        }))
+                      }
+                      placeholder="Hash key from NIC portal"
+                      disabled={disabled || saveSmsMutation.isPending}
                     />
                   </div>
                   <div>
                     <Label>Gateway URL</Label>
                     <Input
-                      value={smsForm.nic.postUrl}
+                      value={smsForm.nicV2.postUrl}
                       onChange={(e) =>
-                        setSmsForm((prev) => ({ ...prev, nic: { ...prev.nic, postUrl: e.target.value } }))
+                        setSmsForm((prev) => ({
+                          ...prev,
+                          nicV2: { ...prev.nicV2, postUrl: e.target.value },
+                        }))
                       }
                       placeholder="https://msdgweb.mgov.gov.in/esms/sendsmsrequestDLT"
                       disabled={disabled || saveSmsMutation.isPending}

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { nanoid } from "nanoid";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -14,7 +14,43 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
-import { ArrowLeft, ArrowRight, Save, Send, Home, User as UserIcon, Bed, Wifi, FileText, IndianRupee, Eye, Lightbulb, AlertTriangle, Sparkles, Info, MapPin, Wind, ParkingCircle, UtensilsCrossed, Droplets, Tv, Shirt, ConciergeBell, Trees, Mountain, PawPrint, Video, Flame, Plus, Trash2, Copy } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Save,
+  Send,
+  Home,
+  User as UserIcon,
+  Bed,
+  Wifi,
+  FileText,
+  IndianRupee,
+  Eye,
+  Lightbulb,
+  AlertTriangle,
+  Sparkles,
+  Info,
+  MapPin,
+  Wind,
+  ParkingCircle,
+  UtensilsCrossed,
+  Droplets,
+  Tv,
+  Shirt,
+  ConciergeBell,
+  Trees,
+  Mountain,
+  PawPrint,
+  Video,
+  Flame,
+  Plus,
+  Trash2,
+  Copy,
+  Accessibility,
+  HandHeart,
+  Landmark,
+  ChefHat,
+} from "lucide-react";
 import type { User, HomestayApplication, UserProfile, ApplicationServiceContext, ApplicationKind } from "@shared/schema";
 import { ObjectUploader, type UploadedFileMetadata } from "@/components/ObjectUploader";
 import { ApplicationSummaryCard } from "@/components/application/application-summary";
@@ -104,6 +140,16 @@ const clampFloat = (value: string) => {
   }
   return parsed;
 };
+
+const AREA_CONVERSION_FACTORS = {
+  kanal: 505.857,
+  marla: 25.29285,
+  bigha: 802.34,
+  sqft: 0.092903,
+  sqm: 1,
+};
+const SQM_TO_SQFT = 10.7639;
+type AreaUnit = keyof typeof AREA_CONVERSION_FACTORS;
 
 const sanitizeGstinInput = (value: string) =>
   value.toUpperCase().replace(/[^0-9A-Z]/g, "").slice(0, 15);
@@ -576,6 +622,10 @@ const AMENITIES = [
   { id: "garden", label: "Garden", icon: Trees },
   { id: "mountainView", label: "Mountain View", icon: Mountain },
   { id: "petFriendly", label: "Pet Friendly", icon: PawPrint },
+  { id: "accessible", label: "Accessible", icon: Accessibility },
+  { id: "seniorFriendly", label: "Senior Citizen Friendly", icon: HandHeart },
+  { id: "vernacularArchitecture", label: "Vernacular Architecture", icon: Landmark },
+  { id: "authenticFood", label: "Authentic Food", icon: ChefHat },
   { id: "cctv", label: "CCTV Surveillance", icon: Video },
   { id: "fireSafety", label: "Fire Safety Equipment", icon: Flame },
 ];
@@ -740,6 +790,25 @@ const setType2RowsSafe = useCallback(
 const [syncAttachedBaths, setSyncAttachedBaths] = useState(true);
 const derivedRoomCalcMode = roomCalcModeSettingData?.mode ?? DEFAULT_ROOM_CALC_MODE.mode;
 const [roomCalcMode, setRoomCalcMode] = useState<RoomCalculationMode>(derivedRoomCalcMode);
+const [areaConverter, setAreaConverter] = useState<{ rowId: string | null; open: boolean }>({
+  rowId: null,
+  open: false,
+});
+const [areaInputs, setAreaInputs] = useState<{ unit: AreaUnit; value: string }>({ unit: "kanal", value: "" });
+const areaConversion = useMemo(() => {
+  const numericValue = Number(areaInputs.value) || 0;
+  const factor = AREA_CONVERSION_FACTORS[areaInputs.unit];
+  const sqm = numericValue * factor;
+  return {
+    sqm,
+    sqft: sqm * SQM_TO_SQFT,
+  };
+}, [areaInputs]);
+const openAreaConverter = (rowId: string) => {
+  setAreaInputs({ unit: "kanal", value: "" });
+  setAreaConverter({ rowId, open: true });
+};
+const closeAreaConverter = () => setAreaConverter({ rowId: null, open: false });
 useEffect(() => {
   setRoomCalcMode(derivedRoomCalcMode);
 }, [derivedRoomCalcMode]);
@@ -772,6 +841,64 @@ useEffect(() => {
 
 const { data: userData } = useQuery<{ user: User }>({
   queryKey: ["/api/auth/me"],
+});
+
+const defaultOwnerNameParts = splitFullName(userData?.user?.fullName || "");
+
+const form = useForm<ApplicationForm>({
+  // No resolver - validation happens manually on next/submit to allow draft saves
+  defaultValues: {
+    propertyName: "",
+    address: "",
+    district: "",
+    pincode: PINCODE_PREFIX,
+    locationType: "" as LocationType | "",
+    telephone: "",
+    tehsil: "",
+    tehsilOther: "",
+    gramPanchayat: "",
+    urbanBody: "",
+    ward: "",
+    ownerEmail: userData?.user?.email || "",
+    ownerMobile: userData?.user?.mobile || "",
+    ownerName: userData?.user?.fullName || "",
+    ownerFirstName: defaultOwnerNameParts.firstName,
+    ownerLastName: defaultOwnerNameParts.lastName,
+    ownerAadhaar: userData?.user?.aadhaarNumber || "",
+    ownerGender: normalizeGender((userData?.user as any)?.gender) as "male" | "female" | "other",
+    propertyOwnership: "owned",
+    category: "silver",
+    proposedRoomRate: 2000,
+    singleBedRoomRate: 0,
+    doubleBedRoomRate: 0,
+    familySuiteRate: 0,
+    projectType: "new_project",
+    propertyArea: 0,
+    singleBedRooms: 0,
+    singleBedBeds: 1,
+    singleBedRoomSize: undefined,
+    doubleBedRooms: 0,
+    doubleBedBeds: 2,
+    doubleBedRoomSize: undefined,
+    familySuites: 0,
+    familySuiteBeds: 4,
+    familySuiteSize: undefined,
+    attachedWashrooms: 1,
+    gstin: "",
+    distanceAirport: undefined,
+    distanceRailway: undefined,
+    distanceCityCenter: undefined,
+    distanceShopping: undefined,
+    distanceBusStand: undefined,
+    lobbyArea: undefined,
+    diningArea: undefined,
+    parkingArea: "",
+    ecoFriendlyFacilities: "",
+    differentlyAbledFacilities: "",
+    fireEquipmentDetails: "",
+    certificateValidityYears: "1",
+    nearestHospital: "",
+  },
 });
 
 const { data: applicationsData } = useQuery<{ applications: HomestayApplication[] }>({
@@ -833,17 +960,58 @@ useEffect(() => {
   });
 
   // Load draft application if resuming
-const { data: draftData } = useQuery<{ application: HomestayApplication }>({
-  queryKey: ["/api/applications", draftIdFromUrl],
-  enabled: !!draftIdFromUrl,
-});
+const [draftApplication, setDraftApplication] = useState<HomestayApplication | null>(null);
+const [isDraftLoading, setIsDraftLoading] = useState(false);
+const draftIdToLoad = draftId ?? draftIdFromUrl ?? null;
+
+useEffect(() => {
+  let cancelled = false;
+  if (!draftIdToLoad) {
+    setDraftApplication(null);
+    return;
+  }
+  setIsDraftLoading(true);
+  (async () => {
+    try {
+      const res = await fetch(`/api/applications/${draftIdToLoad}`, {
+        credentials: "include",
+      });
+      if (res.status === 401) {
+        if (!cancelled) {
+          setDraftApplication(null);
+        }
+        return;
+      }
+      if (!res.ok) {
+        const text = (await res.text()) || res.statusText;
+        throw new Error(text);
+      }
+      const data = await res.json();
+      if (!cancelled) {
+        setDraftApplication(data?.application ?? null);
+      }
+    } catch (error) {
+      console.error("[draft-load]", error);
+      if (!cancelled) {
+        setDraftApplication(null);
+      }
+    } finally {
+      if (!cancelled) {
+        setIsDraftLoading(false);
+      }
+    }
+  })();
+  return () => {
+    cancelled = true;
+  };
+}, [draftIdToLoad]);
 
 const { data: correctionData } = useQuery<{ application: HomestayApplication }>({
   queryKey: ["/api/applications", correctionIdFromUrl],
   enabled: !!correctionIdFromUrl,
 });
 
-const activeDraftApplication = draftData?.application ?? null;
+const activeDraftApplication = draftApplication;
 const activeCorrectionApplication = correctionData?.application ?? null;
 const activeHydratedApplication = activeDraftApplication ?? (isCorrectionMode ? activeCorrectionApplication : null);
 const activeApplicationKind = (activeHydratedApplication?.applicationKind as ApplicationKind | undefined) ?? "new_registration";
@@ -858,63 +1026,30 @@ const requestedRoomDelta = serviceContext?.requestedRoomDelta;
 const serviceNote = activeDraftApplication?.serviceNotes;
   const shouldLockPropertyDetails = isServiceDraft;
 
-  const defaultOwnerNameParts = splitFullName(userData?.user?.fullName || "");
+  useEffect(() => {
+    if (!activeDraftApplication) {
+      return;
+    }
+    const currentTehsilValue = form.getValues("tehsil");
+    const currentDistrictValue = form.getValues("district");
+    if (!currentDistrictValue && activeDraftApplication.district) {
+      form.setValue("district", activeDraftApplication.district, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+    }
+    if (!currentTehsilValue && (activeDraftApplication.tehsil || activeDraftApplication.tehsilOther)) {
+      form.setValue("tehsil", activeDraftApplication.tehsil || "__other", {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+      form.setValue("tehsilOther", activeDraftApplication.tehsilOther || "", {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+    }
+  }, [activeDraftApplication, form]);
 
-const form = useForm<ApplicationForm>({
-    // No resolver - validation happens manually on next/submit to allow draft saves
-    defaultValues: {
-      propertyName: "",
-      address: "",
-      district: "",
-      pincode: PINCODE_PREFIX,
-      locationType: "" as LocationType | "",
-      telephone: "",
-      tehsil: "",
-      tehsilOther: "",
-      gramPanchayat: "",
-      urbanBody: "",
-      ward: "",
-      ownerEmail: userData?.user?.email || "",
-      ownerMobile: userData?.user?.mobile || "",
-      ownerName: userData?.user?.fullName || "",
-      ownerFirstName: defaultOwnerNameParts.firstName,
-      ownerLastName: defaultOwnerNameParts.lastName,
-      ownerAadhaar: userData?.user?.aadhaarNumber || "",
-      ownerGender: normalizeGender((userData?.user as any)?.gender) as "male" | "female" | "other",
-      propertyOwnership: "owned",
-      category: "silver",
-      proposedRoomRate: 2000,
-      singleBedRoomRate: 0,
-      doubleBedRoomRate: 0,
-      familySuiteRate: 0,
-      projectType: "new_project",
-      propertyArea: 0,
-      singleBedRooms: 0,
-      singleBedBeds: 1,
-      singleBedRoomSize: undefined,
-      doubleBedRooms: 0,
-      doubleBedBeds: 2,
-      doubleBedRoomSize: undefined,
-      familySuites: 0,
-      familySuiteBeds: 4,
-      familySuiteSize: undefined,
-      attachedWashrooms: 1,
-      gstin: "",
-      distanceAirport: undefined,
-      distanceRailway: undefined,
-      distanceCityCenter: undefined,
-      distanceShopping: undefined,
-      distanceBusStand: undefined,
-      lobbyArea: undefined,
-      diningArea: undefined,
-      parkingArea: "",
-      ecoFriendlyFacilities: "",
-      differentlyAbledFacilities: "",
-      fireEquipmentDetails: "",
-      certificateValidityYears: "1",
-  nearestHospital: "",
-},
-});
 
 const buildType2RowsFromForm = useCallback((): Type2Row[] => {
   const rows: Type2Row[] = [];
@@ -1028,6 +1163,16 @@ const addType2Row = useCallback(() => {
 const removeType2Row = useCallback((rowId: string) => {
   setType2RowsSafe((rows) => rows.filter((row) => row.id !== rowId));
 }, [setType2RowsSafe]);
+
+const applyAreaConversion = () => {
+  if (!areaConverter.rowId || areaConversion.sqm <= 0) {
+    return;
+  }
+  updateType2Row(areaConverter.rowId, {
+    area: Number(areaConversion.sqm.toFixed(2)),
+  });
+  closeAreaConverter();
+};
 
 const resetType2Rows = useCallback(() => {
   setType2RowsSafe(() => [makeEmptyType2Row("single")]);
@@ -1151,6 +1296,19 @@ const normalizedPincode = ensurePincodeWithPrefix(pincodeValue ?? PINCODE_PREFIX
 const pincodeSuffixValue = normalizedPincode.slice(PINCODE_PREFIX.length);
 const pincodeIsValid = PINCODE_REGEX.test(normalizedPincode);
 const showPincodeHint = pincodeSuffixValue.length < PINCODE_SUFFIX_LENGTH;
+
+useEffect(() => {
+  if (isHydratingDraft.current) {
+    return;
+  }
+  const currentTehsilValue = form.getValues("tehsil") ?? "";
+  const currentTehsilOtherValue =
+    currentTehsilValue === "__other" ? form.getValues("tehsilOther") ?? "" : "";
+  lastHydratedTehsil.current = {
+    value: currentTehsilValue,
+    other: currentTehsilOtherValue,
+  };
+}, [form, tehsil, tehsilOther]);
 
 useEffect(() => {
   if (isHydratingDraft.current) {
@@ -1421,6 +1579,19 @@ const hydrateFormFromSource = (source: Partial<HomestayApplication> | DraftForm 
       setPropertyPhotos([]);
     }
     setTimeout(() => {
+      form.setValue("district", districtValue, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+      form.setValue("tehsil", resolvedTehsil, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+      form.setValue("tehsilOther", resolvedTehsilOther, {
+        shouldDirty: false,
+        shouldValidate: false,
+      });
+      setType2RowsSafe(() => buildType2RowsFromForm());
       isHydratingDraft.current = false;
     }, 0);
   };
@@ -1599,8 +1770,8 @@ const copyApplicationNumber = async () => {
 
   // Load draft data into form when resuming
   useEffect(() => {
-    if (!draftData?.application) return;
-    const draft = draftData.application;
+    if (!draftApplication) return;
+    const draft = draftApplication;
     setDraftId(draft.id);
     hydrateFormFromSource(draft);
 
@@ -1622,7 +1793,7 @@ const copyApplicationNumber = async () => {
         ? "This request is linked to your approved application. Review and submit once adjustments are complete."
         : "Continue editing your application from where you left off.",
     });
-  }, [draftData]);
+  }, [draftApplication]);
 
   // Load existing application for corrections
   useEffect(() => {
@@ -2646,6 +2817,10 @@ const submitApplicationMutation = useMutation({
                           <Select
                             onValueChange={(value) => {
                               field.onChange(value);
+                              if (isHydratingDraft.current) {
+                                return;
+                              }
+
                               form.setValue('gramPanchayat', '');
                               form.setValue('urbanBody', '');
                               form.setValue('ward', '');
@@ -2710,6 +2885,10 @@ const submitApplicationMutation = useMutation({
                                 onValueChange={(value) => {
                                   const previousTehsil = form.getValues('tehsil');
                                   field.onChange(value);
+
+                                  if (isHydratingDraft.current) {
+                                    return;
+                                  }
 
                                   const tehsilChanged = value !== previousTehsil;
                                     if (!isHydratingDraft.current && tehsilChanged) {
@@ -3627,7 +3806,9 @@ const submitApplicationMutation = useMutation({
                                               updateType2Row(row.id, { tariffBucket: value as TariffBucket })
                                             }
                                           >
-                                            <SelectTrigger className={tariffHighlightClass}>
+                                            <SelectTrigger
+                                              className={`${tariffHighlightClass ?? ""} whitespace-normal font-medium text-left justify-start pr-8`}
+                                            >
                                               <SelectValue placeholder="Select tariff" />
                                             </SelectTrigger>
                                             <SelectContent>
@@ -3638,6 +3819,11 @@ const submitApplicationMutation = useMutation({
                                               ))}
                                             </SelectContent>
                                           </Select>
+                                          {bucketInfo && (
+                                            <p className="text-[11px] text-muted-foreground mt-1">
+                                              {bucketInfo.label} · {bucketInfo.explanation}
+                                            </p>
+                                          )}
                                           {tariffHelperText && (
                                             <p
                                               className={`text-[11px] mt-1 ${
@@ -3664,6 +3850,18 @@ const submitApplicationMutation = useMutation({
                                           })
                                         }
                                       />
+                                      <div className="mt-1 flex flex-wrap justify-between items-center gap-2 text-[11px] text-muted-foreground">
+                                        <span>Enter the room size in square metres.</span>
+                                        <Button
+                                          type="button"
+                                          variant="link"
+                                          size="sm"
+                                          className="px-0 text-primary"
+                                          onClick={() => openAreaConverter(row.id)}
+                                        >
+                                          Convert Kanal/Marla/Bigha
+                                        </Button>
+                                      </div>
                                     </div>
                                   </>
                                 );
@@ -4466,7 +4664,7 @@ const submitApplicationMutation = useMutation({
                     className="bg-muted/50 border-0 shadow-none"
                     highlightCategoryBadge={false}
                     application={{
-                      applicationNumber: draftData?.application?.applicationNumber ?? correctionId ?? undefined,
+                      applicationNumber: activeDraftApplication?.applicationNumber ?? correctionId ?? undefined,
                       propertyName: form.watch("propertyName") || undefined,
                       address: form.watch("address") || undefined,
                       district: form.watch("district") || undefined,
@@ -4591,6 +4789,94 @@ const submitApplicationMutation = useMutation({
           </form>
         </Form>
 
+        <Dialog
+          open={areaConverter.open}
+          onOpenChange={(open) => {
+            if (!open) {
+              closeAreaConverter();
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-[480px]">
+            <DialogHeader>
+              <DialogTitle>Convert traditional area units</DialogTitle>
+              <DialogDescription>
+                Approximate conversion for Kanal, Marla, and Bigha. Values are estimates; refer to your revenue records for precise measurements.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <p className="text-xs uppercase text-muted-foreground mb-1">Unit</p>
+                  <Select
+                    value={areaInputs.unit}
+                    onValueChange={(value) =>
+                      setAreaInputs((prev) => ({
+                        ...prev,
+                        unit: value as AreaUnit,
+                      }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select unit" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="kanal">Kanal</SelectItem>
+                      <SelectItem value="marla">Marla</SelectItem>
+                      <SelectItem value="bigha">Bigha</SelectItem>
+                      <SelectItem value="sqft">Square feet</SelectItem>
+                      <SelectItem value="sqm">Square metres</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-muted-foreground mb-1">Value</p>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={areaInputs.value}
+                    onChange={(event) =>
+                      setAreaInputs((prev) => ({
+                        ...prev,
+                        value: event.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+              <div className="rounded-lg border p-3 text-sm bg-muted/30">
+                <p className="font-semibold">Converted area</p>
+                {areaConversion.sqm > 0 ? (
+                  <div className="mt-2 space-y-1">
+                    <p>
+                      <span className="font-medium">{areaConversion.sqm.toFixed(2)}</span> sq. metres
+                    </p>
+                    <p className="text-muted-foreground">
+                      ({areaConversion.sqft.toFixed(0)} sq. feet)
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground mt-2">Enter a value above to see the conversion.</p>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                1 Kanal ≈ 505.86 sq.m., 1 Marla ≈ 25.29 sq.m., 1 Bigha ≈ 802.34 sq.m. Conversions may vary slightly by district.
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={closeAreaConverter}>
+                  Cancel
+                </Button>
+                <Button
+                  onClick={applyAreaConversion}
+                  disabled={!areaConverter.rowId || areaConversion.sqm <= 0}
+                >
+                  Use {areaConversion.sqm > 0 ? areaConversion.sqm.toFixed(2) : "converted"} sq.m.
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
         {/* Preview Dialog */}
         <Dialog open={showPreview} onOpenChange={setShowPreview}>
           <DialogContent className="max-w-4xl max-h-[90vh]">
