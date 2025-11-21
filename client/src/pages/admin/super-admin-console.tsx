@@ -324,7 +324,8 @@ export default function SuperAdminConsole() {
     const value = event.target.value;
     setDbForm((prev) => ({ ...prev, [field]: value }));
   };
-  const formatDateTime = (value?: string | null) => (value ? new Date(value).toLocaleString() : null);
+  const formatDateTime = (value?: string | Date | null) =>
+    value ? new Date(value).toLocaleString() : null;
   const handleGatewayInputChange =
     (field: keyof typeof gatewayForm) => (event: ChangeEvent<HTMLInputElement>) => {
       const value = event.target.value;
@@ -475,31 +476,24 @@ export default function SuperAdminConsole() {
     if (!himkoshGatewayData) {
       return;
     }
-    const source = himkoshGatewayData.overrides || himkoshGatewayData.effective;
-    if (!source) {
-      return;
-    }
+    const effective = himkoshGatewayData.effective;
+    const source = himkoshGatewayData.overrides || effective;
+    if (!source) return;
+    const heads = (source as any).heads ?? effective?.heads;
+
     setGatewayForm({
       merchantCode: source.merchantCode ?? "",
       deptId: source.deptId ?? "",
       serviceCode: source.serviceCode ?? "",
       ddo: source.ddo ?? "",
-      head1:
-        (source as any).head1 ??
-        source.heads?.registrationFee ??
-        himkoshGatewayData.effective?.heads?.registrationFee ??
-        "",
-      head2:
-        (source as any).head2 ??
-        source.heads?.secondaryHead ??
-        himkoshGatewayData.effective?.heads?.secondaryHead ??
-        "",
+      head1: (source as any).head1 ?? (heads as any)?.registrationFee ?? (effective as any)?.head1 ?? "",
+      head2: (source as any).head2 ?? (heads as any)?.secondaryHead ?? (effective as any)?.head2 ?? "",
       head2Amount:
         ((source as any).head2Amount ??
-          source.heads?.secondaryHeadAmount ??
-          himkoshGatewayData.effective?.heads?.secondaryHeadAmount ??
+          (heads as any)?.secondaryHeadAmount ??
+          (effective as any)?.head2Amount ??
           "")?.toString() ?? "",
-      returnUrl: source.returnUrl ?? himkoshGatewayData.effective?.returnUrl ?? "",
+      returnUrl: source.returnUrl ?? (effective as any)?.returnUrl ?? "",
       allowFallback:
         (source as any).allowFallback === undefined ? true : Boolean((source as any).allowFallback),
     });
@@ -1177,7 +1171,7 @@ export default function SuperAdminConsole() {
       )
     : 0;
   const canRunStaffImport = Boolean(staffCsvText.trim()) && !staffImportMutation.isPending;
-  const formatDateLabel = (value?: string | null) => formatDateTime(value) ?? "—";
+  const formatDateLabel = (value?: string | Date | null) => formatDateTime(value) ?? "—";
   const renderTransactionStatus = (transaction: HimkoshTransaction) => {
     const success = transaction.statusCd === "1" || transaction.transactionStatus === "success";
     const failure = transaction.statusCd === "0" || transaction.transactionStatus === "failed";

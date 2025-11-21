@@ -710,7 +710,7 @@ export default function NewApplication() {
       is managed from{" "}
       <Button
         type="button"
-        variant="link"
+        variant="ghost"
         className="h-auto px-0 text-primary"
         onClick={goToProfile}
       >
@@ -852,7 +852,7 @@ const form = useForm<ApplicationForm>({
     address: "",
     district: "",
     pincode: PINCODE_PREFIX,
-    locationType: "" as LocationType | "",
+    locationType: "mc" as LocationType,
     telephone: "",
     tehsil: "",
     tehsilOther: "",
@@ -1180,12 +1180,12 @@ const resetType2Rows = useCallback(() => {
   applyType2RowsToForm([makeEmptyType2Row("single")]);
 }, [applyType2RowsToForm, setType2RowsSafe]);
 
-  // Ensure location type starts blank for fresh applications (force manual selection)
+  // Ensure location type has a sane default for fresh applications
   useEffect(() => {
     if (draftIdFromUrl || correctionIdFromUrl || activeDraftApplication) {
       return;
     }
-    form.setValue("locationType", "" as LocationType | "", {
+    form.setValue("locationType", "mc", {
       shouldDirty: false,
       shouldValidate: false,
     });
@@ -1201,8 +1201,8 @@ const gstinHasValue = normalizedWatchedGstin.length > 0;
 const gstinMatchesPattern = GSTIN_REGEX.test(normalizedWatchedGstin);
 const gstinIsValid = !requiresGstin || (gstinHasValue && gstinMatchesPattern);
 const gstinBlocking = requiresGstin && !gstinIsValid;
-const locationType = (form.watch("locationType") || "") as LocationType | "";
-const resolvedLocationType = (locationType || "gp") as LocationType;
+const locationType = (form.watch("locationType") || "mc") as LocationType;
+const resolvedLocationType = locationType as LocationType;
   const watchedDistrict = form.watch("district");
   const isHydratingDraft = useRef(false);
   const gramFieldConfig =
@@ -1469,7 +1469,7 @@ const hydrateFormFromSource = (source: Partial<HomestayApplication> | DraftForm 
       urbanBody: (source as any).urbanBody ?? defaults.urbanBody ?? "",
       ward: (source as any).ward ?? defaults.ward ?? "",
       pincode: (source as any).pincode ?? defaults.pincode ?? "",
-      locationType: ((source.locationType as "mc" | "tcp" | "gp") ?? "") as LocationType | "",
+      locationType: ((source.locationType as "mc" | "tcp" | "gp") ?? "mc") as LocationType,
       telephone: (source as any).telephone ?? defaults.telephone ?? "",
       ownerEmail: source.ownerEmail ?? defaults.ownerEmail ?? "",
       ownerMobile: source.ownerMobile ?? defaults.ownerMobile ?? "",
@@ -1852,7 +1852,7 @@ const copyApplicationNumber = async () => {
 
     form.reset({
       propertyName: "",
-      locationType: "" as LocationType | "",
+      locationType: "mc" as LocationType,
       category: "silver",
       proposedRoomRate: 2000,
       singleBedRoomRate: 0,
@@ -3854,7 +3854,7 @@ const submitApplicationMutation = useMutation({
                                         <span>Enter the room size in square metres.</span>
                                         <Button
                                           type="button"
-                                          variant="link"
+                                          variant="ghost"
                                           size="sm"
                                           className="px-0 text-primary"
                                           onClick={() => openAreaConverter(row.id)}

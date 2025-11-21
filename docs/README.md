@@ -102,6 +102,10 @@ npm run db:studio        # Open Drizzle Studio GUI
 npm run dev              # Start dev server with HMR
 npm run build            # Build for production
 npm run start            # Start production server
+
+# Testing
+npm run test             # Run full Vitest suite (API + React)
+npm run test:watch       # Watch mode for active development
 ```
 
 ### 🧾 Logging & Diagnostics

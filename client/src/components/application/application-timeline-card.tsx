@@ -287,7 +287,7 @@ export function ApplicationTimelineCard({
               icon: ShieldAlert,
               label: entry.action.replace(/_/g, " "),
               description: "Workflow update",
-              tone: "default" as Tone,
+              tone: "default" as TimelineTone,
             };
             const tone = toneStyles[meta.tone];
             const timestamp = entry.createdAt ? new Date(entry.createdAt) : null;

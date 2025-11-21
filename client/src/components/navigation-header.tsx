@@ -11,6 +11,7 @@ interface NavigationHeaderProps {
   backTo?: string;
   actions?: React.ReactNode;
   onPrimaryLogoToggle?: () => void;
+  onBack?: () => void;
 }
 
 export function NavigationHeader({ 
@@ -21,10 +22,15 @@ export function NavigationHeader({
   backTo,
   actions,
   onPrimaryLogoToggle,
+  onBack,
 }: NavigationHeaderProps) {
   const [, setLocation] = useLocation();
 
   const handleBack = () => {
+    if (onBack) {
+      onBack();
+      return;
+    }
     if (backTo) {
       setLocation(backTo);
     } else {

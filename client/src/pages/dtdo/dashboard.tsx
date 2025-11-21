@@ -22,6 +22,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { isCorrectionRequiredStatus } from "@/constants/workflow";
 import { cn } from "@/lib/utils";
 
+const isThisMonthSafe = (value?: string | Date | null) => {
+  if (!value) return false;
+  const date = value instanceof Date ? value : new Date(value);
+  return isThisMonth(date);
+};
+
 interface ApplicationWithOwner extends HomestayApplication {
   ownerName: string;
   ownerMobile: string;
@@ -133,7 +139,7 @@ export default function DTDODashboard() {
   const approvedThisMonth = useMemo(
     () =>
       allApplications.filter(
-        (app) => app.status === "approved" && isThisMonth(app.approvedAt ?? app.updatedAt ?? null),
+        (app) => app.status === "approved" && isThisMonthSafe(app.approvedAt ?? app.updatedAt ?? null),
       ),
     [allApplications],
   );
@@ -166,7 +172,7 @@ export default function DTDODashboard() {
   const rejectedThisMonth = useMemo(
     () =>
       allApplications.filter(
-        (app) => app.status === "rejected" && isThisMonth(app.updatedAt ?? app.approvedAt ?? null),
+        (app) => app.status === "rejected" && isThisMonthSafe(app.updatedAt ?? app.approvedAt ?? null),
       ),
     [allApplications],
   );
@@ -795,8 +801,8 @@ export default function DTDODashboard() {
     actionHint,
   }: {
     application: ApplicationWithOwner;
-    actionLabel: string;
-    actionHint?: string;
+    actionLabel: string | ((application: ApplicationWithOwner) => string);
+    actionHint?: string | ((application: ApplicationWithOwner) => string | undefined);
   }) => {
     const applicationKind = application.applicationKind as ApplicationKind | undefined;
     const isService = isServiceApplication(applicationKind);
@@ -820,6 +826,10 @@ export default function DTDODashboard() {
         handleNavigate();
       }
     };
+
+    const resolvedActionLabel = typeof actionLabel === "function" ? actionLabel(application) : actionLabel;
+    const resolvedActionHint =
+      typeof actionHint === "function" ? actionHint(application) : actionHint ?? undefined;
 
     return (
       <div
@@ -903,12 +913,12 @@ export default function DTDODashboard() {
               handleNavigate();
             }}
           >
-            {actionLabel}
+            {resolvedActionLabel}
             <ArrowRight className="w-4 h-4 ml-2" />
           </Button>
         </div>
-        {actionHint && (
-          <p className="text-xs text-muted-foreground mt-1">{actionHint}</p>
+        {resolvedActionHint && (
+          <p className="text-xs text-muted-foreground mt-1">{resolvedActionHint}</p>
         )}
       </div>
     );

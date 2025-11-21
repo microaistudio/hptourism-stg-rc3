@@ -228,7 +228,7 @@ export default function ExistingOwnerOnboarding() {
       }
 
       return response.json() as Promise<{
-        application: { applicationNumber: string };
+        application: { applicationNumber: string; id?: string };
         message?: string;
       }>;
     },

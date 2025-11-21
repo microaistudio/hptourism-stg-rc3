@@ -21,7 +21,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
 
-const EARLY_OVERRIDE_WINDOW_DAYS = 7;
+const EARLY_OVERRIDE_WINDOW_DAYS: number = 7;
 
 const inspectionReportSchema = z.object({
   actualInspectionDate: z.string().min(1, "Inspection date is required"),

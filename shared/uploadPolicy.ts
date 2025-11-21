@@ -30,6 +30,8 @@ export type UploadPolicy = {
   totalPerApplicationMB: number;
 };
 
+export type UploadCategoryKey = keyof Pick<UploadPolicy, "documents" | "photos">;
+
 export const DEFAULT_UPLOAD_POLICY: UploadPolicy = {
   documents: {
     allowedMimeTypes: ["application/pdf"],

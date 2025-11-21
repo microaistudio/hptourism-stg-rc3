@@ -139,6 +139,11 @@ export default function DTDOInspectionReview() {
     },
   });
 
+  const normalizeDateValue = (value: string | Date | null | undefined) => {
+    if (!value) return null;
+    return typeof value === "string" ? value : value.toISOString();
+  };
+
   const inspectionSummary = useMemo<InspectionReportSummary | null>(() => {
     if (!data) {
       return null;
@@ -154,10 +159,10 @@ export default function DTDOInspectionReview() {
         tehsil: data.application.tehsil,
         address: data.application.address,
         category: data.application.category,
-        status: data.application.status,
+        status: data.application.status ?? "",
         siteInspectionOutcome: data.application.siteInspectionOutcome ?? null,
         siteInspectionNotes: data.application.siteInspectionNotes ?? null,
-        siteInspectionCompletedDate: data.application.siteInspectionCompletedDate ?? null,
+        siteInspectionCompletedDate: normalizeDateValue(data.application.siteInspectionCompletedDate),
       },
       owner: data.owner
         ? {

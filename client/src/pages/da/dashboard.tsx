@@ -28,11 +28,10 @@ import {
 } from "@/components/application/application-pipeline-row";
 import { isServiceApplication } from "@/components/application/application-kind-badge";
 import { DASummaryCard, type SlaNotice, type SummaryCardBreakdown } from "./summary-card";
-import { DASummaryCard, type SlaNotice } from "./summary-card";
 
-const isInCurrentMonth = (value?: string | null) => {
+const isInCurrentMonth = (value?: string | Date | null) => {
   if (!value) return false;
-  const date = new Date(value);
+  const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return false;
   return isThisMonth(date);
 };

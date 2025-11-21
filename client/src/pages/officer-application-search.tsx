@@ -416,8 +416,8 @@ export default function OfficerApplicationSearch() {
                     <TableRow key={application.id}>
                       <TableCell className="font-medium">
                         <Button
-                          variant="link"
-                          className="px-0 font-semibold"
+                          variant="ghost"
+                          className="px-0 font-semibold underline"
                           onClick={() => setLocation(`${detailBasePath}${application.id}`)}
                         >
                           {application.applicationNumber}

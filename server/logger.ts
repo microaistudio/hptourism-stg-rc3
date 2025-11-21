@@ -33,7 +33,7 @@ const buildFileStream = () => {
   const rotationStream = createStream(baseName, {
     path: directory,
     size: `${config.logging.file.maxSizeMB}M`,
-    interval: config.logging.file.interval,
+    interval: config.logging.file.interval as any,
     maxFiles: config.logging.file.maxFiles,
     compress: "gzip",
   });
@@ -73,7 +73,7 @@ const destination =
     ? multistream(streamEntries)
     : streamEntries[0]?.stream ?? process.stdout;
 
-export const logger = pino(
+export const logger: any = pino(
   {
     level: config.logging.level,
   },

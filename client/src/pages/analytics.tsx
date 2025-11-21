@@ -78,7 +78,7 @@ const PRODUCTION_STATS_FALLBACK: ProductionStats = {
   approvedApplications: 16301,
   rejectedApplications: 1142,
   pendingApplications: 2262,
-  scrapedAt: new Date().toISOString(),
+  scrapedAt: new Date(),
 };
 
 export default function AnalyticsPage() {

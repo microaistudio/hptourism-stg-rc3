@@ -26,6 +26,7 @@ import {
   BarChart3,
   ShieldCheck,
   ClipboardList,
+  Timer,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -49,6 +50,13 @@ const SLA_THRESHOLDS = {
   total: 15
 };
 
+type MonitoringApplication = HomestayApplication & {
+  assignedToName?: string | null;
+  assignedTo?: string | null;
+  ownerName?: string | null;
+  statusUpdatedAt?: string | null;
+};
+
 export default function WorkflowMonitoringPage() {
   const [, setLocation] = useLocation();
   const [activeTab, setActiveTab] = useState("pipeline");
@@ -56,7 +64,7 @@ export default function WorkflowMonitoringPage() {
   const [searchQuery, setSearchQuery] = useState("");
 
   // Fetch all applications for monitoring with real-time updates
-  const { data: applications = [], isLoading, error: fetchError } = useQuery<HomestayApplication[]>({
+  const { data: applications = [], isLoading, error: fetchError } = useQuery<MonitoringApplication[]>({
     queryKey: ['/api/applications/all'],
     refetchInterval: 30000, // Auto-refresh every 30 seconds for real-time updates
     retry: 1,
@@ -301,7 +309,7 @@ function VisualPipelineFlow({
   onStageClick,
   activeFilter,
 }: {
-  applications: HomestayApplication[];
+  applications: MonitoringApplication[];
   onStageClick: (status: string | null) => void;
   activeFilter: string | null;
 }) {
@@ -412,7 +420,7 @@ function AtRiskApplicationsTable({
   onClearFilter,
   onSearchChange
 }: { 
-  applications: HomestayApplication[];
+  applications: MonitoringApplication[];
   statusFilter: string | null;
   searchQuery: string;
   onClearFilter: () => void;
@@ -550,7 +558,7 @@ function AtRiskApplicationsTable({
                   </Badge>
                 </div>
                 <div className="w-[10%] text-right">
-                  <Badge variant="ghost">{app.status || "Draft"}</Badge>
+                  <Badge variant="outline">{app.status || "Draft"}</Badge>
                 </div>
               </div>
             ))}
@@ -581,7 +589,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 // SLA Indicator Component
-function SLAIndicator({ app }: { app: HomestayApplication }) {
+function SLAIndicator({ app }: { app: MonitoringApplication }) {
   if (!app.submittedAt) return null;
 
   const daysSinceSubmission = Math.floor(
@@ -614,7 +622,7 @@ function SLAIndicator({ app }: { app: HomestayApplication }) {
 
 const applicantStatuses = new Set(["da_send_back", "dtdo_revert"]);
 
-const getDaysInStage = (application: HomestayApplication) => {
+const getDaysInStage = (application: MonitoringApplication) => {
   const anchor = application.updatedAt || application.statusUpdatedAt || application.submittedAt;
   if (!anchor) return 0;
   return Math.floor((Date.now() - new Date(anchor).getTime()) / (1000 * 60 * 60 * 24));
@@ -631,7 +639,7 @@ function BottlenecksView({
   applications
 }: {
   bottlenecks: Array<{ stage: string; count: number; avgDays: number }>;
-  applications: HomestayApplication[];
+  applications: MonitoringApplication[];
 }) {
   return (
     <Card>
@@ -675,7 +683,7 @@ function BottlenecksView({
 }
 
 // District Performance View
-function DistrictPerformanceView({ applications }: { applications: HomestayApplication[] }) {
+function DistrictPerformanceView({ applications }: { applications: MonitoringApplication[] }) {
   const districtStats = applications.reduce((acc, app) => {
     const district = app.district || 'Unknown';
     if (!acc[district]) {
@@ -874,7 +882,7 @@ function DistrictPerformanceView({ applications }: { applications: HomestayAppli
 }
 
 // Officer Workload View
-function OfficerWorkloadView({ applications }: { applications: HomestayApplication[] }) {
+function OfficerWorkloadView({ applications }: { applications: MonitoringApplication[] }) {
   return (
     <Card>
       <CardHeader>
@@ -897,7 +905,7 @@ function OfficerWorkloadView({ applications }: { applications: HomestayApplicati
 }
 
 // Helper Functions
-function calculatePipelineStats(applications: HomestayApplication[]) {
+function calculatePipelineStats(applications: MonitoringApplication[]) {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -959,7 +967,7 @@ function calculatePipelineStats(applications: HomestayApplication[]) {
   };
 }
 
-function identifyBottlenecks(applications: HomestayApplication[]) {
+function identifyBottlenecks(applications: MonitoringApplication[]) {
   const stageGroups = applications.reduce((acc, app) => {
     const status = app.status || 'draft';
     if (!acc[status]) {
@@ -967,7 +975,7 @@ function identifyBottlenecks(applications: HomestayApplication[]) {
     }
     acc[status].push(app);
     return acc;
-  }, {} as Record<string, HomestayApplication[]>);
+  }, {} as Record<string, MonitoringApplication[]>);
 
   const bottlenecks: Array<{ stage: string; count: number; avgDays: number }> = [];
 
@@ -994,7 +1002,7 @@ function identifyBottlenecks(applications: HomestayApplication[]) {
   return bottlenecks.sort((a, b) => b.count - a.count);
 }
 
-function identifySLABreaches(applications: HomestayApplication[]) {
+function identifySLABreaches(applications: MonitoringApplication[]) {
   return applications.filter(app => {
     if (!app.submittedAt || app.status === 'approved' || app.status === 'rejected') {
       return false;

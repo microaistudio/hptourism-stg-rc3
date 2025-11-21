@@ -127,7 +127,7 @@ export default function Dashboard() {
     if (paymentQuery) {
       const timer = window.setTimeout(() => {
         const pathOnly = location.split("?")[0];
-        setLocation(pathOnly, true);
+        setLocation(pathOnly, { replace: true });
       }, 6000);
       return () => window.clearTimeout(timer);
     }

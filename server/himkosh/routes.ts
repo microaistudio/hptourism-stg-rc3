@@ -775,6 +775,7 @@ router.post('/callback', async (req, res) => {
 router.post('/verify/:appRefNo', async (req, res) => {
   try {
     const { appRefNo } = req.params;
+    const { config } = await resolveHimkoshGatewayConfig();
     // Build verification request
     const verificationString = buildVerificationString({
       appRefNo,

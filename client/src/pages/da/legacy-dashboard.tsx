@@ -45,9 +45,9 @@ const useLegacySettings = () => {
   };
 };
 
-const isInCurrentMonth = (value?: string | null) => {
+const isInCurrentMonth = (value?: string | Date | null) => {
   if (!value) return false;
-  const date = new Date(value);
+  const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return false;
   const now = new Date();
   return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
